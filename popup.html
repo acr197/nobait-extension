@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <h1>NoBait</h1>
+    <p class="tagline">See through clickbait instantly.</p>
+
+    <div class="section">
+      <h2>How to use</h2>
+      <p><strong>Long-click</strong> (hold ~0.5s) any article link to get the real answer behind the headline.</p>
+    </div>
+
+    <div class="section">
+      <h2>AI Proxy URL</h2>
+      <p class="hint">Point this to your summarization endpoint.</p>
+      <input type="url" id="proxy-url" placeholder="https://your-proxy.example.com/summarize">
+      <div class="btn-row">
+        <button id="save-btn">Save</button>
+        <span id="status"></span>
+      </div>
+    </div>
+  </div>
+  <script src="popup-settings.js"></script>
+</body>
+</html>
