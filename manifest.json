@@ -3,7 +3,7 @@
   "name": "NoBait",
   "version": "1.0.0",
   "description": "See through clickbait instantly. Long-click any headline to get the real answer.",
-  "permissions": ["activeTab", "storage"],
+  "permissions": ["activeTab"],
   "action": {
     "default_popup": "popup.html",
     "default_icon": {

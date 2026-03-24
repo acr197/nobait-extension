@@ -56,46 +56,20 @@ p {
   color: #999;
 }
 
-input[type="url"] {
-  width: 100%;
-  padding: 8px 10px;
-  border: 1.5px solid #e0e0e0;
-  border-radius: 8px;
-  font-size: 12px;
-  font-family: monospace;
-  outline: none;
-  transition: border-color 0.15s;
-}
-
-input[type="url"]:focus {
-  border-color: #6c47ff;
-}
-
-.btn-row {
+.trigger-list {
+  list-style: none;
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 0;
 }
 
-button {
-  padding: 7px 18px;
-  border: none;
-  border-radius: 8px;
-  background: #6c47ff;
-  color: #fff;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.15s;
+.trigger-list li {
+  font-size: 13px;
+  color: #444;
+  line-height: 1.45;
 }
 
-button:hover {
-  background: #5835db;
-}
-
-#status {
-  font-size: 11px;
-  color: #22c55e;
-  opacity: 0;
-  transition: opacity 0.2s;
+.trigger-list li strong {
+  color: #6c47ff;
 }

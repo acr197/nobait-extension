@@ -1,64 +1,89 @@
 // NoBait - Content Script
-// Long-click detection and popup UI
+// Trigger detection (long-click, shift+click, ctrl+click), news URL filtering, and popup UI
 
 (function () {
   "use strict";
 
+  // --- Configuration ---
   const LONG_PRESS_MS = 800;
   const MOVE_THRESHOLD = 10;
+  const ANCHOR_TRAVERSAL_DEPTH = 10;
 
+  // --- Layer 1: blocked non-news domains ---
+  const BLOCKED_DOMAINS = [
+    // Social media
+    "twitter.com", "x.com", "facebook.com", "instagram.com", "tiktok.com",
+    "linkedin.com", "reddit.com", "threads.net", "pinterest.com",
+    // Video
+    "youtube.com", "youtu.be", "vimeo.com", "twitch.tv",
+    // Shopping
+    "amazon.com", "ebay.com", "etsy.com", "walmart.com", "target.com", "shopify.com",
+    // Tech / apps
+    "github.com", "stackoverflow.com", "notion.so", "figma.com",
+    "docs.google.com", "drive.google.com",
+  ];
+
+  // --- Layer 1: blocked search engine paths ---
+  const BLOCKED_SEARCH_PATHS = [
+    { host: "google.com", path: "/search" },
+    { host: "bing.com", path: "/search" },
+    { host: "duckduckgo.com", path: "/" },
+  ];
+
+  // --- Layer 2: article-like path keywords ---
+  const ARTICLE_PATH_KEYWORDS = [
+    "/article/", "/story/", "/news/", "/post/", "/blog/",
+    "/opinion/", "/analysis/", "/report/",
+  ];
+
+  // --- Layer 2: article-like query params ---
+  const ARTICLE_QUERY_KEYS = ["article", "story", "p"];
+
+  // --- Layer 2: news-related hostname fragments ---
+  const NEWS_HOST_WORDS = [
+    "news", "press", "times", "post", "journal", "herald",
+    "gazette", "tribune", "wire", "report", "daily", "weekly",
+  ];
+
+  // --- State ---
   let pressTimer = null;
   let startX = 0;
   let startY = 0;
   let activePopupHost = null;
   let longPressTriggered = false;
-  let pressTarget = null;
 
-  // --- Long-click detection ---
-
+  // --- Event listeners ---
   document.addEventListener("pointerdown", onPointerDown, true);
   document.addEventListener("pointermove", onPointerMove, true);
   document.addEventListener("pointerup", onPointerUp, true);
   document.addEventListener("pointercancel", onPointerCancel, true);
-  document.addEventListener("pointerleave", onPointerLeave, true);
   document.addEventListener("click", onClickCapture, true);
-  document.addEventListener("auxclick", onClickCapture, true);
 
+  // =========================================================================
+  // TRIGGER DETECTION
+  // =========================================================================
+
+  // --- onPointerDown: starts the long-press timer on primary button ---
   function onPointerDown(e) {
-    // Only primary button (left click)
     if (e.button !== 0) return;
-
     cancelPress();
 
     const anchor = findAnchor(e.target);
     if (!anchor) return;
 
-    const href = anchor.href;
-    if (!href || href.startsWith("javascript:") || href === "#" || href.endsWith("#")) return;
-
-    // Filter out non-http links
-    try {
-      const url = new URL(href, location.href);
-      if (url.protocol !== "http:" && url.protocol !== "https:") return;
-    } catch (_) {
-      return;
-    }
+    const href = resolveHref(anchor);
+    if (!href) return;
 
     startX = e.clientX;
     startY = e.clientY;
-    pressTarget = anchor;
 
     pressTimer = setTimeout(() => {
       pressTimer = null;
-      longPressTriggered = true;
-
-      const headline = extractHeadline(anchor);
-      if (headline) {
-        showPopup(href, headline, e.clientX, e.clientY);
-      }
+      triggerPopup(anchor, href, e.clientX, e.clientY);
     }, LONG_PRESS_MS);
   }
 
+  // --- onPointerMove: cancels long-press if the cursor drifts too far ---
   function onPointerMove(e) {
     if (!pressTimer) return;
     const dx = e.clientX - startX;
@@ -68,34 +93,41 @@
     }
   }
 
-  function onPointerUp(e) {
+  // --- onPointerUp: cancels long-press if released before threshold ---
+  function onPointerUp() {
     if (pressTimer) {
-      // Released before the timer fired — normal click, let it through
       cancelPress();
     }
-    // If longPressTriggered is true, we leave it set so onClickCapture blocks navigation
+    // longPressTriggered stays true so onClickCapture can suppress navigation
   }
 
+  // --- onPointerCancel: cleanup on pointer interruption ---
   function onPointerCancel() {
     cancelPress();
   }
 
-  function onPointerLeave(e) {
-    // Only cancel if the pointer left the document (not just an element)
-    if (e.target === document || e.target === document.documentElement) {
-      cancelPress();
-    }
-  }
-
+  // --- onClickCapture: handles shift+click, ctrl+click, long-press suppression, and outside-click close ---
   function onClickCapture(e) {
-    // After a long-press, suppress the click that the browser fires on release
-    // This prevents navigation to the link
+    // Suppress the click event that fires after a successful long-press
     if (longPressTriggered) {
       longPressTriggered = false;
-      pressTarget = null;
       e.preventDefault();
       e.stopImmediatePropagation();
       return;
+    }
+
+    // Shift+click or Ctrl+click on a link triggers the popup
+    if (e.button === 0 && (e.shiftKey || e.ctrlKey)) {
+      const anchor = findAnchor(e.target);
+      if (anchor) {
+        const href = resolveHref(anchor);
+        if (href) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          triggerPopup(anchor, href, e.clientX, e.clientY);
+          return;
+        }
+      }
     }
 
     // Close popup on outside click
@@ -107,29 +139,59 @@
     }
   }
 
+  // --- triggerPopup: validates the URL then opens the popup ---
+  function triggerPopup(anchor, href, x, y) {
+    longPressTriggered = true;
+
+    if (!isNewsUrl(href)) return;
+
+    const headline = extractHeadline(anchor);
+    if (!headline) return;
+
+    showPopup(href, headline, x, y);
+  }
+
+  // --- cancelPress: clears the long-press timer ---
   function cancelPress() {
     if (pressTimer) {
       clearTimeout(pressTimer);
       pressTimer = null;
     }
-    pressTarget = null;
   }
 
+  // =========================================================================
+  // DOM HELPERS
+  // =========================================================================
+
+  // --- findAnchor: walks up the DOM to find the nearest <a> element ---
   function findAnchor(el) {
     let node = el;
-    // Traverse up to 10 levels to handle deeply nested DOM (Google News, etc.)
-    for (let i = 0; i < 10 && node && node !== document; i++) {
+    for (let i = 0; i < ANCHOR_TRAVERSAL_DEPTH && node && node !== document; i++) {
       if (node.tagName === "A" && node.href) return node;
       node = node.parentElement;
     }
     return null;
   }
 
+  // --- resolveHref: validates and returns the anchor's href, or null ---
+  function resolveHref(anchor) {
+    const href = anchor.href;
+    if (!href) return null;
+    if (href.startsWith("javascript:") || href === "#" || href.endsWith("#")) return null;
+    try {
+      const url = new URL(href, location.href);
+      if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+      return url.href;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // --- extractHeadline: gets meaningful text from the anchor ---
   function extractHeadline(anchor) {
-    // Try to get meaningful text from the anchor or nearby heading
     let text = anchor.textContent.trim();
 
-    // If the link has very little text (e.g. just an image), try aria-label or title
+    // Fall back to aria-label or title for image-only links
     if (text.length < 5) {
       text = anchor.getAttribute("aria-label") || anchor.title || text;
     }
@@ -139,8 +201,79 @@
     return text || null;
   }
 
-  // --- Popup UI ---
+  // =========================================================================
+  // NEWS URL FILTERING
+  // =========================================================================
 
+  // --- isNewsUrl: two-layer filter — blocks non-news, then checks for article signals ---
+  function isNewsUrl(href) {
+    let url;
+    try {
+      url = new URL(href);
+    } catch (_) {
+      return false;
+    }
+
+    const hostname = url.hostname.toLowerCase();
+
+    // Layer 1: block known non-news domains
+    if (isBlockedDomain(hostname, url)) return false;
+
+    // Layer 2: require at least one article-like signal
+    return hasArticleSignal(url, hostname);
+  }
+
+  // --- isBlockedDomain: checks if the hostname matches any blocked domain ---
+  function isBlockedDomain(hostname, url) {
+    for (const domain of BLOCKED_DOMAINS) {
+      if (hostname === domain || hostname.endsWith("." + domain)) return true;
+    }
+    for (const rule of BLOCKED_SEARCH_PATHS) {
+      if (
+        (hostname === rule.host || hostname.endsWith("." + rule.host)) &&
+        url.pathname.startsWith(rule.path)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // --- hasArticleSignal: checks if the URL looks like a news article ---
+  function hasArticleSignal(url, hostname) {
+    const path = url.pathname.toLowerCase();
+    const search = url.search.toLowerCase();
+
+    // Signal: path has 3+ segments (e.g. /politics/2024/03/article-title)
+    const segments = path.split("/").filter(Boolean);
+    if (segments.length >= 3) return true;
+
+    // Signal: path contains a date pattern like /2024/03/ or /20240315/
+    if (/\/\d{4}\/\d{2}\//.test(path) || /\/\d{8}\//.test(path)) return true;
+
+    // Signal: path contains article-like keywords
+    for (const keyword of ARTICLE_PATH_KEYWORDS) {
+      if (path.includes(keyword)) return true;
+    }
+
+    // Signal: query string contains article-like params
+    for (const key of ARTICLE_QUERY_KEYS) {
+      if (search.includes(key + "=")) return true;
+    }
+
+    // Signal: hostname contains news-related words
+    for (const word of NEWS_HOST_WORDS) {
+      if (hostname.includes(word)) return true;
+    }
+
+    return false;
+  }
+
+  // =========================================================================
+  // POPUP UI
+  // =========================================================================
+
+  // --- showPopup: creates the Shadow DOM popup and sends the SUMMARIZE request ---
   function showPopup(url, headline, x, y) {
     closePopup();
 
@@ -177,7 +310,7 @@
     host.style.left = left + "px";
     host.style.top = top + "px";
 
-    // Header
+    // Header with logo and close button
     const header = document.createElement("div");
     header.className = "nobait-header";
 
@@ -204,7 +337,7 @@
     headlineEl.textContent = truncate(headline, 120);
     popup.appendChild(headlineEl);
 
-    // Loading state
+    // Loading spinner
     const spinnerWrap = document.createElement("div");
     spinnerWrap.className = "nobait-body nobait-loading";
 
@@ -222,7 +355,7 @@
     document.body.appendChild(host);
     activePopupHost = host;
 
-    // Trigger entrance animation
+    // Trigger entrance animation on next frame
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         popup.classList.add("nobait-visible");
@@ -230,26 +363,24 @@
     });
 
     // Request summary from background
-    chrome.runtime.sendMessage(
-      { type: "SUMMARIZE", url, headline },
-      (response) => {
-        if (chrome.runtime.lastError) {
-          renderError(popup, spinnerWrap, "fetch_failed", "Extension error. Try again.");
-          return;
-        }
-        if (!response) {
-          renderError(popup, spinnerWrap, "fetch_failed", "No response from extension.");
-          return;
-        }
-        if (response.ok) {
-          renderSummary(popup, spinnerWrap, response.summary);
-        } else {
-          renderError(popup, spinnerWrap, response.error, response.message);
-        }
+    chrome.runtime.sendMessage({ type: "SUMMARIZE", url, headline }, (response) => {
+      if (chrome.runtime.lastError) {
+        renderError(popup, spinnerWrap, "fetch_failed", "Extension error. Try again.", headline);
+        return;
       }
-    );
+      if (!response) {
+        renderError(popup, spinnerWrap, "fetch_failed", "No response from extension.", headline);
+        return;
+      }
+      if (response.ok) {
+        renderSummary(popup, spinnerWrap, response.summary);
+      } else {
+        renderError(popup, spinnerWrap, response.error, response.message, headline);
+      }
+    });
   }
 
+  // --- renderSummary: replaces spinner with the AI summary text ---
   function renderSummary(popup, spinnerWrap, summary) {
     if (!activePopupHost) return;
 
@@ -261,23 +392,17 @@
     text.textContent = summary;
     body.appendChild(text);
 
-    spinnerWrap.classList.add("nobait-fade-out");
-    setTimeout(() => {
-      if (spinnerWrap.parentNode === popup) {
-        popup.replaceChild(body, spinnerWrap);
-        requestAnimationFrame(() => {
-          body.classList.add("nobait-fade-in");
-        });
-      }
-    }, 150);
+    swapContent(popup, spinnerWrap, body);
   }
 
-  function renderError(popup, spinnerWrap, errorType, message) {
+  // --- renderError: replaces spinner with error message and Google Search fallback ---
+  function renderError(popup, spinnerWrap, errorType, message, headline) {
     if (!activePopupHost) return;
 
     const body = document.createElement("div");
     body.className = "nobait-body nobait-error-body";
 
+    // Error icon
     const icon = document.createElement("div");
     icon.className = "nobait-error-icon";
     if (errorType === "paywall") {
@@ -289,50 +414,58 @@
     }
     body.appendChild(icon);
 
+    // Error message
     const msg = document.createElement("div");
     msg.className = "nobait-error-msg";
     msg.textContent = message;
     body.appendChild(msg);
 
+    // Google Search fallback button
     const btn = document.createElement("button");
     btn.className = "nobait-fallback-btn";
-    btn.textContent = "Search for answer";
+    btn.textContent = "Search Google";
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
-      const headlineEl = popup.querySelector(".nobait-headline");
-      const query = headlineEl ? headlineEl.textContent : "";
+      const query = headline || "";
       window.open("https://www.google.com/search?q=" + encodeURIComponent(query), "_blank");
     });
     body.appendChild(btn);
 
-    spinnerWrap.classList.add("nobait-fade-out");
+    swapContent(popup, spinnerWrap, body);
+  }
+
+  // --- swapContent: fade-out old content, fade-in new content ---
+  function swapContent(popup, oldEl, newEl) {
+    oldEl.classList.add("nobait-fade-out");
     setTimeout(() => {
-      if (spinnerWrap.parentNode === popup) {
-        popup.replaceChild(body, spinnerWrap);
+      if (oldEl.parentNode === popup) {
+        popup.replaceChild(newEl, oldEl);
         requestAnimationFrame(() => {
-          body.classList.add("nobait-fade-in");
+          newEl.classList.add("nobait-fade-in");
         });
       }
     }, 150);
   }
 
+  // --- closePopup: removes the popup host from the DOM ---
   function closePopup() {
     if (activePopupHost) {
-      const host = activePopupHost;
-      const shadow = host.shadowRoot;
-      // If shadow is closed, we can't animate — just remove
+      activePopupHost.remove();
       activePopupHost = null;
-      host.remove();
     }
   }
 
+  // --- truncate: shortens a string with an ellipsis ---
   function truncate(str, max) {
     if (str.length <= max) return str;
     return str.substring(0, max - 1) + "\u2026";
   }
 
-  // --- Inline styles for Shadow DOM ---
+  // =========================================================================
+  // POPUP STYLES (injected into Shadow DOM)
+  // =========================================================================
 
+  // --- getPopupStyles: returns the CSS string for the popup ---
   function getPopupStyles() {
     return `
       * {
