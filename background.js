@@ -1,50 +1,47 @@
 // NoBait - Background Service Worker
-// Handles article fetching and AI summarization
+// Fetches article text and calls the AI proxy for summarization
 
-const DEFAULT_PROXY_URL = "https://nobait-proxy.example.com/summarize";
+// --- Configuration ---
+const PROXY_URL = "https://nobait-proxy.acr197.workers.dev/summarize";
 const FETCH_TIMEOUT_MS = 10000;
 const AI_TIMEOUT_MS = 15000;
 const MAX_CONTENT_LENGTH = 5000;
+const MIN_CONTENT_LENGTH = 50;
 
+// --- Message listener: routes SUMMARIZE requests from the content script ---
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === "SUMMARIZE") {
-    handleSummarize(msg.url, msg.headline)
-      .then(sendResponse)
-      .catch(() => sendResponse({
-        ok: false,
-        error: "ai_error",
-        message: "An unexpected error occurred."
-      }));
-    return true; // keep message channel open for async response
-  }
+  if (msg.type !== "SUMMARIZE") return;
+
+  handleSummarize(msg.url, msg.headline)
+    .then(sendResponse)
+    .catch(() =>
+      sendResponse({ ok: false, error: "ai_error", message: "An unexpected error occurred." })
+    );
+
+  // Keep the message channel open for the async response
+  return true;
 });
 
+// --- handleSummarize: orchestrates fetch -> extract -> AI pipeline ---
 async function handleSummarize(url, headline) {
-  // Phase 1: Fetch article content
+  // Phase 1: fetch and extract article text
   let articleText;
   try {
     articleText = await fetchArticle(url);
   } catch (err) {
-    return {
-      ok: false,
-      error: err.errorType || "fetch_failed",
-      message: err.message
-    };
+    return { ok: false, error: err.errorType || "fetch_failed", message: err.message };
   }
 
-  // Phase 2: AI summarization
+  // Phase 2: send to AI proxy
   try {
     const summary = await callAI(headline, articleText);
     return { ok: true, summary };
   } catch (err) {
-    return {
-      ok: false,
-      error: "ai_error",
-      message: err.message || "Summarization failed."
-    };
+    return { ok: false, error: "ai_error", message: err.message || "Summarization failed." };
   }
 }
 
+// --- fetchArticle: downloads the page HTML with a timeout ---
 async function fetchArticle(url) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -53,9 +50,7 @@ async function fetchArticle(url) {
   try {
     response = await fetch(url, {
       signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; NoBait/1.0)"
-      }
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; NoBait/1.0)" },
     });
   } catch (err) {
     clearTimeout(timer);
@@ -71,7 +66,7 @@ async function fetchArticle(url) {
     throw createError("paywall", "This article is behind a paywall or restricted access.");
   }
   if (response.status === 429) {
-    throw createError("blocked", "This site is rate-limiting requests.");
+    throw createError("blocked", "This site is rate-limiting requests. Try again later.");
   }
   if (!response.ok) {
     throw createError("fetch_failed", `Could not load the article (HTTP ${response.status}).`);
@@ -86,15 +81,16 @@ async function fetchArticle(url) {
   return extractText(html);
 }
 
+// --- extractText: strips HTML down to plain text ---
 function extractText(html) {
-  // Strip script and style blocks
+  // Remove non-content blocks
   let text = html.replace(/<script[\s\S]*?<\/script>/gi, " ");
   text = text.replace(/<style[\s\S]*?<\/style>/gi, " ");
   text = text.replace(/<nav[\s\S]*?<\/nav>/gi, " ");
   text = text.replace(/<footer[\s\S]*?<\/footer>/gi, " ");
   text = text.replace(/<header[\s\S]*?<\/header>/gi, " ");
 
-  // Strip all HTML tags
+  // Strip remaining tags
   text = text.replace(/<[^>]+>/g, " ");
 
   // Decode common HTML entities
@@ -105,24 +101,20 @@ function extractText(html) {
   text = text.replace(/&#39;/g, "'");
   text = text.replace(/&nbsp;/g, " ");
 
-  // Collapse whitespace
+  // Collapse whitespace and truncate
   text = text.replace(/\s+/g, " ").trim();
-
-  // Truncate
   if (text.length > MAX_CONTENT_LENGTH) {
     text = text.substring(0, MAX_CONTENT_LENGTH) + "...";
   }
-
-  if (text.length < 50) {
+  if (text.length < MIN_CONTENT_LENGTH) {
     throw createError("fetch_failed", "Could not extract enough text from the article.");
   }
 
   return text;
 }
 
+// --- callAI: sends the prompt to the Cloudflare Worker proxy ---
 async function callAI(headline, content) {
-  const proxyUrl = await getProxyUrl();
-
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
@@ -130,11 +122,11 @@ async function callAI(headline, content) {
 
   let response;
   try {
-    response = await fetch(proxyUrl, {
+    response = await fetch(PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ headline, content, prompt }),
-      signal: controller.signal
+      body: JSON.stringify({ text: prompt }),
+      signal: controller.signal,
     });
   } catch (err) {
     clearTimeout(timer);
@@ -158,6 +150,7 @@ async function callAI(headline, content) {
   return data.summary;
 }
 
+// --- buildPrompt: constructs the full AI prompt from headline + content ---
 function buildPrompt(headline, content) {
   return `You are NoBait, an AI that cuts through clickbait. Given a headline and the article content, provide the ACTUAL answer or key information the headline is teasing.
 
@@ -177,14 +170,7 @@ ${content}
 Direct answer:`;
 }
 
-async function getProxyUrl() {
-  return new Promise((resolve) => {
-    chrome.storage.sync.get(["proxyUrl"], (result) => {
-      resolve(result.proxyUrl || DEFAULT_PROXY_URL);
-    });
-  });
-}
-
+// --- createError: builds an Error with an errorType property ---
 function createError(errorType, message) {
   const err = new Error(message);
   err.errorType = errorType;

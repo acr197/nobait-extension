@@ -56,46 +56,68 @@ p {
   color: #999;
 }
 
-input[type="url"] {
-  width: 100%;
-  padding: 8px 10px;
-  border: 1.5px solid #e0e0e0;
-  border-radius: 8px;
-  font-size: 12px;
-  font-family: monospace;
-  outline: none;
-  transition: border-color 0.15s;
-}
-
-input[type="url"]:focus {
-  border-color: #6c47ff;
-}
-
-.btn-row {
+.toggle {
   display: flex;
   align-items: center;
-  gap: 10px;
-}
-
-button {
-  padding: 7px 18px;
-  border: none;
-  border-radius: 8px;
-  background: #6c47ff;
-  color: #fff;
-  font-size: 12px;
-  font-weight: 600;
+  gap: 8px;
   cursor: pointer;
-  transition: background 0.15s;
+  padding: 4px 0;
 }
 
-button:hover {
-  background: #5835db;
+.toggle input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: #6c47ff;
+  cursor: pointer;
+  margin: 0;
 }
 
-#status {
+.toggle-label {
+  font-size: 13px;
+  color: #1a1a1a;
+  font-weight: 500;
+  user-select: none;
+}
+
+.toggle-hint {
+  color: #999;
+  font-weight: 400;
+}
+
+.status {
   font-size: 11px;
-  color: #22c55e;
+  height: 14px;
   opacity: 0;
   transition: opacity 0.2s;
+}
+
+.bmc-wrap {
+  padding-top: 4px;
+  border-top: 1px solid #f0f0f0;
+}
+
+.bmc-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  background: #FFDD00;
+  color: #0D0C22;
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.bmc-btn:hover {
+  background: #f5d400;
+}
+
+.bmc-btn:active {
+  transform: scale(0.97);
+}
+
+.bmc-btn svg {
+  flex-shrink: 0;
 }

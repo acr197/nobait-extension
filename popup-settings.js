@@ -1,42 +1,59 @@
 // NoBait - Popup Settings
+// Manages trigger toggle checkboxes and persists to chrome.storage.sync
 
-const proxyInput = document.getElementById("proxy-url");
-const saveBtn = document.getElementById("save-btn");
+// --- Configuration ---
+const STORAGE_KEY = "triggerSettings";
+const STATUS_DISPLAY_MS = 1500;
+
+// --- DOM references ---
+const longClickEl = document.getElementById("trigger-longclick");
+const shiftClickEl = document.getElementById("trigger-shiftclick");
+const ctrlClickEl = document.getElementById("trigger-ctrlclick");
 const statusEl = document.getElementById("status");
 
-// Load saved proxy URL
-chrome.storage.sync.get(["proxyUrl"], (result) => {
-  if (result.proxyUrl) {
-    proxyInput.value = result.proxyUrl;
-  }
-});
-
-saveBtn.addEventListener("click", () => {
-  const url = proxyInput.value.trim();
-  if (url && !isValidUrl(url)) {
-    flashStatus("Invalid URL", "#ef4444");
-    return;
-  }
-
-  chrome.storage.sync.set({ proxyUrl: url }, () => {
-    flashStatus("Saved!", "#22c55e");
+// --- loadSettings: reads saved trigger state and updates checkboxes ---
+function loadSettings() {
+  chrome.storage.sync.get([STORAGE_KEY], (result) => {
+    if (chrome.runtime.lastError) return;
+    const s = result[STORAGE_KEY];
+    if (!s) return;
+    if (typeof s.longClick === "boolean") longClickEl.checked = s.longClick;
+    if (typeof s.shiftClick === "boolean") shiftClickEl.checked = s.shiftClick;
+    if (typeof s.ctrlClick === "boolean") ctrlClickEl.checked = s.ctrlClick;
   });
-});
-
-function isValidUrl(str) {
-  try {
-    const u = new URL(str);
-    return u.protocol === "https:" || u.protocol === "http:";
-  } catch {
-    return false;
-  }
 }
 
+// --- saveSettings: writes current checkbox state to chrome.storage ---
+function saveSettings() {
+  const settings = {
+    longClick: longClickEl.checked,
+    shiftClick: shiftClickEl.checked,
+    ctrlClick: ctrlClickEl.checked,
+  };
+
+  chrome.storage.sync.set({ [STORAGE_KEY]: settings }, () => {
+    if (chrome.runtime.lastError) {
+      flashStatus("Error saving", "#ef4444");
+      return;
+    }
+    flashStatus("Saved!", "#22c55e");
+  });
+}
+
+// --- flashStatus: briefly shows a status message ---
 function flashStatus(text, color) {
   statusEl.textContent = text;
   statusEl.style.color = color;
   statusEl.style.opacity = "1";
   setTimeout(() => {
     statusEl.style.opacity = "0";
-  }, 2000);
+  }, STATUS_DISPLAY_MS);
 }
+
+// --- Initialize ---
+loadSettings();
+
+// --- Save on any checkbox change ---
+longClickEl.addEventListener("change", saveSettings);
+shiftClickEl.addEventListener("change", saveSettings);
+ctrlClickEl.addEventListener("change", saveSettings);
