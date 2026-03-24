@@ -56,20 +56,68 @@ p {
   color: #999;
 }
 
-.trigger-list {
-  list-style: none;
+.toggle {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
   padding: 4px 0;
 }
 
-.trigger-list li {
-  font-size: 13px;
-  color: #444;
-  line-height: 1.45;
+.toggle input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: #6c47ff;
+  cursor: pointer;
+  margin: 0;
 }
 
-.trigger-list li strong {
-  color: #6c47ff;
+.toggle-label {
+  font-size: 13px;
+  color: #1a1a1a;
+  font-weight: 500;
+  user-select: none;
+}
+
+.toggle-hint {
+  color: #999;
+  font-weight: 400;
+}
+
+.status {
+  font-size: 11px;
+  height: 14px;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.bmc-wrap {
+  padding-top: 4px;
+  border-top: 1px solid #f0f0f0;
+}
+
+.bmc-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  background: #FFDD00;
+  color: #0D0C22;
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.bmc-btn:hover {
+  background: #f5d400;
+}
+
+.bmc-btn:active {
+  transform: scale(0.97);
+}
+
+.bmc-btn svg {
+  flex-shrink: 0;
 }

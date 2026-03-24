@@ -1,5 +1,5 @@
 // NoBait - Content Script
-// Trigger detection (long-click, shift+click, ctrl+click), news URL filtering, and popup UI
+// Trigger detection (long-click, shift+click, ctrl+click), URL filtering, and popup UI
 
 (function () {
   "use strict";
@@ -8,8 +8,9 @@
   const LONG_PRESS_MS = 800;
   const MOVE_THRESHOLD = 10;
   const ANCHOR_TRAVERSAL_DEPTH = 10;
+  const STORAGE_KEY = "triggerSettings";
 
-  // --- Layer 1: blocked non-news domains ---
+  // --- Blocked domains: obvious non-news sites ---
   const BLOCKED_DOMAINS = [
     // Social media
     "twitter.com", "x.com", "facebook.com", "instagram.com", "tiktok.com",
@@ -23,26 +24,11 @@
     "docs.google.com", "drive.google.com",
   ];
 
-  // --- Layer 1: blocked search engine paths ---
+  // --- Blocked search paths ---
   const BLOCKED_SEARCH_PATHS = [
     { host: "google.com", path: "/search" },
     { host: "bing.com", path: "/search" },
     { host: "duckduckgo.com", path: "/" },
-  ];
-
-  // --- Layer 2: article-like path keywords ---
-  const ARTICLE_PATH_KEYWORDS = [
-    "/article/", "/story/", "/news/", "/post/", "/blog/",
-    "/opinion/", "/analysis/", "/report/",
-  ];
-
-  // --- Layer 2: article-like query params ---
-  const ARTICLE_QUERY_KEYS = ["article", "story", "p"];
-
-  // --- Layer 2: news-related hostname fragments ---
-  const NEWS_HOST_WORDS = [
-    "news", "press", "times", "post", "journal", "herald",
-    "gazette", "tribune", "wire", "report", "daily", "weekly",
   ];
 
   // --- State ---
@@ -52,12 +38,49 @@
   let activePopupHost = null;
   let longPressTriggered = false;
 
+  // --- Trigger enable flags (loaded from storage, all on by default) ---
+  let enableLongClick = true;
+  let enableShiftClick = true;
+  let enableCtrlClick = true;
+
+  // --- Load trigger settings from storage ---
+  loadTriggerSettings();
+
+  // --- Listen for storage changes so popup toggles take effect immediately ---
+  chrome.storage.onChanged.addListener(onStorageChanged);
+
   // --- Event listeners ---
   document.addEventListener("pointerdown", onPointerDown, true);
   document.addEventListener("pointermove", onPointerMove, true);
   document.addEventListener("pointerup", onPointerUp, true);
   document.addEventListener("pointercancel", onPointerCancel, true);
   document.addEventListener("click", onClickCapture, true);
+
+  // =========================================================================
+  // SETTINGS
+  // =========================================================================
+
+  // --- loadTriggerSettings: reads saved trigger preferences from chrome.storage ---
+  function loadTriggerSettings() {
+    chrome.storage.sync.get([STORAGE_KEY], (result) => {
+      if (chrome.runtime.lastError) return;
+      const s = result[STORAGE_KEY];
+      if (!s) return;
+      if (typeof s.longClick === "boolean") enableLongClick = s.longClick;
+      if (typeof s.shiftClick === "boolean") enableShiftClick = s.shiftClick;
+      if (typeof s.ctrlClick === "boolean") enableCtrlClick = s.ctrlClick;
+    });
+  }
+
+  // --- onStorageChanged: updates trigger flags when user toggles settings ---
+  function onStorageChanged(changes) {
+    if (!changes[STORAGE_KEY]) return;
+    const s = changes[STORAGE_KEY].newValue;
+    if (!s) return;
+    if (typeof s.longClick === "boolean") enableLongClick = s.longClick;
+    if (typeof s.shiftClick === "boolean") enableShiftClick = s.shiftClick;
+    if (typeof s.ctrlClick === "boolean") enableCtrlClick = s.ctrlClick;
+  }
 
   // =========================================================================
   // TRIGGER DETECTION
@@ -67,6 +90,8 @@
   function onPointerDown(e) {
     if (e.button !== 0) return;
     cancelPress();
+
+    if (!enableLongClick) return;
 
     const anchor = findAnchor(e.target);
     if (!anchor) return;
@@ -98,7 +123,6 @@
     if (pressTimer) {
       cancelPress();
     }
-    // longPressTriggered stays true so onClickCapture can suppress navigation
   }
 
   // --- onPointerCancel: cleanup on pointer interruption ---
@@ -106,9 +130,9 @@
     cancelPress();
   }
 
-  // --- onClickCapture: handles shift+click, ctrl+click, long-press suppression, and outside-click close ---
+  // --- onClickCapture: handles modifier-click triggers, long-press suppression, outside-click close ---
   function onClickCapture(e) {
-    // Suppress the click event that fires after a successful long-press
+    // Suppress the click that fires after a successful long-press
     if (longPressTriggered) {
       longPressTriggered = false;
       e.preventDefault();
@@ -116,8 +140,22 @@
       return;
     }
 
-    // Shift+click or Ctrl+click on a link triggers the popup
-    if (e.button === 0 && (e.shiftKey || e.ctrlKey)) {
+    // Shift+click trigger
+    if (e.button === 0 && e.shiftKey && !e.ctrlKey && enableShiftClick) {
+      const anchor = findAnchor(e.target);
+      if (anchor) {
+        const href = resolveHref(anchor);
+        if (href) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          triggerPopup(anchor, href, e.clientX, e.clientY);
+          return;
+        }
+      }
+    }
+
+    // Ctrl+click trigger
+    if (e.button === 0 && e.ctrlKey && !e.shiftKey && enableCtrlClick) {
       const anchor = findAnchor(e.target);
       if (anchor) {
         const href = resolveHref(anchor);
@@ -139,16 +177,19 @@
     }
   }
 
-  // --- triggerPopup: validates the URL then opens the popup ---
+  // --- triggerPopup: validates the URL, sets suppress flag, and opens the popup ---
   function triggerPopup(anchor, href, x, y) {
     longPressTriggered = true;
 
-    if (!isNewsUrl(href)) return;
+    if (isBlockedUrl(href)) return;
+
+    // Try to unwrap Google News redirect URLs
+    const finalHref = unwrapGoogleNewsUrl(anchor, href);
 
     const headline = extractHeadline(anchor);
     if (!headline) return;
 
-    showPopup(href, headline, x, y);
+    showPopup(finalHref, headline, x, y);
   }
 
   // --- cancelPress: clears the long-press timer ---
@@ -202,32 +243,26 @@
   }
 
   // =========================================================================
-  // NEWS URL FILTERING
+  // URL FILTERING
   // =========================================================================
 
-  // --- isNewsUrl: two-layer filter — blocks non-news, then checks for article signals ---
-  function isNewsUrl(href) {
+  // --- isBlockedUrl: returns true if the URL is on the blocklist ---
+  function isBlockedUrl(href) {
     let url;
     try {
       url = new URL(href);
     } catch (_) {
-      return false;
+      return true;
     }
 
     const hostname = url.hostname.toLowerCase();
 
-    // Layer 1: block known non-news domains
-    if (isBlockedDomain(hostname, url)) return false;
-
-    // Layer 2: require at least one article-like signal
-    return hasArticleSignal(url, hostname);
-  }
-
-  // --- isBlockedDomain: checks if the hostname matches any blocked domain ---
-  function isBlockedDomain(hostname, url) {
+    // Check blocked domains
     for (const domain of BLOCKED_DOMAINS) {
       if (hostname === domain || hostname.endsWith("." + domain)) return true;
     }
+
+    // Check blocked search paths
     for (const rule of BLOCKED_SEARCH_PATHS) {
       if (
         (hostname === rule.host || hostname.endsWith("." + rule.host)) &&
@@ -236,37 +271,56 @@
         return true;
       }
     }
+
     return false;
   }
 
-  // --- hasArticleSignal: checks if the URL looks like a news article ---
-  function hasArticleSignal(url, hostname) {
-    const path = url.pathname.toLowerCase();
-    const search = url.search.toLowerCase();
-
-    // Signal: path has 3+ segments (e.g. /politics/2024/03/article-title)
-    const segments = path.split("/").filter(Boolean);
-    if (segments.length >= 3) return true;
-
-    // Signal: path contains a date pattern like /2024/03/ or /20240315/
-    if (/\/\d{4}\/\d{2}\//.test(path) || /\/\d{8}\//.test(path)) return true;
-
-    // Signal: path contains article-like keywords
-    for (const keyword of ARTICLE_PATH_KEYWORDS) {
-      if (path.includes(keyword)) return true;
+  // --- unwrapGoogleNewsUrl: extracts the real destination from Google News wrapper links ---
+  function unwrapGoogleNewsUrl(anchor, href) {
+    let url;
+    try {
+      url = new URL(href);
+    } catch (_) {
+      return href;
     }
 
-    // Signal: query string contains article-like params
-    for (const key of ARTICLE_QUERY_KEYS) {
-      if (search.includes(key + "=")) return true;
+    const hostname = url.hostname.toLowerCase();
+
+    // Only process news.google.com links
+    if (hostname !== "news.google.com" && !hostname.endsWith(".news.google.com")) {
+      return href;
     }
 
-    // Signal: hostname contains news-related words
-    for (const word of NEWS_HOST_WORDS) {
-      if (hostname.includes(word)) return true;
+    // Try data-href or data-url attributes on the anchor
+    const dataHref = anchor.getAttribute("data-href") || anchor.getAttribute("data-url");
+    if (dataHref) {
+      try {
+        const dataUrl = new URL(dataHref);
+        if (dataUrl.protocol === "http:" || dataUrl.protocol === "https:") {
+          return dataUrl.href;
+        }
+      } catch (_) {
+        // fall through
+      }
     }
 
-    return false;
+    // Try extracting from the URL query params (e.g. ?url=... or ?q=...)
+    for (const key of ["url", "q", "dest"]) {
+      const param = url.searchParams.get(key);
+      if (param) {
+        try {
+          const paramUrl = new URL(param);
+          if (paramUrl.protocol === "http:" || paramUrl.protocol === "https:") {
+            return paramUrl.href;
+          }
+        } catch (_) {
+          // not a valid URL, skip
+        }
+      }
+    }
+
+    // Could not unwrap — return original and let background.js follow the redirect
+    return href;
   }
 
   // =========================================================================
