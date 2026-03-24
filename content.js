@@ -123,6 +123,12 @@
     if (pressTimer) {
       cancelPress();
     }
+    // Safety net: reset longPressTriggered after 300ms in case the click event
+    // never fires (Google News intercepts it), preventing all subsequent clicks
+    // from being silently eaten
+    setTimeout(() => {
+      longPressTriggered = false;
+    }, 300);
   }
 
   // --- onPointerCancel: cleanup on pointer interruption ---
@@ -179,15 +185,18 @@
 
   // --- triggerPopup: validates the URL, sets suppress flag, and opens the popup ---
   function triggerPopup(anchor, href, x, y) {
-    longPressTriggered = true;
-
     if (isBlockedUrl(href)) return;
+
+    longPressTriggered = true;
 
     // Try to unwrap Google News redirect URLs
     const finalHref = unwrapGoogleNewsUrl(anchor, href);
 
     const headline = extractHeadline(anchor);
-    if (!headline) return;
+    if (!headline) {
+      longPressTriggered = false;
+      return;
+    }
 
     showPopup(finalHref, headline, x, y);
   }
@@ -291,8 +300,8 @@
       return href;
     }
 
-    // Try data-href or data-url attributes on the anchor
-    const dataHref = anchor.getAttribute("data-href") || anchor.getAttribute("data-url");
+    // Try data-n-au (Google News), data-href, or data-url attributes on the anchor
+    const dataHref = anchor.getAttribute("data-n-au") || anchor.getAttribute("data-href") || anchor.getAttribute("data-url");
     if (dataHref) {
       try {
         const dataUrl = new URL(dataHref);
