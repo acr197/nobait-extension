@@ -37,11 +37,12 @@
   let startY = 0;
   let activePopupHost = null;
   let longPressTriggered = false;
+  let modifierHandledViaPointerUp = false;
 
-  // --- Trigger enable flags (loaded from storage, all on by default) ---
+  // --- Trigger enable flags (loaded from storage) ---
   let enableLongClick = true;
   let enableShiftClick = true;
-  let enableCtrlClick = true;
+  let enableCtrlClick = false;
 
   // --- Load trigger settings from storage ---
   loadTriggerSettings();
@@ -93,7 +94,7 @@
 
     if (!enableLongClick) return;
 
-    const anchor = findAnchor(e.target);
+    const anchor = findAnchor(e.target, e);
     if (!anchor) return;
 
     const href = resolveHref(anchor);
@@ -118,16 +119,38 @@
     }
   }
 
-  // --- onPointerUp: cancels long-press if released before threshold ---
-  function onPointerUp() {
+  // --- onPointerUp: cancels long-press if released before threshold,
+  //     and handles modifier-click triggers via pointerup (works on sites
+  //     like Google News that intercept/eat click events) ---
+  function onPointerUp(e) {
     if (pressTimer) {
       cancelPress();
     }
-    // Safety net: reset longPressTriggered after 300ms in case the click event
+
+    // Handle shift+click and ctrl+click via pointerup so it works even when
+    // the site eats the subsequent click event (e.g. Google News)
+    if (e.button === 0 && !longPressTriggered) {
+      const wantShift = e.shiftKey && !e.ctrlKey && enableShiftClick;
+      const wantCtrl = e.ctrlKey && !e.shiftKey && enableCtrlClick;
+      if (wantShift || wantCtrl) {
+        const anchor = findAnchor(e.target, e);
+        if (anchor) {
+          const href = resolveHref(anchor);
+          if (href) {
+            modifierHandledViaPointerUp = true;
+            triggerPopup(anchor, href, e.clientX, e.clientY);
+            return;
+          }
+        }
+      }
+    }
+
+    // Safety net: reset flags after 300ms in case the click event
     // never fires (Google News intercepts it), preventing all subsequent clicks
     // from being silently eaten
     setTimeout(() => {
       longPressTriggered = false;
+      modifierHandledViaPointerUp = false;
     }, 300);
   }
 
@@ -136,7 +159,7 @@
     cancelPress();
   }
 
-  // --- onClickCapture: handles modifier-click triggers, long-press suppression, outside-click close ---
+  // --- onClickCapture: suppresses clicks after triggers, closes popup on outside click ---
   function onClickCapture(e) {
     // Suppress the click that fires after a successful long-press
     if (longPressTriggered) {
@@ -146,32 +169,12 @@
       return;
     }
 
-    // Shift+click trigger
-    if (e.button === 0 && e.shiftKey && !e.ctrlKey && enableShiftClick) {
-      const anchor = findAnchor(e.target);
-      if (anchor) {
-        const href = resolveHref(anchor);
-        if (href) {
-          e.preventDefault();
-          e.stopImmediatePropagation();
-          triggerPopup(anchor, href, e.clientX, e.clientY);
-          return;
-        }
-      }
-    }
-
-    // Ctrl+click trigger
-    if (e.button === 0 && e.ctrlKey && !e.shiftKey && enableCtrlClick) {
-      const anchor = findAnchor(e.target);
-      if (anchor) {
-        const href = resolveHref(anchor);
-        if (href) {
-          e.preventDefault();
-          e.stopImmediatePropagation();
-          triggerPopup(anchor, href, e.clientX, e.clientY);
-          return;
-        }
-      }
+    // Suppress the click that fires after a modifier-click handled via pointerup
+    if (modifierHandledViaPointerUp) {
+      modifierHandledViaPointerUp = false;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      return;
     }
 
     // Close popup on outside click
@@ -213,8 +216,19 @@
   // DOM HELPERS
   // =========================================================================
 
-  // --- findAnchor: walks up the DOM to find the nearest <a> element ---
-  function findAnchor(el) {
+  // --- findAnchor: walks up the DOM (using composedPath to pierce Shadow DOM)
+  //     to find the nearest <a> element ---
+  function findAnchor(el, event) {
+    // Use composedPath if available (pierces Shadow DOM boundaries)
+    if (event && typeof event.composedPath === "function") {
+      const path = event.composedPath();
+      for (let i = 0; i < Math.min(path.length, ANCHOR_TRAVERSAL_DEPTH); i++) {
+        const node = path[i];
+        if (node.tagName === "A" && node.href) return node;
+      }
+      return null;
+    }
+    // Fallback: regular parentElement walk
     let node = el;
     for (let i = 0; i < ANCHOR_TRAVERSAL_DEPTH && node && node !== document; i++) {
       if (node.tagName === "A" && node.href) return node;
@@ -237,13 +251,33 @@
     }
   }
 
-  // --- extractHeadline: gets meaningful text from the anchor ---
+  // --- extractHeadline: gets meaningful text from the anchor, falling back
+  //     to nearby article/heading context for sites like Google News ---
   function extractHeadline(anchor) {
     let text = anchor.textContent.trim();
 
     // Fall back to aria-label or title for image-only links
     if (text.length < 5) {
       text = anchor.getAttribute("aria-label") || anchor.title || text;
+    }
+
+    // Fall back to parent <article> headings (Google News, news aggregators)
+    if (!text || text.length < 5) {
+      const article = anchor.closest("article, [role='article'], c-wiz");
+      if (article) {
+        const heading = article.querySelector("h1, h2, h3, h4, [role='heading']");
+        if (heading) {
+          const headingText = heading.textContent.trim();
+          if (headingText.length >= 5) text = headingText;
+        }
+        // If still no heading, try any <a> with substantial text
+        if (!text || text.length < 5) {
+          for (const link of article.querySelectorAll("a")) {
+            const linkText = link.textContent.trim();
+            if (linkText.length >= 10) { text = linkText; break; }
+          }
+        }
+      }
     }
 
     // Collapse whitespace
@@ -300,17 +334,26 @@
       return href;
     }
 
-    // Try data-n-au (Google News), data-href, or data-url attributes on the anchor
-    const dataHref = anchor.getAttribute("data-n-au") || anchor.getAttribute("data-href") || anchor.getAttribute("data-url");
-    if (dataHref) {
-      try {
-        const dataUrl = new URL(dataHref);
-        if (dataUrl.protocol === "http:" || dataUrl.protocol === "https:") {
-          return dataUrl.href;
+    // Try data-n-au, data-href, or data-url on the anchor itself
+    const directUrl = extractDataUrl(anchor);
+    if (directUrl) return directUrl;
+
+    // Walk up to parent <article> / <c-wiz> and search for data-n-au on any element
+    let parent = anchor.parentElement;
+    for (let i = 0; i < 6 && parent && parent !== document.body; i++) {
+      const parentUrl = extractDataUrl(parent);
+      if (parentUrl) return parentUrl;
+
+      if (parent.tagName === "ARTICLE" || parent.tagName === "C-WIZ") {
+        // Search within this container for any link with data-n-au
+        const dataLink = parent.querySelector("a[data-n-au]");
+        if (dataLink) {
+          const au = extractDataUrl(dataLink);
+          if (au) return au;
         }
-      } catch (_) {
-        // fall through
+        break;
       }
+      parent = parent.parentElement;
     }
 
     // Try extracting from the URL query params (e.g. ?url=... or ?q=...)
@@ -328,8 +371,30 @@
       }
     }
 
+    // Last resort: convert /articles/... to /rss/articles/... for server-side redirect
+    if (url.pathname.startsWith("/articles/") || url.pathname.startsWith("/read/")) {
+      return url.href.replace(
+        /news\.google\.com\/(articles|read)\//,
+        "news.google.com/rss/articles/"
+      );
+    }
+
     // Could not unwrap — return original and let background.js follow the redirect
     return href;
+  }
+
+  // --- extractDataUrl: checks an element for data-n-au, data-href, or data-url ---
+  function extractDataUrl(el) {
+    for (const attr of ["data-n-au", "data-href", "data-url"]) {
+      const val = el.getAttribute ? el.getAttribute(attr) : null;
+      if (val) {
+        try {
+          const u = new URL(val);
+          if (u.protocol === "http:" || u.protocol === "https:") return u.href;
+        } catch (_) { /* skip */ }
+      }
+    }
+    return null;
   }
 
   // =========================================================================
