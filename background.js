@@ -50,6 +50,7 @@ async function fetchArticle(url) {
   try {
     response = await fetch(url, {
       signal: controller.signal,
+      redirect: "follow",
       headers: { "User-Agent": "Mozilla/5.0 (compatible; NoBait/1.0)" },
     });
   } catch (err) {
@@ -77,8 +78,46 @@ async function fetchArticle(url) {
     throw createError("fetch_failed", "The link doesn't point to a readable article.");
   }
 
-  const html = await response.text();
-  return extractText(html);
+  let html = await response.text();
+
+  // Handle JS-based redirects (common on news aggregator redirect pages)
+  const jsRedirectUrl = extractJsRedirect(html);
+  if (jsRedirectUrl) {
+    return fetchArticle(jsRedirectUrl);
+  }
+
+  const text = extractText(html);
+
+  // If we got very little text and the final URL differs from the request,
+  // the page may have been a redirect stub — the extracted text is fine to use
+  return text;
+}
+
+// --- extractJsRedirect: detects common JS/meta redirect patterns in HTML ---
+function extractJsRedirect(html) {
+  // Meta refresh: <meta http-equiv="refresh" content="0;url=...">
+  const metaMatch = html.match(
+    /<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]+content\s*=\s*["']?\d+\s*;\s*url\s*=\s*["']?([^"'\s>]+)/i
+  );
+  if (metaMatch && metaMatch[1]) {
+    try {
+      const u = new URL(metaMatch[1]);
+      if (u.protocol === "http:" || u.protocol === "https:") return u.href;
+    } catch (_) { /* skip */ }
+  }
+
+  // window.location / location.href = "..."
+  const jsMatch = html.match(
+    /(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']/i
+  );
+  if (jsMatch && jsMatch[1]) {
+    try {
+      const u = new URL(jsMatch[1]);
+      if (u.protocol === "http:" || u.protocol === "https:") return u.href;
+    } catch (_) { /* skip */ }
+  }
+
+  return null;
 }
 
 // --- extractText: strips HTML down to plain text ---
