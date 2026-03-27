@@ -7,6 +7,8 @@ const FETCH_TIMEOUT_MS = 10000;
 const AI_TIMEOUT_MS = 15000;
 const MAX_CONTENT_LENGTH = 5000;
 const MIN_CONTENT_LENGTH = 50;
+const BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 // --- Message listener: routes SUMMARIZE requests from the content script ---
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -24,21 +26,98 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // --- handleSummarize: orchestrates fetch -> extract -> AI pipeline ---
 async function handleSummarize(url, headline) {
-  // Phase 1: fetch and extract article text
   let articleText;
+
+  // Phase 1: try to fetch the article directly
   try {
     articleText = await fetchArticle(url);
-  } catch (err) {
-    return { ok: false, error: err.errorType || "fetch_failed", message: err.message };
+  } catch (_) {
+    articleText = null;
   }
 
-  // Phase 2: send to AI proxy
+  // Phase 2: for Google News redirect URLs, try alternative approaches
+  if (!articleText && isGoogleNewsRedirectUrl(url)) {
+    // 2a: try to decode the article ID to get the real URL
+    const realUrl = decodeGoogleNewsUrl(url);
+    if (realUrl) {
+      try {
+        articleText = await fetchArticle(realUrl);
+      } catch (_) { /* fall through */ }
+    }
+
+    // 2b: try the RSS variant (server-side redirect)
+    if (!articleText) {
+      const rssUrl = url.replace(
+        /news\.google\.com\/(read|articles)\//,
+        "news.google.com/rss/articles/"
+      );
+      if (rssUrl !== url) {
+        try {
+          articleText = await fetchArticle(rssUrl);
+        } catch (_) { /* fall through */ }
+      }
+    }
+  }
+
+  // Phase 3: send to AI — with article text if available, headline-only otherwise
   try {
     const summary = await callAI(headline, articleText);
     return { ok: true, summary };
   } catch (err) {
     return { ok: false, error: "ai_error", message: err.message || "Summarization failed." };
   }
+}
+
+// --- isGoogleNewsRedirectUrl: checks if a URL is a Google News redirect ---
+function isGoogleNewsRedirectUrl(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    return (host === "news.google.com" || host.endsWith(".news.google.com")) &&
+      (u.pathname.startsWith("/read/") || u.pathname.startsWith("/articles/") ||
+       u.pathname.startsWith("/rss/articles/"));
+  } catch (_) {
+    return false;
+  }
+}
+
+// --- decodeGoogleNewsUrl: tries to extract the real article URL from the
+//     base64-encoded article ID in Google News redirect URLs ---
+function decodeGoogleNewsUrl(url) {
+  try {
+    const u = new URL(url);
+    // Extract the article ID from paths like /read/CBMi... or /articles/CBMi...
+    const match = u.pathname.match(/\/(read|articles)\/(CB[A-Za-z0-9_-]+)/);
+    if (!match) return null;
+
+    const articleId = match[2];
+
+    // Base64url → standard base64
+    let b64 = articleId.replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4) b64 += "=";
+
+    // Decode to binary string
+    const bytes = atob(b64);
+
+    // Scan for "http" in the decoded bytes and extract the URL
+    const httpIdx = bytes.indexOf("http");
+    if (httpIdx < 0) return null;
+
+    let end = httpIdx;
+    while (end < bytes.length) {
+      const c = bytes.charCodeAt(end);
+      // Stop at control chars or non-ASCII (URL chars are all printable ASCII)
+      if (c < 32 || c > 126) break;
+      end++;
+    }
+
+    const candidate = bytes.substring(httpIdx, end);
+    const decoded = new URL(candidate);
+    if (decoded.protocol === "http:" || decoded.protocol === "https:") {
+      return decoded.href;
+    }
+  } catch (_) { /* decoding failed */ }
+  return null;
 }
 
 // --- fetchArticle: downloads the page HTML with a timeout ---
@@ -51,7 +130,7 @@ async function fetchArticle(url) {
     response = await fetch(url, {
       signal: controller.signal,
       redirect: "follow",
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; NoBait/1.0)" },
+      headers: { "User-Agent": BROWSER_UA },
     });
   } catch (err) {
     clearTimeout(timer);
@@ -191,6 +270,23 @@ async function callAI(headline, content) {
 
 // --- buildPrompt: constructs the full AI prompt from headline + content ---
 function buildPrompt(headline, content) {
+  if (!content) {
+    // Headline-only mode: AI answers from its own knowledge
+    return `You are NoBait, an AI that cuts through clickbait. The full article could not be loaded, but based on the headline below and your knowledge, provide the ACTUAL answer or key information the headline is teasing.
+
+Rules:
+- Give the direct answer in 1-3 sentences max
+- No fluff, no filler, no rewording the headline
+- If the headline asks a question, answer it directly
+- If it's a listicle tease, give the key item(s)
+- If it's rage/shock bait, state what actually happened plainly
+- If you genuinely don't know the answer, say so briefly
+
+Headline: "${headline}"
+
+Direct answer:`;
+  }
+
   return `You are NoBait, an AI that cuts through clickbait. Given a headline and the article content, provide the ACTUAL answer or key information the headline is teasing.
 
 Rules:
