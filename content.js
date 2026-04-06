@@ -4,6 +4,9 @@
 (function () {
   "use strict";
 
+  // --- Cross-browser API shim (Chrome uses `chrome`, Firefox exposes `browser`) ---
+  const api = (typeof browser !== "undefined") ? browser : chrome;
+
   // --- Configuration ---
   const LONG_PRESS_MS = 800;
   const MOVE_THRESHOLD = 10;
@@ -48,7 +51,7 @@
   loadTriggerSettings();
 
   // --- Listen for storage changes so popup toggles take effect immediately ---
-  chrome.storage.onChanged.addListener(onStorageChanged);
+  api.storage.onChanged.addListener(onStorageChanged);
 
   // --- Event listeners ---
   document.addEventListener("pointerdown", onPointerDown, true);
@@ -61,16 +64,20 @@
   // SETTINGS
   // =========================================================================
 
-  // --- loadTriggerSettings: reads saved trigger preferences from chrome.storage ---
+  // --- loadTriggerSettings: reads saved trigger preferences from extension storage.
+  //     Uses Promise style so it works on both Chrome (MV3 returns Promises) and
+  //     Firefox (browser.* always returns Promises) ---
   function loadTriggerSettings() {
-    chrome.storage.sync.get([STORAGE_KEY], (result) => {
-      if (chrome.runtime.lastError) return;
-      const s = result[STORAGE_KEY];
-      if (!s) return;
-      if (typeof s.longClick === "boolean") enableLongClick = s.longClick;
-      if (typeof s.shiftClick === "boolean") enableShiftClick = s.shiftClick;
-      if (typeof s.ctrlClick === "boolean") enableCtrlClick = s.ctrlClick;
-    });
+    try {
+      const p = api.storage.sync.get([STORAGE_KEY]);
+      Promise.resolve(p).then((result) => {
+        const s = result && result[STORAGE_KEY];
+        if (!s) return;
+        if (typeof s.longClick === "boolean") enableLongClick = s.longClick;
+        if (typeof s.shiftClick === "boolean") enableShiftClick = s.shiftClick;
+        if (typeof s.ctrlClick === "boolean") enableCtrlClick = s.ctrlClick;
+      }).catch(() => { /* ignore */ });
+    } catch (_) { /* ignore */ }
   }
 
   // --- onStorageChanged: updates trigger flags when user toggles settings ---
@@ -490,22 +497,24 @@
       });
     });
 
-    // Request summary from background
-    chrome.runtime.sendMessage({ type: "SUMMARIZE", url, headline }, (response) => {
-      if (chrome.runtime.lastError) {
+    // Request summary from background. Use Promise style so the same code path
+    // works in Chrome (MV3 returns Promises when no callback is given) and
+    // Firefox (browser.runtime.sendMessage always returns a Promise).
+    Promise.resolve(api.runtime.sendMessage({ type: "SUMMARIZE", url, headline }))
+      .then((response) => {
+        if (!response) {
+          renderError(popup, spinnerWrap, "fetch_failed", "No response from extension.", headline);
+          return;
+        }
+        if (response.ok) {
+          renderSummary(popup, spinnerWrap, response.summary);
+        } else {
+          renderError(popup, spinnerWrap, response.error, response.message, headline);
+        }
+      })
+      .catch(() => {
         renderError(popup, spinnerWrap, "fetch_failed", "Extension error. Try again.", headline);
-        return;
-      }
-      if (!response) {
-        renderError(popup, spinnerWrap, "fetch_failed", "No response from extension.", headline);
-        return;
-      }
-      if (response.ok) {
-        renderSummary(popup, spinnerWrap, response.summary);
-      } else {
-        renderError(popup, spinnerWrap, response.error, response.message, headline);
-      }
-    });
+      });
   }
 
   // --- renderSummary: replaces spinner with the AI summary text ---
