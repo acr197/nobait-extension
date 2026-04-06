@@ -1,6 +1,9 @@
 // NoBait - Background Service Worker
 // Fetches article text and calls the AI proxy for summarization
 
+// --- Cross-browser API shim (Chrome uses `chrome`, Firefox exposes `browser`) ---
+const api = (typeof browser !== "undefined") ? browser : chrome;
+
 // --- Configuration ---
 const PROXY_URL = "https://nobait-proxy.acr197.workers.dev/summarize";
 const FETCH_TIMEOUT_MS = 10000;
@@ -10,18 +13,24 @@ const MIN_CONTENT_LENGTH = 50;
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-// --- Message listener: routes SUMMARIZE requests from the content script ---
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type !== "SUMMARIZE") return;
+// --- Message listener: routes SUMMARIZE requests from the content script.
+//     Returns a Promise so the same handler works in Chrome (MV3) and Firefox.
+//     Both browsers accept a Promise return value as the async response. ---
+api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || msg.type !== "SUMMARIZE") return;
 
-  handleSummarize(msg.url, msg.headline)
-    .then(sendResponse)
-    .catch(() =>
-      sendResponse({ ok: false, error: "ai_error", message: "An unexpected error occurred." })
-    );
+  const responsePromise = handleSummarize(msg.url, msg.headline).catch(() => ({
+    ok: false,
+    error: "ai_error",
+    message: "An unexpected error occurred.",
+  }));
 
-  // Keep the message channel open for the async response
-  return true;
+  // Chrome path: call sendResponse and keep the channel open with `return true`.
+  // Firefox path: returning the Promise directly is the supported pattern.
+  responsePromise.then((res) => {
+    try { sendResponse(res); } catch (_) { /* channel may be closed in Firefox */ }
+  });
+  return responsePromise;
 });
 
 // --- handleSummarize: orchestrates fetch -> extract -> AI pipeline ---

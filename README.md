@@ -22,11 +22,19 @@ It pulls context from the source (or closest match) and returns a short, direct 
 
 ## Setup
 
+### Chrome
+
 1. Clone this repo
 2. Open `chrome://extensions` > Enable Developer Mode
 3. Click "Load unpacked" > Select this folder
 4. Click the NoBait icon to set your AI proxy URL
 
+### Firefox
+
+1. Clone this repo
+2. Open `about:debugging` > This Firefox > Load Temporary Add-on
+3. Select `manifest.json` from this folder
+
 ## Tech
 
-Chrome Extension (Manifest V3) + AI API
+Cross-browser WebExtension (Manifest V3) — Chrome & Firefox — + AI API

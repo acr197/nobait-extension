@@ -1,5 +1,8 @@
 // NoBait - Popup Settings
-// Manages trigger toggle checkboxes and persists to chrome.storage.sync
+// Manages trigger toggle checkboxes and persists to extension storage
+
+// --- Cross-browser API shim (Chrome uses `chrome`, Firefox exposes `browser`) ---
+const api = (typeof browser !== "undefined") ? browser : chrome;
 
 // --- Configuration ---
 const STORAGE_KEY = "triggerSettings";
@@ -11,19 +14,21 @@ const shiftClickEl = document.getElementById("trigger-shiftclick");
 const ctrlClickEl = document.getElementById("trigger-ctrlclick");
 const statusEl = document.getElementById("status");
 
-// --- loadSettings: reads saved trigger state and updates checkboxes ---
+// --- loadSettings: reads saved trigger state and updates checkboxes.
+//     Uses Promise style so it works on both Chrome (MV3) and Firefox. ---
 function loadSettings() {
-  chrome.storage.sync.get([STORAGE_KEY], (result) => {
-    if (chrome.runtime.lastError) return;
-    const s = result[STORAGE_KEY];
-    if (!s) return;
-    if (typeof s.longClick === "boolean") longClickEl.checked = s.longClick;
-    if (typeof s.shiftClick === "boolean") shiftClickEl.checked = s.shiftClick;
-    if (typeof s.ctrlClick === "boolean") ctrlClickEl.checked = s.ctrlClick;
-  });
+  Promise.resolve(api.storage.sync.get([STORAGE_KEY]))
+    .then((result) => {
+      const s = result && result[STORAGE_KEY];
+      if (!s) return;
+      if (typeof s.longClick === "boolean") longClickEl.checked = s.longClick;
+      if (typeof s.shiftClick === "boolean") shiftClickEl.checked = s.shiftClick;
+      if (typeof s.ctrlClick === "boolean") ctrlClickEl.checked = s.ctrlClick;
+    })
+    .catch(() => { /* ignore */ });
 }
 
-// --- saveSettings: writes current checkbox state to chrome.storage ---
+// --- saveSettings: writes current checkbox state to extension storage ---
 function saveSettings() {
   const settings = {
     longClick: longClickEl.checked,
@@ -31,13 +36,9 @@ function saveSettings() {
     ctrlClick: ctrlClickEl.checked,
   };
 
-  chrome.storage.sync.set({ [STORAGE_KEY]: settings }, () => {
-    if (chrome.runtime.lastError) {
-      flashStatus("Error saving", "#ef4444");
-      return;
-    }
-    flashStatus("Saved!", "#22c55e");
-  });
+  Promise.resolve(api.storage.sync.set({ [STORAGE_KEY]: settings }))
+    .then(() => flashStatus("Saved!", "#22c55e"))
+    .catch(() => flashStatus("Error saving", "#ef4444"));
 }
 
 // --- flashStatus: briefly shows a status message ---

@@ -26,5 +26,11 @@
       "js": ["content.js"],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "nobait@acr197",
+      "strict_min_version": "121.0"
+    }
+  }
 }
