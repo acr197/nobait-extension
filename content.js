@@ -53,18 +53,6 @@
   // --- Listen for storage changes so popup toggles take effect immediately ---
   api.storage.onChanged.addListener(onStorageChanged);
 
-  // --- Listen for scrape requests from the sidebar (relayed via background) ---
-  api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (!msg || msg.type !== "EXTRACT_LINKS") return;
-    try {
-      const items = extractNewsLinks();
-      sendResponse({ ok: true, items });
-    } catch (_) {
-      sendResponse({ ok: false, items: [] });
-    }
-    return true;
-  });
-
   // --- Event listeners ---
   document.addEventListener("pointerdown", onPointerDown, true);
   document.addEventListener("pointermove", onPointerMove, true);
@@ -302,89 +290,6 @@
     // Collapse whitespace
     text = text.replace(/\s+/g, " ").trim();
     return text || null;
-  }
-
-  // =========================================================================
-  // PAGE SCRAPING (sidebar fallback)
-  // =========================================================================
-
-  // --- extractNewsLinks: walks the page DOM and returns up to MAX_SCRAPE_ITEMS
-  //     deduplicated, blocklist-filtered { url, title, source } items that
-  //     look like news article links. Heuristics, in priority order:
-  //       1. Anchors that contain a heading (<h1>-<h4>) -- the highest-signal
-  //          shape since publishers wrap headlines in heading tags.
-  //       2. Anchors inside <article> / [role=article] containers whose own
-  //          text is at least 25 chars (real headlines, not nav links).
-  //       3. Anchors anywhere on the page whose visible text is at least
-  //          40 chars (long enough to plausibly be a headline rather than
-  //          UI chrome). This sweeps up sites that don't use semantic HTML.
-  //     Within each pass we use a Map keyed on the resolved URL so a link
-  //     that matches multiple heuristics only contributes once. ---
-  const MAX_SCRAPE_ITEMS = 25;
-
-  function extractNewsLinks() {
-    const out = new Map();
-
-    // Pass 1: anchors that wrap a heading
-    const headingsInLinks = document.querySelectorAll("a h1, a h2, a h3, a h4");
-    for (const h of headingsInLinks) {
-      if (out.size >= MAX_SCRAPE_ITEMS) break;
-      const a = h.closest("a");
-      if (!a) continue;
-      addScrapeCandidate(out, a, h.textContent);
-    }
-
-    // Pass 2: anchors inside article-like containers
-    if (out.size < MAX_SCRAPE_ITEMS) {
-      const articles = document.querySelectorAll("article, [role='article']");
-      for (const article of articles) {
-        if (out.size >= MAX_SCRAPE_ITEMS) break;
-        const links = article.querySelectorAll("a[href]");
-        for (const a of links) {
-          if (out.size >= MAX_SCRAPE_ITEMS) break;
-          const text = (a.textContent || "").trim();
-          if (text.length >= 25) addScrapeCandidate(out, a, text);
-        }
-      }
-    }
-
-    // Pass 3: long-text anchors anywhere
-    if (out.size < MAX_SCRAPE_ITEMS) {
-      const all = document.querySelectorAll("a[href]");
-      for (const a of all) {
-        if (out.size >= MAX_SCRAPE_ITEMS) break;
-        const text = (a.textContent || "").trim();
-        if (text.length >= 40) addScrapeCandidate(out, a, text);
-      }
-    }
-
-    return Array.from(out.values());
-  }
-
-  // --- addScrapeCandidate: validates the anchor against the same blocklist
-  //     content.js uses for long-click, normalizes the title, and inserts
-  //     into the dedupe map. ---
-  function addScrapeCandidate(map, anchor, rawTitle) {
-    if (!anchor || map.size >= MAX_SCRAPE_ITEMS) return;
-
-    const href = resolveHref(anchor);
-    if (!href) return;
-    if (map.has(href)) return;
-    if (isBlockedUrl(href)) return;
-
-    let title = (rawTitle || anchor.textContent || "").replace(/\s+/g, " ").trim();
-    if (!title || title.length < 10) {
-      title = (anchor.getAttribute("aria-label") || anchor.title || "").trim();
-    }
-    if (!title || title.length < 10) return;
-
-    let source = "";
-    try {
-      const u = new URL(href);
-      source = u.hostname.replace(/^www\./, "");
-    } catch (_) { /* leave blank */ }
-
-    map.set(href, { url: href, title, source });
   }
 
   // =========================================================================

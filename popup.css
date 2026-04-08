@@ -91,38 +91,6 @@ p {
   transition: opacity 0.2s;
 }
 
-.primary-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-  margin-top: 4px;
-  padding: 9px 14px;
-  border: none;
-  border-radius: 8px;
-  background: #6c47ff;
-  color: #fff;
-  font-size: 13px;
-  font-weight: 600;
-  font-family: inherit;
-  cursor: pointer;
-  transition: background 0.15s ease, transform 0.1s ease;
-}
-
-.primary-btn:hover {
-  background: #5835db;
-}
-
-.primary-btn:active {
-  transform: scale(0.97);
-}
-
-.primary-btn:disabled {
-  background: #c8bff0;
-  cursor: default;
-  transform: none;
-}
-
 .bmc-wrap {
   padding-top: 4px;
   border-top: 1px solid #f0f0f0;
