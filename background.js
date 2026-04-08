@@ -14,6 +14,16 @@ const MIN_CONTENT_LENGTH = 50;
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+
+// --- Merino endpoint that powers Firefox's own Discovery Stream / Pocket
+//     feed. We can't read about:newtab's DOM (Firefox blocks content scripts
+//     from privileged pages), so when the sidebar asks us to scrape that
+//     page we substitute the same feed Mozilla would have shown there. ---
+const MERINO_FEED_URL = "https://merino.services.mozilla.com/api/v1/curated-recommendations";
+const FEED_MAX_ITEMS = 12;
+
+// --- Message listener: routes SUMMARIZE and SCRAPE_PAGE requests.
+
 // --- Merino endpoint powering Firefox's own Discovery Stream / Pocket feed.
 //     Used by the overridden new tab page so NoBait can show live headlines
 //     that mirror what Mozilla would have shown on about:newtab. ---
@@ -23,6 +33,7 @@ const FEED_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const FEED_MAX_ITEMS = 12;
 
 // --- Message listener: routes SUMMARIZE and FETCH_FEED requests.
+
 //     Returns a Promise so the same handler works in Chrome (MV3) and Firefox.
 //     Both browsers accept a Promise return value as the async response. ---
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -35,8 +46,18 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       error: "ai_error",
       message: "An unexpected error occurred.",
     }));
+
+  } else if (msg.type === "SCRAPE_PAGE") {
+    responsePromise = handleScrapePage(msg.tabId, msg.url || "").catch(() => ({
+      ok: false,
+      error: "scrape_failed",
+      message: "Could not scan this page.",
+      items: [],
+    }));
+
   } else if (msg.type === "FETCH_FEED") {
     responsePromise = handleFetchFeed().catch(() => ({ ok: false, items: [] }));
+
   } else {
     return;
   }
@@ -338,6 +359,90 @@ function createError(errorType, message) {
 }
 
 // =========================================================================
+
+// SCRAPE PAGE (sidebar fallback for when long-click doesn't work)
+// =========================================================================
+
+// --- handleScrapePage: returns a list of news links the sidebar can summarize.
+//     For about:newtab/about:home (which extensions can't inject into) we fetch
+//     Mozilla's Merino curated-recommendations feed -- the same data Firefox
+//     itself shows on the new tab page. For every other URL we ask the content
+//     script in that tab to extract anchors via EXTRACT_LINKS. ---
+async function handleScrapePage(tabId, url) {
+  const lowered = (url || "").toLowerCase();
+
+  // about:newtab / about:home: content scripts are blocked, use Merino feed
+  if (lowered.startsWith("about:newtab") || lowered.startsWith("about:home")) {
+    try {
+      const items = await fetchMerinoFeed();
+      if (!items.length) {
+        return {
+          ok: false,
+          error: "newtab_unavailable",
+          message: "Could not load Firefox's recommended stories.",
+          items: [],
+        };
+      }
+      return { ok: true, items };
+    } catch (_) {
+      return {
+        ok: false,
+        error: "newtab_unavailable",
+        message: "Could not reach Firefox's story feed.",
+        items: [],
+      };
+    }
+  }
+
+  // Other privileged about: / chrome: pages we can't scrape at all
+  if (lowered.startsWith("about:") || lowered.startsWith("chrome:") ||
+      lowered.startsWith("moz-extension:") || lowered.startsWith("chrome-extension:")) {
+    return {
+      ok: false,
+      error: "restricted_page",
+      message: "This browser page is restricted. Try it on a regular website.",
+      items: [],
+    };
+  }
+
+  // Regular page: ask the content script to walk the DOM
+  if (typeof tabId !== "number") {
+    return {
+      ok: false,
+      error: "no_tab",
+      message: "Could not identify the active tab.",
+      items: [],
+    };
+  }
+
+  let response;
+  try {
+    response = await Promise.resolve(api.tabs.sendMessage(tabId, { type: "EXTRACT_LINKS" }));
+  } catch (_) {
+    return {
+      ok: false,
+      error: "no_content_script",
+      message: "Could not connect to this page. Reload it and try again.",
+      items: [],
+    };
+  }
+
+  if (!response || !Array.isArray(response.items) || response.items.length === 0) {
+    return {
+      ok: false,
+      error: "no_links",
+      message: "No news article links found on this page.",
+      items: [],
+    };
+  }
+
+  return { ok: true, items: response.items };
+}
+
+// --- fetchMerinoFeed: pulls Firefox's curated stories. The Merino service
+//     accepts POST with locale/region/count and returns a JSON envelope whose
+//     shape has changed across versions, so normalizeFeedItems is defensive
+//     about where the array of items lives. ---
 // NEW TAB FEED
 // =========================================================================
 
@@ -385,6 +490,17 @@ async function fetchMerinoFeed() {
     response = await fetch(MERINO_FEED_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ locale: "en-US", region: "US", count: FEED_MAX_ITEMS }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    return [];
+  }
+
+  clearTimeout(timer);
+  if (!response.ok) return [];
+
       body: JSON.stringify({
         locale: "en-US",
         region: "US",
@@ -405,10 +521,74 @@ async function fetchMerinoFeed() {
   try {
     data = await response.json();
   } catch (_) {
+    return [];
+=======
     return null;
   }
 
   return normalizeFeedItems(data);
+}
+
+// --- normalizeFeedItems: walks the Merino response in priority order and
+//     converts each entry into the { url, title, source } shape the sidebar
+//     expects. Mozilla has shipped at least three different envelope shapes
+//     for this endpoint (top-level `data`, `recommendations`, and per-feed
+//     buckets), so we check all of them and stop at the first non-empty list. ---
+function normalizeFeedItems(data) {
+  if (!data || typeof data !== "object") return [];
+
+  const buckets = [];
+  if (Array.isArray(data.data)) buckets.push(data.data);
+  if (Array.isArray(data.recommendations)) buckets.push(data.recommendations);
+  if (data.feeds && typeof data.feeds === "object") {
+    for (const key of Object.keys(data.feeds)) {
+      const feed = data.feeds[key];
+      if (feed && Array.isArray(feed.recommendations)) buckets.push(feed.recommendations);
+      if (Array.isArray(feed)) buckets.push(feed);
+    }
+  }
+
+  const out = [];
+  const seen = new Set();
+  for (const list of buckets) {
+    for (const entry of list) {
+      if (out.length >= FEED_MAX_ITEMS) break;
+      if (!entry || typeof entry !== "object") continue;
+
+      const url = pickString(entry, ["url", "link", "permalink"]);
+      const title = pickString(entry, ["title", "headline", "name"]);
+      if (!url || !title) continue;
+      if (seen.has(url)) continue;
+
+      // Validate it's an http(s) URL
+      let parsed;
+      try {
+        parsed = new URL(url);
+      } catch (_) { continue; }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
+
+      const source =
+        pickString(entry, ["publisher", "domain", "source"]) ||
+        parsed.hostname.replace(/^www\./, "");
+
+      seen.add(url);
+      out.push({ url, title, source });
+    }
+    if (out.length >= FEED_MAX_ITEMS) break;
+  }
+
+  return out;
+}
+
+// --- pickString: returns the first non-empty string value found at any of
+//     the candidate keys on the given object. Used to defensively extract
+//     fields from Merino entries whose schema varies. ---
+function pickString(obj, keys) {
+  for (const key of keys) {
+    const v = obj[key];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
 }
 
 // --- normalizeFeedItems: the Merino schema has changed over time; scan the
