@@ -35,6 +35,9 @@
       "16": "icons/icon-16.png",
       "32": "icons/icon-48.png"
     }
+=======
+  "chrome_url_overrides": {
+    "newtab": "newtab.html"
   },
   "browser_specific_settings": {
     "gecko": {

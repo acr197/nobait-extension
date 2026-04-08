@@ -14,6 +14,7 @@ const MIN_CONTENT_LENGTH = 50;
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+
 // --- Merino endpoint that powers Firefox's own Discovery Stream / Pocket
 //     feed. We can't read about:newtab's DOM (Firefox blocks content scripts
 //     from privileged pages), so when the sidebar asks us to scrape that
@@ -22,6 +23,17 @@ const MERINO_FEED_URL = "https://merino.services.mozilla.com/api/v1/curated-reco
 const FEED_MAX_ITEMS = 12;
 
 // --- Message listener: routes SUMMARIZE and SCRAPE_PAGE requests.
+
+// --- Merino endpoint powering Firefox's own Discovery Stream / Pocket feed.
+//     Used by the overridden new tab page so NoBait can show live headlines
+//     that mirror what Mozilla would have shown on about:newtab. ---
+const MERINO_FEED_URL = "https://merino.services.mozilla.com/api/v1/curated-recommendations";
+const FEED_CACHE_KEY = "newtabFeedCache";
+const FEED_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const FEED_MAX_ITEMS = 12;
+
+// --- Message listener: routes SUMMARIZE and FETCH_FEED requests.
+
 //     Returns a Promise so the same handler works in Chrome (MV3) and Firefox.
 //     Both browsers accept a Promise return value as the async response. ---
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -34,6 +46,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       error: "ai_error",
       message: "An unexpected error occurred.",
     }));
+
   } else if (msg.type === "SCRAPE_PAGE") {
     responsePromise = handleScrapePage(msg.tabId, msg.url || "").catch(() => ({
       ok: false,
@@ -41,6 +54,10 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       message: "Could not scan this page.",
       items: [],
     }));
+
+  } else if (msg.type === "FETCH_FEED") {
+    responsePromise = handleFetchFeed().catch(() => ({ ok: false, items: [] }));
+
   } else {
     return;
   }
@@ -342,6 +359,7 @@ function createError(errorType, message) {
 }
 
 // =========================================================================
+
 // SCRAPE PAGE (sidebar fallback for when long-click doesn't work)
 // =========================================================================
 
@@ -425,6 +443,44 @@ async function handleScrapePage(tabId, url) {
 //     accepts POST with locale/region/count and returns a JSON envelope whose
 //     shape has changed across versions, so normalizeFeedItems is defensive
 //     about where the array of items lives. ---
+// NEW TAB FEED
+// =========================================================================
+
+// --- handleFetchFeed: returns a list of headline items for the overridden
+//     new tab. Tries Mozilla's public Merino endpoint (the same service that
+//     powers Firefox's own Discovery Stream) with a short in-memory cache so
+//     rapid new-tab openings don't hammer the network. Any failure resolves
+//     to { ok: false } and newtab.js falls back to its curated list. ---
+async function handleFetchFeed() {
+  // Serve from cache if still fresh
+  const cached = await readFeedCache();
+  if (cached && Array.isArray(cached.items) && cached.items.length > 0) {
+    const age = Date.now() - (cached.ts || 0);
+    if (age >= 0 && age < FEED_CACHE_TTL_MS) {
+      return { ok: true, items: cached.items, cached: true };
+    }
+  }
+
+  // Fetch live
+  try {
+    const items = await fetchMerinoFeed();
+    if (items && items.length > 0) {
+      writeFeedCache(items).catch(() => { /* ignore */ });
+      return { ok: true, items };
+    }
+  } catch (_) { /* fall through */ }
+
+  // Last-ditch: serve stale cache if we have it
+  if (cached && Array.isArray(cached.items) && cached.items.length > 0) {
+    return { ok: true, items: cached.items, stale: true };
+  }
+
+  return { ok: false, items: [] };
+}
+
+// --- fetchMerinoFeed: POSTs to Mozilla's curated-recommendations endpoint
+//     and normalizes whichever field names the response happens to use.
+//     Returns an array of { title, url, source } items. ---
 async function fetchMerinoFeed() {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FEED_TIMEOUT_MS);
@@ -445,11 +501,29 @@ async function fetchMerinoFeed() {
   clearTimeout(timer);
   if (!response.ok) return [];
 
+      body: JSON.stringify({
+        locale: "en-US",
+        region: "US",
+        count: FEED_MAX_ITEMS,
+      }),
+      signal: controller.signal,
+    });
+  } catch (_) {
+    clearTimeout(timer);
+    return null;
+  }
+
+  clearTimeout(timer);
+
+  if (!response || !response.ok) return null;
+
   let data;
   try {
     data = await response.json();
   } catch (_) {
     return [];
+=======
+    return null;
   }
 
   return normalizeFeedItems(data);
@@ -515,4 +589,81 @@ function pickString(obj, keys) {
     if (typeof v === "string" && v.trim()) return v.trim();
   }
   return "";
+}
+
+// --- normalizeFeedItems: the Merino schema has changed over time; scan the
+//     response for any array of objects that look like recommendations and
+//     extract title + url + source defensively. ---
+function normalizeFeedItems(data) {
+  if (!data || typeof data !== "object") return null;
+
+  // Merino typically nests under `data` (an array of items or feeds) or
+  // `recommendations`. Collect every candidate array we can find.
+  const candidateArrays = [];
+  if (Array.isArray(data.data)) candidateArrays.push(data.data);
+  if (Array.isArray(data.recommendations)) candidateArrays.push(data.recommendations);
+  if (data.feeds && typeof data.feeds === "object") {
+    for (const key of Object.keys(data.feeds)) {
+      const feed = data.feeds[key];
+      if (feed && Array.isArray(feed.recommendations)) {
+        candidateArrays.push(feed.recommendations);
+      }
+      if (Array.isArray(feed)) candidateArrays.push(feed);
+    }
+  }
+
+  const items = [];
+  const seen = new Set();
+
+  for (const arr of candidateArrays) {
+    for (const raw of arr) {
+      if (!raw || typeof raw !== "object") continue;
+
+      const title = pickString(raw, ["title", "headline", "name"]);
+      const url = pickString(raw, ["url", "link", "externalUrl", "dest_url"]);
+      const source = pickString(raw, ["publisher", "source", "domain", "siteName"]);
+
+      if (!title || !url) continue;
+      if (!/^https?:\/\//i.test(url)) continue;
+      if (seen.has(url)) continue;
+      seen.add(url);
+
+      items.push({ title: title.trim(), url, source: source ? source.trim() : "" });
+      if (items.length >= FEED_MAX_ITEMS) return items;
+    }
+  }
+
+  return items.length > 0 ? items : null;
+}
+
+// --- pickString: returns the first non-empty string property from `keys` ---
+function pickString(obj, keys) {
+  for (const k of keys) {
+    const v = obj[k];
+    if (typeof v === "string" && v.length > 0) return v;
+  }
+  return "";
+}
+
+// --- readFeedCache / writeFeedCache: tiny wrapper around storage.local so
+//     the cache survives service-worker restarts. Uses Promise style for
+//     cross-browser compatibility. ---
+function readFeedCache() {
+  try {
+    return Promise.resolve(api.storage.local.get([FEED_CACHE_KEY]))
+      .then((res) => (res && res[FEED_CACHE_KEY]) || null)
+      .catch(() => null);
+  } catch (_) {
+    return Promise.resolve(null);
+  }
+}
+
+function writeFeedCache(items) {
+  try {
+    return Promise.resolve(
+      api.storage.local.set({ [FEED_CACHE_KEY]: { ts: Date.now(), items } })
+    ).catch(() => { /* ignore */ });
+  } catch (_) {
+    return Promise.resolve();
+  }
 }
