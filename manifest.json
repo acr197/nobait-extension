@@ -28,6 +28,9 @@
       "run_at": "document_idle"
     }
   ],
+  "chrome_url_overrides": {
+    "newtab": "newtab.html"
+  },
   "browser_specific_settings": {
     "gecko": {
       "id": "nobait@acr197",
