@@ -25,7 +25,20 @@
     // Tech / apps
     "github.com", "stackoverflow.com", "notion.so", "figma.com",
     "docs.google.com", "drive.google.com",
+    // Accounts / sign-in pages — must never surface personal info
+    "accounts.google.com", "myaccount.google.com", "account.google.com",
+    "mail.google.com", "calendar.google.com", "photos.google.com",
+    "login.microsoftonline.com", "login.live.com", "account.microsoft.com",
+    "appleid.apple.com", "account.apple.com", "id.atlassian.com",
   ];
+
+  // --- Patterns used to scrub personal info from the sidebar list.
+  //     We never want to surface things like the user's email address,
+  //     "Google Account: John Doe", or "Sign in" links as if they were
+  //     news headlines. ---
+  const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+  const ACCOUNT_HEADLINE_REGEX =
+    /^(?:google account|your account|my account|account settings|sign\s*in|sign\s*out|log\s*in|log\s*out|switch account|manage account|profile)\b/i;
 
   // --- Blocked search paths ---
   const BLOCKED_SEARCH_PATHS = [
@@ -53,19 +66,50 @@
   // --- Listen for storage changes so popup toggles take effect immediately ---
   api.storage.onChanged.addListener(onStorageChanged);
 
-  // --- Listen for messages from the sidebar (GET_ARTICLE_LINKS).
+  // --- Listen for messages from the sidebar. Two types:
+  //       GET_ARTICLE_LINKS  → scan page for headlines (returns list)
+  //       SHOW_POPUP_AT      → render the in-page summary popup at (x, y)
   //     Uses both sendResponse and a Promise return for Chrome/Firefox parity. ---
   api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (!msg || msg.type !== "GET_ARTICLE_LINKS") return;
-    let result;
-    try {
-      const links = collectArticleLinks();
-      result = { ok: true, links, pageTitle: document.title, pageUrl: location.href };
-    } catch (err) {
-      result = { ok: false, error: String(err && err.message || err) };
+    if (!msg) return;
+
+    if (msg.type === "GET_ARTICLE_LINKS") {
+      let result;
+      try {
+        const links = collectArticleLinks();
+        result = { ok: true, links, pageTitle: document.title, pageUrl: location.href };
+      } catch (err) {
+        result = { ok: false, error: String(err && err.message || err) };
+      }
+      try { sendResponse(result); } catch (_) { /* channel may be closed */ }
+      return Promise.resolve(result);
     }
-    try { sendResponse(result); } catch (_) { /* channel may be closed */ }
-    return Promise.resolve(result);
+
+    if (msg.type === "SHOW_POPUP_AT") {
+      let result;
+      try {
+        const url = msg.url;
+        const headline = msg.headline;
+        if (!url || !headline) {
+          result = { ok: false, error: "missing_args" };
+        } else {
+          // Clamp the requested position to the current viewport so a
+          // stale Y from the sidebar (after the page scrolled) still lands
+          // somewhere visible. The popup already does its own clamping,
+          // but do a conservative pre-clamp here too.
+          const x = typeof msg.x === "number" ? msg.x : 20;
+          let y = typeof msg.y === "number" ? msg.y : 120;
+          if (y < 20) y = 20;
+          if (y > window.innerHeight - 20) y = window.innerHeight - 20;
+          showPopup(url, headline, x, y);
+          result = { ok: true };
+        }
+      } catch (err) {
+        result = { ok: false, error: String(err && err.message || err) };
+      }
+      try { sendResponse(result); } catch (_) { /* channel may be closed */ }
+      return Promise.resolve(result);
+    }
   });
 
   // --- Event listeners ---
@@ -351,6 +395,12 @@
       // Require a reasonably substantial headline
       if (clean.length < 20) continue;
       if (clean.split(/\s+/).length < 4) continue;
+
+      // Privacy guard: never surface the user's email address, account
+      // greetings, or sign-in links — these show up as anchor text on sites
+      // like Google News and would be jarring to see in the sidebar.
+      if (EMAIL_REGEX.test(clean)) continue;
+      if (ACCOUNT_HEADLINE_REGEX.test(clean)) continue;
 
       // Try to unwrap Google News wrapper URLs
       const finalUrl = unwrapGoogleNewsUrl(anchor, href) || href;
