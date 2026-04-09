@@ -682,14 +682,28 @@
     return wrap;
   }
 
-  // --- renderSummary: replaces the spinner with the AI summary text. Only
-  //     called on ok:true responses, which always carry fully fetched article
-  //     content — unreadable articles flow through renderError() instead. ---
+  // --- renderSummary: replaces the spinner with the AI summary text. Called
+  //     on ok:true responses, which carry either:
+  //       - source:"article" → the summary is grounded in fetched article text
+  //       - source:"knowledge" → the fetch failed and the AI answered from
+  //         web search / training data. We show a clear amber banner so the
+  //         reader can tell which kind of answer they're looking at. ---
   function renderSummary(popup, oldEl, response, url, headline, mode) {
     if (!activePopupHost) return;
 
     const body = document.createElement("div");
     body.className = "nobait-body";
+
+    // Amber banner when the answer did NOT come from the fetched article —
+    // trust matters more than cleverness here.
+    if (response.source === "knowledge" || response.contentStatus === "from_knowledge") {
+      const banner = document.createElement("div");
+      banner.className = "nobait-status";
+      banner.textContent =
+        response.contentStatusMessage ||
+        "Article couldn't be fetched — answer is from AI knowledge.";
+      body.appendChild(banner);
+    }
 
     const text = document.createElement("div");
     text.className = "nobait-summary";
