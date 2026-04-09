@@ -48,8 +48,20 @@
   // =========================================================================
 
   loadSettings();
+  renderVersionLabel();
   attachEventListeners();
   scanActiveTab();
+
+  // --- renderVersionLabel: single source of truth is manifest.json. ---
+  function renderVersionLabel() {
+    try {
+      const manifest = api.runtime.getManifest();
+      const el = document.getElementById("sb-version");
+      if (el && manifest && manifest.version) {
+        el.textContent = "v" + manifest.version;
+      }
+    } catch (_) { /* ignore */ }
+  }
 
   // Rescan when the user switches tabs or navigates the current tab
   if (api.tabs && api.tabs.onActivated) {
@@ -376,8 +388,54 @@
     }
   }
 
+  // --- Rotating snarky lines shown with the PURE CLICKBAIT banner. ---
+  const CLICKBAIT_QUIPS = [
+    "Saved you the click.",
+    "Not even worth lifting a finger.",
+    "All bait, no meal.",
+    "Journalistic rickroll.",
+    "Hook set, line empty.",
+    "You're welcome.",
+    "The article's soul: empty.",
+    "Attention economy 1, your time 0.",
+  ];
+
+  function parseClickbaitVerdict(summary) {
+    if (!summary) return null;
+    const m = summary.match(/^\s*CLICKBAIT\s*[:\-]\s*(.*)$/is);
+    if (!m) return null;
+    return (m[1] || "").trim();
+  }
+
   function renderSummary(summary) {
     modalBodyEl.innerHTML = "";
+
+    const verdict = parseClickbaitVerdict(summary);
+    if (verdict !== null) {
+      const wrap = document.createElement("div");
+      wrap.className = "sb-modal-clickbait";
+
+      const banner = document.createElement("div");
+      banner.className = "sb-modal-clickbait-banner";
+      banner.textContent = "PURE CLICKBAIT";
+      wrap.appendChild(banner);
+
+      if (verdict) {
+        const roast = document.createElement("div");
+        roast.className = "sb-modal-clickbait-roast";
+        roast.textContent = verdict;
+        wrap.appendChild(roast);
+      }
+
+      const quip = document.createElement("div");
+      quip.className = "sb-modal-clickbait-quip";
+      quip.textContent = CLICKBAIT_QUIPS[Math.floor(Math.random() * CLICKBAIT_QUIPS.length)];
+      wrap.appendChild(quip);
+
+      modalBodyEl.appendChild(wrap);
+      return;
+    }
+
     const div = document.createElement("div");
     div.className = "sb-modal-summary";
     div.textContent = summary;

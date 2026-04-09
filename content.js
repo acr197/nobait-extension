@@ -317,6 +317,19 @@
     }
   }
 
+  // --- Material Icons ligature regex. Sites like Google News render inline
+  //     icons with <i class="material-icons">chevron_right</i> inside or next
+  //     to the article's anchor, which means the ligature name bleeds into
+  //     the anchor's textContent. Strip any whole-word occurrence so headlines
+  //     don't end with "... chevron_right". ---
+  const ICON_LIGATURE_REGEX = /\b(?:chevron_right|chevron_left|chevron_up|chevron_down|arrow_forward|arrow_back|arrow_upward|arrow_downward|keyboard_arrow_right|keyboard_arrow_left|keyboard_arrow_up|keyboard_arrow_down|open_in_new|open_in_browser|expand_more|expand_less|more_vert|more_horiz|play_arrow|launch|fiber_manual_record|radio_button_unchecked)\b/gi;
+
+  // --- cleanHeadlineText: strips icon ligature names and collapses whitespace ---
+  function cleanHeadlineText(text) {
+    if (!text) return text;
+    return text.replace(ICON_LIGATURE_REGEX, " ").replace(/\s+/g, " ").trim();
+  }
+
   // --- extractHeadline: gets meaningful text from the anchor, falling back
   //     to nearby article/heading context for sites like Google News ---
   function extractHeadline(anchor) {
@@ -346,8 +359,8 @@
       }
     }
 
-    // Collapse whitespace
-    text = text.replace(/\s+/g, " ").trim();
+    // Scrub icon ligatures and collapse whitespace
+    text = cleanHeadlineText(text);
     return text || null;
   }
 
@@ -647,6 +660,27 @@
       });
   }
 
+  // --- Rotating tongue-in-cheek lines shown under the PURE CLICKBAIT banner. ---
+  const CLICKBAIT_QUIPS = [
+    "Saved you the click.",
+    "Not even worth lifting a finger.",
+    "All bait, no meal.",
+    "Journalistic rickroll.",
+    "Hook set, line empty.",
+    "You're welcome.",
+    "The article's soul: empty.",
+    "Attention economy 1, your time 0.",
+  ];
+
+  // --- parseClickbaitVerdict: returns the snarky one-liner if the AI's
+  //     response starts with the CLICKBAIT: sentinel, otherwise null. ---
+  function parseClickbaitVerdict(summary) {
+    if (!summary) return null;
+    const m = summary.match(/^\s*CLICKBAIT\s*[:\-]\s*(.*)$/is);
+    if (!m) return null;
+    return (m[1] || "").trim();
+  }
+
   // --- renderSummary: replaces spinner with the AI summary text ---
   function renderSummary(popup, spinnerWrap, summary) {
     if (!activePopupHost) return;
@@ -654,10 +688,32 @@
     const body = document.createElement("div");
     body.className = "nobait-body";
 
-    const text = document.createElement("div");
-    text.className = "nobait-summary";
-    text.textContent = summary;
-    body.appendChild(text);
+    const verdict = parseClickbaitVerdict(summary);
+    if (verdict !== null) {
+      body.classList.add("nobait-clickbait-body");
+
+      const banner = document.createElement("div");
+      banner.className = "nobait-clickbait-banner";
+      banner.textContent = "PURE CLICKBAIT";
+      body.appendChild(banner);
+
+      if (verdict) {
+        const roast = document.createElement("div");
+        roast.className = "nobait-clickbait-roast";
+        roast.textContent = verdict;
+        body.appendChild(roast);
+      }
+
+      const quip = document.createElement("div");
+      quip.className = "nobait-clickbait-quip";
+      quip.textContent = CLICKBAIT_QUIPS[Math.floor(Math.random() * CLICKBAIT_QUIPS.length)];
+      body.appendChild(quip);
+    } else {
+      const text = document.createElement("div");
+      text.className = "nobait-summary";
+      text.textContent = summary;
+      body.appendChild(text);
+    }
 
     swapContent(popup, spinnerWrap, body);
   }
@@ -837,6 +893,42 @@
         max-height: 200px;
         overflow-y: auto;
         overscroll-behavior: contain;
+      }
+      .nobait-clickbait-body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+        gap: 8px;
+        padding: 18px 16px 16px;
+      }
+      .nobait-clickbait-banner {
+        font-size: 19px;
+        font-weight: 900;
+        letter-spacing: 0.06em;
+        color: #dc2626;
+        text-transform: uppercase;
+        text-shadow: 0 1px 0 rgba(220, 38, 38, 0.12);
+        animation: nobait-clickbait-pulse 1.6s ease-in-out infinite;
+      }
+      @keyframes nobait-clickbait-pulse {
+        0%, 100% { transform: scale(1); }
+        50%      { transform: scale(1.035); }
+      }
+      .nobait-clickbait-roast {
+        font-size: 13px;
+        color: #1a1a1a;
+        line-height: 1.45;
+        max-width: 300px;
+      }
+      .nobait-clickbait-quip {
+        margin-top: 4px;
+        padding-top: 8px;
+        border-top: 1px dashed #eee;
+        font-size: 11.5px;
+        font-style: italic;
+        color: #9a9aa6;
+        width: 100%;
       }
       .nobait-summary::-webkit-scrollbar {
         width: 6px;

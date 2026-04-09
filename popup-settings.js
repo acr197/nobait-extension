@@ -51,8 +51,20 @@ function flashStatus(text, color) {
   }, STATUS_DISPLAY_MS);
 }
 
+// --- renderVersion: single source of truth is manifest.json ---
+function renderVersion() {
+  try {
+    const manifest = api.runtime.getManifest();
+    const el = document.getElementById("version");
+    if (el && manifest && manifest.version) {
+      el.textContent = "v" + manifest.version;
+    }
+  } catch (_) { /* ignore */ }
+}
+
 // --- Initialize ---
 loadSettings();
+renderVersion();
 
 // --- Save on any checkbox change ---
 longClickEl.addEventListener("change", saveSettings);
