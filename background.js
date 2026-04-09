@@ -26,24 +26,35 @@ const MIN_CONTENT_LENGTH = 50;
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-// --- Message listener: routes SUMMARIZE requests from the content script.
+// --- Message listener: routes SUMMARIZE + FETCH_TRENDING_NEWS requests.
 //     Returns a Promise so the same handler works in Chrome (MV3) and Firefox.
 //     Both browsers accept a Promise return value as the async response. ---
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (!msg || msg.type !== "SUMMARIZE") return;
+  if (!msg) return;
 
-  const responsePromise = handleSummarize(msg.url, msg.headline).catch(() => ({
-    ok: false,
-    error: "ai_error",
-    message: "An unexpected error occurred.",
-  }));
+  if (msg.type === "SUMMARIZE") {
+    const responsePromise = handleSummarize(msg.url, msg.headline).catch(() => ({
+      ok: false,
+      error: "ai_error",
+      message: "An unexpected error occurred.",
+    }));
+    responsePromise.then((res) => {
+      try { sendResponse(res); } catch (_) { /* channel may be closed in Firefox */ }
+    });
+    return responsePromise;
+  }
 
-  // Chrome path: call sendResponse and keep the channel open with `return true`.
-  // Firefox path: returning the Promise directly is the supported pattern.
-  responsePromise.then((res) => {
-    try { sendResponse(res); } catch (_) { /* channel may be closed in Firefox */ }
-  });
-  return responsePromise;
+  if (msg.type === "FETCH_TRENDING_NEWS") {
+    const responsePromise = handleFetchTrendingNews().catch((err) => ({
+      ok: false,
+      error: "fetch_failed",
+      message: (err && err.message) || "Could not load trending news.",
+    }));
+    responsePromise.then((res) => {
+      try { sendResponse(res); } catch (_) { /* channel may be closed in Firefox */ }
+    });
+    return responsePromise;
+  }
 });
 
 // --- handleSummarize: orchestrates fetch -> extract -> AI pipeline ---
@@ -332,4 +343,102 @@ function createError(errorType, message) {
   const err = new Error(message);
   err.errorType = errorType;
   return err;
+}
+
+// =========================================================================
+// TRENDING NEWS FALLBACK
+// =========================================================================
+//
+// When the sidebar is opened on a privileged page (about:home, about:newtab,
+// about:blank, etc.), there's no content script to scan for headlines. To
+// keep the sidebar useful we fetch Google News' public top-stories RSS feed
+// and return structured article entries for the sidebar to render. The
+// sidebar shows its inline summary modal for these entries because the
+// source page isn't scriptable.
+
+const TRENDING_RSS_URL = "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en";
+const TRENDING_MAX = 60;
+
+async function handleFetchTrendingNews() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  let response;
+  try {
+    response = await fetch(TRENDING_RSS_URL, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent": BROWSER_UA,
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+      },
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    throw new Error("Could not load trending news.");
+  }
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    throw new Error("Trending news unavailable (HTTP " + response.status + ").");
+  }
+
+  const xml = await response.text();
+  const links = parseGoogleNewsRss(xml);
+  return { ok: true, links };
+}
+
+// --- parseGoogleNewsRss: extracts items from the Google News RSS feed into
+//     { url, headline, source } objects. Uses regex rather than DOMParser
+//     because DOMParser is not available in Chrome MV3 service workers. ---
+function parseGoogleNewsRss(xml) {
+  const out = [];
+  const itemRegex = /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
+  let m;
+  while ((m = itemRegex.exec(xml)) !== null && out.length < TRENDING_MAX) {
+    const item = m[1];
+    const title = extractRssTag(item, "title");
+    const link = extractRssTag(item, "link");
+    const source = extractRssTag(item, "source");
+    if (!title || !link) continue;
+
+    // Google News appends " - SourceName" to titles; strip it so the
+    // sidebar headline is clean.
+    let headline = decodeRssEntities(title).trim();
+    const dashIdx = headline.lastIndexOf(" - ");
+    if (dashIdx > 10 && dashIdx >= headline.length - 60) {
+      headline = headline.substring(0, dashIdx).trim();
+    }
+    if (headline.length < 10) continue;
+
+    const url = decodeRssEntities(link).trim();
+    let sourceName = source ? decodeRssEntities(source).trim() : "";
+    if (!sourceName) sourceName = "news.google.com";
+
+    out.push({ url, headline, source: sourceName });
+  }
+  return out;
+}
+
+// --- extractRssTag: pulls the inner text of <tag>…</tag>, tolerating
+//     attributes on the opening tag and optional CDATA wrappers. ---
+function extractRssTag(xml, tag) {
+  const re = new RegExp(
+    "<" + tag + "\\b[^>]*>\\s*(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?\\s*<\\/" + tag + "\\s*>",
+    "i"
+  );
+  const m = xml.match(re);
+  return m ? m[1] : null;
+}
+
+function decodeRssEntities(str) {
+  return str
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&nbsp;/g, " ");
 }

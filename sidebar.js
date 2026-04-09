@@ -37,6 +37,12 @@
   //     closed/reopened the modal for a different article. ---
   let activeRequestId = 0;
 
+  // --- RSS-fallback mode: true when the active tab is a privileged page
+  //     (about:home, about:newtab, etc.) and we showed Google News top
+  //     stories instead. In that mode the content script isn't available,
+  //     so clicks must fall back to the inline sidebar modal. ---
+  let inRssMode = false;
+
   // =========================================================================
   // INITIALIZATION
   // =========================================================================
@@ -134,16 +140,17 @@
   async function scanActiveTab() {
     showState("loading");
     listEl.innerHTML = "";
+    inRssMode = false;
 
     let tab;
     try {
       tab = await getActiveTab();
     } catch (_) {
-      showUnreadable();
+      await showUnreadableOrFallback(null);
       return;
     }
     if (!tab) {
-      showUnreadable();
+      await showUnreadableOrFallback(null);
       return;
     }
 
@@ -151,9 +158,10 @@
     pageTitleEl.textContent = tab.title || "(untitled)";
     pageMetaEl.textContent = "";
 
-    // Privileged pages (about:, chrome:, moz-extension:) can't be scanned
+    // Privileged pages (about:, chrome:, moz-extension:) can't be scanned —
+    // fall back to Google News top stories so the sidebar isn't empty.
     if (!isReadableUrl(tab.url)) {
-      showUnreadable();
+      await showUnreadableOrFallback(tab);
       return;
     }
 
@@ -165,12 +173,12 @@
       );
     } catch (err) {
       // Content script not present (file://, privileged page, or injection blocked)
-      showUnreadable();
+      await showUnreadableOrFallback(tab);
       return;
     }
 
     if (!response || !response.ok || !Array.isArray(response.links)) {
-      showUnreadable();
+      await showUnreadableOrFallback(tab);
       return;
     }
 
@@ -184,6 +192,33 @@
     renderLinks(links);
     pageMetaEl.textContent = links.length + (links.length === 1 ? " article" : " articles") +
       " · " + hostnameOf(tab.url);
+    showState("list");
+  }
+
+  // --- showUnreadableOrFallback: when we can't read the active tab
+  //     (privileged page like about:home, or content script unavailable),
+  //     fetch Google News top stories through background.js and render
+  //     them instead. Falls back to the "can't read" state if that fails. ---
+  async function showUnreadableOrFallback(tab) {
+    let trending;
+    try {
+      const resp = await Promise.resolve(
+        api.runtime.sendMessage({ type: "FETCH_TRENDING_NEWS" })
+      );
+      if (resp && resp.ok && Array.isArray(resp.links) && resp.links.length > 0) {
+        trending = resp.links;
+      }
+    } catch (_) { /* ignore, fall through */ }
+
+    if (!trending) {
+      showUnreadable();
+      return;
+    }
+
+    inRssMode = true;
+    pageTitleEl.textContent = "Top headlines";
+    pageMetaEl.textContent = trending.length + " articles · Google News";
+    renderLinks(trending);
     showState("list");
   }
 
@@ -242,7 +277,7 @@
 
     card.appendChild(meta);
 
-    card.addEventListener("click", () => openSummary(link));
+    card.addEventListener("click", (e) => openSummary(link, e));
     return card;
   }
 
@@ -275,7 +310,36 @@
     }, 220);
   }
 
-  async function openSummary(link) {
+  async function openSummary(link, event) {
+    // Preferred path: ask the content script to render the popup in the page
+    // itself, anchored near the cursor so the summary surfaces next to wherever
+    // the user clicked. Falls back to the inline sidebar modal if the content
+    // script isn't reachable (privileged page / RSS fallback).
+    if (!inRssMode) {
+      const clientY = event && typeof event.clientY === "number" ? event.clientY : 120;
+      try {
+        const tab = await getActiveTab();
+        if (tab && tab.id != null) {
+          const resp = await Promise.resolve(
+            api.tabs.sendMessage(tab.id, {
+              type: "SHOW_POPUP_AT",
+              url: link.url,
+              headline: link.headline,
+              // x: small left-edge offset puts the popup just inside the page
+              // viewport, which is already to the right of the sidebar panel.
+              x: 12,
+              y: clientY,
+            })
+          );
+          if (resp && resp.ok) return;
+        }
+      } catch (_) { /* fall through to the inline modal */ }
+    }
+
+    openSummaryInModal(link);
+  }
+
+  async function openSummaryInModal(link) {
     const requestId = ++activeRequestId;
 
     modalHeadlineEl.textContent = link.headline;
