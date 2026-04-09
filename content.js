@@ -684,7 +684,7 @@
 
   // --- renderSummary: replaces the spinner with the AI summary text.
   //     When contentStatus !== "ok" (blocked / paywall / fetch failed), we
-  //     prepend a one-line reason and an "Its attempt at a summary:" label,
+  //     prepend a one-line reason and a "Best guess (may be outdated):" label,
   //     then show the summary underneath. A "More context" button lets the
   //     user regenerate a longer answer; it's disabled when blocked because
   //     a longer headline-only guess would just be more guessing. ---
@@ -705,7 +705,7 @@
 
       const label = document.createElement("div");
       label.className = "nobait-status-label";
-      label.textContent = "Its attempt at a summary:";
+      label.textContent = "Best guess (may be outdated):";
       body.appendChild(label);
     }
 

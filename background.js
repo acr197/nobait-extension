@@ -29,6 +29,11 @@ const BROWSER_UA =
 // and sites whose anti-bot blocks our direct fetch.
 const JINA_READER_URL_PREFIX = "https://r.jina.ai/";
 const JINA_TIMEOUT_MS = 20000;
+// Internet Archive Wayback Machine — final fallback for sites that block both
+// our direct fetch and Jina. Archived snapshots are plain static HTML served
+// from IA's own infra, so anti-bot and JS-rendering aren't in play.
+const WAYBACK_AVAIL_URL = "https://archive.org/wayback/available";
+const WAYBACK_TIMEOUT_MS = 15000;
 
 // --- Message listener: routes SUMMARIZE requests from the content script
 //     and the sidebar. Returns a Promise so the same handler works in Chrome
@@ -55,7 +60,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 //     article text couldn't be fetched. In that case contentStatus reports
 //     "blocked" / "paywall" / "fetch_failed" and contentStatusMessage is the
 //     single-line user-facing reason. The UI uses that to show
-//     "<reason>" + "Its attempt at a summary: …". ---
+//     "<reason>" + "Best guess (may be outdated): …". ---
 async function handleSummarize(url, headline, mode) {
   let articleText = null;
   let fetchError = null;
@@ -96,20 +101,35 @@ async function handleSummarize(url, headline, mode) {
     }
   }
 
-  // Fallback: server-side Reader API. Catches JS-rendered SPAs (Tom's Guide,
-  // most modern news sites) whose direct HTML is a near-empty skeleton, and
-  // sites whose bot protection blocks our direct fetch. Use the decoded URL
-  // when we have one, otherwise the original — avoids handing Jina the
-  // Google News redirect stub.
+  // Fallback #1: server-side Reader API (Jina). Catches JS-rendered SPAs
+  // (Tom's Guide, most modern news sites) whose direct HTML is a near-empty
+  // skeleton, and sites whose bot protection blocks our direct fetch. Use
+  // the decoded URL when we have one, otherwise the original — avoids
+  // handing Jina the Google News redirect stub.
+  const realUrl = decodeGoogleNewsUrl(url) || url;
   if (!articleText) {
-    const realUrl = decodeGoogleNewsUrl(url) || url;
     try {
       articleText = await fetchViaJinaReader(realUrl);
       if (articleText) fetchError = null;
     } catch (err) {
-      // Keep the earlier, more specific error (e.g. "paywall") if we had
-      // one; only overwrite if we had nothing.
-      if (!fetchError) fetchError = captureFetchError(err);
+      // Overwrite the generic "could not extract enough text" error from
+      // the direct-fetch path so the user can tell which layer failed;
+      // preserve more-specific errors like "paywall" / "blocked".
+      const captured = captureFetchError(err);
+      if (!fetchError || fetchError.type === "fetch_failed") fetchError = captured;
+    }
+  }
+
+  // Fallback #2: Wayback Machine. Catches sites that block both our direct
+  // fetch and Jina (heavily paywalled sites, aggressive anti-bot). Archived
+  // snapshots are plain static HTML served from IA, no anti-bot in play.
+  if (!articleText) {
+    try {
+      articleText = await fetchViaWayback(realUrl);
+      if (articleText) fetchError = null;
+    } catch (err) {
+      const captured = captureFetchError(err);
+      if (!fetchError || fetchError.type === "fetch_failed") fetchError = captured;
     }
   }
 
@@ -351,9 +371,11 @@ async function fetchViaJinaReader(url) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), JINA_TIMEOUT_MS);
 
+  // Jina accepts the target URL either unencoded (prepended as-is) or
+  // percent-encoded; we encode to be safe with query strings and fragments.
   let response;
   try {
-    response = await fetch(JINA_READER_URL_PREFIX + url, {
+    response = await fetch(JINA_READER_URL_PREFIX + encodeURIComponent(url), {
       signal: controller.signal,
       headers: {
         "Accept": "text/plain, text/markdown, */*",
@@ -390,6 +412,89 @@ async function fetchViaJinaReader(url) {
     throw createError("fetch_failed", "Reader API returned too little text.");
   }
   return text;
+}
+
+// --- fetchViaWayback: final-resort fallback via the Internet Archive's
+//     Wayback Machine. Step 1 queries the availability API for the closest
+//     snapshot; step 2 fetches the raw archived HTML (using the id_ suffix
+//     so IA doesn't inject its own toolbar/navigation); step 3 runs our
+//     regular extractText() over the archived HTML. Works for paywalled
+//     and anti-bot-blocked sites because IA has an archived copy already,
+//     served as plain static HTML from archive.org's own infrastructure. ---
+async function fetchViaWayback(url) {
+  // Step 1: look up the closest snapshot via the availability API.
+  const availController = new AbortController();
+  const availTimer = setTimeout(() => availController.abort(), WAYBACK_TIMEOUT_MS);
+  let availJson;
+  try {
+    const availResponse = await fetch(
+      WAYBACK_AVAIL_URL + "?url=" + encodeURIComponent(url),
+      { signal: availController.signal, headers: { "Accept": "application/json" } }
+    );
+    clearTimeout(availTimer);
+    if (!availResponse.ok) {
+      throw createError("fetch_failed", "Wayback availability check failed (HTTP " + availResponse.status + ").");
+    }
+    availJson = await availResponse.json();
+  } catch (err) {
+    clearTimeout(availTimer);
+    if (err && err.errorType) throw err;
+    if (err && err.name === "AbortError") {
+      throw createError("fetch_failed", "Wayback availability check timed out.");
+    }
+    throw createError("fetch_failed", "Wayback availability check failed.");
+  }
+
+  const snapshot =
+    availJson &&
+    availJson.archived_snapshots &&
+    availJson.archived_snapshots.closest;
+  if (!snapshot || !snapshot.available || !snapshot.url) {
+    throw createError("fetch_failed", "No Wayback snapshot available for this article.");
+  }
+
+  // Convert the standard snapshot URL into the "raw" form by inserting `id_`
+  // after the timestamp. Example:
+  //   https://web.archive.org/web/20250101000000/https://example.com/
+  //   → https://web.archive.org/web/20250101000000id_/https://example.com/
+  // This suppresses IA's toolbar injection so our extractText() sees the
+  // unmodified original page.
+  let snapshotUrl = snapshot.url;
+  const m = snapshotUrl.match(/^(https?:\/\/web\.archive\.org\/web\/\d+)(\/https?:\/\/)/);
+  if (m) snapshotUrl = m[1] + "id_" + m[2];
+
+  // Step 2: fetch the archived HTML directly and run extraction.
+  const htmlController = new AbortController();
+  const htmlTimer = setTimeout(() => htmlController.abort(), FETCH_TIMEOUT_MS);
+  let html;
+  try {
+    const htmlResponse = await fetch(snapshotUrl, {
+      signal: htmlController.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent": BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+    clearTimeout(htmlTimer);
+    if (!htmlResponse.ok) {
+      throw createError("fetch_failed", "Wayback snapshot fetch failed (HTTP " + htmlResponse.status + ").");
+    }
+    html = await htmlResponse.text();
+  } catch (err) {
+    clearTimeout(htmlTimer);
+    if (err && err.errorType) throw err;
+    if (err && err.name === "AbortError") {
+      throw createError("fetch_failed", "Wayback snapshot fetch timed out.");
+    }
+    throw createError("fetch_failed", "Wayback snapshot fetch failed.");
+  }
+
+  // Step 3: reuse our regular extractor. If the snapshot is itself a thin
+  // shell (rare but possible on very new pages), this will throw and the
+  // caller falls through to headline-only mode.
+  return extractText(html);
 }
 
 // --- looksLikeAntiBot: heuristic for Cloudflare / Akamai / "enable JS" walls ---
@@ -659,27 +764,41 @@ function buildPrompt(headline, content, fetchError, mode) {
 - No "according to the article" or "the article says" filler.`;
 
   if (!content) {
-    // Headline-only mode: the model has no article text to work with.
+    // Headline-only mode: the model has no article text. Important: the user
+    // will see this labeled as "Best guess (may be outdated)", so the model
+    // should behave accordingly — accept the headline as a factual recent
+    // event, give its best guess, and flag freshness rather than confidently
+    // contradicting the headline with stale training data.
+    const FRESHNESS_RULES = `FRESHNESS RULES (critical — this is headline-only mode):
+- Treat the headline as describing a real, recent news event. Do NOT contradict it by saying it "hasn't happened" or "isn't true" based on your training data — your info may be months old.
+- If the headline describes a current event (politics, sports, business, breaking news), give your best guess at the specific answer it teases AND add a short "(info as of [your knowledge cutoff month/year]; may be outdated)" note at the end.
+- If you have no relevant info at all, give the single most likely answer based on the headline's wording and any adjacent facts you know, then say "best guess — couldn't access the article".
+- Never refuse. Never return a non-answer. Always give the user something specific they can use.`;
+
     if (isDetailed) {
-      return `You are NoBait. You could not fetch the article text for this headline. Answer it from your general knowledge in 4-6 sentences, covering: the specific fact the headline teases, relevant background and context, any related numbers or names, and any caveats. If the topic is newer than your training data, say so briefly in one sentence but still give whatever useful context you have.
+      return `You are NoBait. You could not fetch the article text for this headline. Give the reader your best guess at the specific answer the headline teases, in 4-6 sentences covering: (1) your best-guess answer, (2) relevant background you know, (3) related numbers or names, (4) caveats about freshness.
 
 ${RULES}
+
+${FRESHNESS_RULES}
 
 Headline: "${headline}"
 
 Response:`;
     }
 
-    return `You are NoBait. You could not fetch the article text for this headline. Answer the headline from your general knowledge using the rules below.
+    return `You are NoBait. You could not fetch the article text for this headline. Give the reader your best guess at the specific answer it teases.
 
 ${RULES}
 
-ANSWER STYLE — follow whichever case fits:
-- Yes/No question headline ("Can you X by doing Y?", "Is X doing Y?"): start with "Yes" or "No", then one short clarifying phrase if needed. Do not write a paragraph.
-- Headline teases a single name, place, price, rank, number, or short noun ("The #1 city to visit is…", "The actor who…"): answer with JUST that noun or 2-3 words. Do not pad it into a full sentence.
-- Otherwise: answer in at most 1-2 tight factual sentences with concrete specifics.
+${FRESHNESS_RULES}
 
-Never restate the headline. If the topic is newer than your training data, say so in one short sentence.
+ANSWER STYLE — follow whichever case fits:
+- Yes/No question headline ("Can you X by doing Y?", "Is X doing Y?"): start with "Yes" or "No", then one short clarifying phrase. Do not write a paragraph.
+- Headline teases a single name, place, price, rank, number, or short noun ("The #1 city to visit is…", "The actor who…"): answer with JUST that noun or 2-3 words, then a short freshness note in parentheses.
+- Otherwise: answer in at most 1-2 tight factual sentences with concrete specifics, ending with a short freshness note in parentheses.
+
+Never restate the headline.
 
 Headline: "${headline}"
 

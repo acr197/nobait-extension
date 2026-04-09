@@ -19,6 +19,7 @@
   const pageMetaEl = document.getElementById("sb-page-meta");
   const listEl = document.getElementById("sb-list");
   const emptyEl = document.getElementById("sb-empty");
+  const emptyRescanBtn = document.getElementById("sb-empty-rescan");
   const unreadableEl = document.getElementById("sb-unreadable");
   const loadingEl = document.getElementById("sb-loading");
 
@@ -81,6 +82,15 @@
         setTimeout(() => refreshBtn.classList.remove("is-spinning"), 350);
       });
     });
+
+    if (emptyRescanBtn) {
+      emptyRescanBtn.addEventListener("click", () => {
+        refreshBtn.classList.add("is-spinning");
+        scanActiveTab().finally(() => {
+          setTimeout(() => refreshBtn.classList.remove("is-spinning"), 350);
+        });
+      });
+    }
 
     settingsToggleBtn.addEventListener("click", () => {
       settingsPanel.classList.toggle("hidden");
@@ -392,7 +402,7 @@
 
       const label = document.createElement("div");
       label.className = "sb-modal-status-label";
-      label.textContent = "Its attempt at a summary:";
+      label.textContent = "Best guess (may be outdated):";
       wrap.appendChild(label);
     }
 
