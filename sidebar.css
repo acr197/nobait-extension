@@ -529,6 +529,7 @@ body {
   font-size: 13.5px;
   line-height: 1.58;
   color: var(--text);
+  white-space: pre-wrap;
 }
 
 .sb-modal-status {

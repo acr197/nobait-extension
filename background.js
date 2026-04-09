@@ -21,7 +21,7 @@ if (typeof browser !== "undefined" && browser.sidebarAction && browser.action) {
 const PROXY_URL = "https://nobait-proxy.acr197.workers.dev/summarize";
 const FETCH_TIMEOUT_MS = 12000;
 const AI_TIMEOUT_MS = 20000;
-const MAX_CONTENT_LENGTH = 6000;
+const MAX_CONTENT_LENGTH = 9000;
 const MIN_CONTENT_LENGTH = 140;
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -589,7 +589,11 @@ function extractJsRedirect(html, baseUrl) {
 //     Strategy:
 //       1. Strip obvious non-content blocks (script, style, nav, aside, etc).
 //       2. Try to isolate a main content container (<article>, <main>).
-//       3. Prefer <p> paragraphs from that container.
+//       3. Walk the container in document order, capturing headings,
+//          paragraphs, and list items together. This is critical for
+//          listicles ("20 Best X Ranked"), where item names live in
+//          <h2>/<h3>/<li> and <p>-only extraction would miss them and
+//          force the AI to hallucinate the list.
 //       4. If that's too thin, fall back to stripped full-body text.
 //       5. Last resort: use the page's meta description / og:description. ---
 function extractText(html) {
@@ -614,10 +618,12 @@ function extractText(html) {
   // Try to pull out the main content container first.
   const container = extractMainContainer(cleaned) || cleaned;
 
-  // Prefer the concatenated text of all substantial <p> blocks.
-  let text = extractParagraphs(container);
+  // Walk headings + paragraphs + list items in document order so we
+  // preserve listicle structure (item title in <h2>, blurb in <p>).
+  let text = extractContentBlocks(container);
 
-  // If paragraphs were thin, fall back to stripping tags from the container.
+  // If structured extraction was thin, fall back to stripping tags from
+  // the container to at least get raw text.
   if (!text || text.length < MIN_CONTENT_LENGTH) {
     text = stripTags(container);
   }
@@ -657,15 +663,37 @@ function extractMainContainer(html) {
   return best && best.length > 400 ? best : null;
 }
 
-// --- extractParagraphs: concatenates the inner text of all non-trivial
-//     <p> tags in the given HTML chunk. ---
-function extractParagraphs(html) {
+// --- extractContentBlocks: walks the container in document order and
+//     captures headings (h1-h6), paragraphs (<p>), and list items (<li>).
+//     Headings are tagged with a "## " prefix so the AI can recognize the
+//     structure of listicles ("## 20. Nevermind by Nirvana", "Released in
+//     1991, ..."). Paragraphs are still length-filtered to skip captions,
+//     but headings and list items are kept short because that's exactly
+//     where listicle item titles live. ---
+function extractContentBlocks(html) {
   const out = [];
-  const re = /<p\b[^>]*>([\s\S]*?)<\/p>/gi;
+  // Match h1-h6, p, and li, capturing the tag name and inner HTML.
+  const re = /<(h[1-6]|p|li)\b[^>]*>([\s\S]*?)<\/\1>/gi;
   let m;
   while ((m = re.exec(html)) !== null) {
-    const inner = stripTags(m[1]);
-    if (inner && inner.length >= 40) out.push(inner);
+    const tag = m[1].toLowerCase();
+    const inner = stripTags(m[2]);
+    if (!inner) continue;
+    if (tag === "p") {
+      // Skip very short paragraphs (captions, ad disclaimers, byline cruft).
+      if (inner.length < 40) continue;
+      out.push(inner);
+    } else if (tag === "li") {
+      // Keep list items even when short — listicles often use <li> for
+      // numbered entries like "Nevermind — Nirvana (1991)".
+      if (inner.length < 3) continue;
+      out.push(inner);
+    } else {
+      // Heading: prefix with "## " so the AI sees structure rather than
+      // a wall of text. Drop empty / single-char headings.
+      if (inner.length < 2) continue;
+      out.push("## " + inner);
+    }
   }
   return out.join(" ");
 }
@@ -764,14 +792,16 @@ function buildPrompt(headline, content, mode) {
   // Never redirect the user back to the article; never lecture; never
   // editorialize. These rules are shared by every variant of the prompt.
   const RULES = `HARD CONSTRAINTS:
+- ONLY use facts that appear verbatim in the "Article content" block below. Do NOT use general knowledge, training data, or guesses. If the article doesn't contain the specific answer the headline teases, say so in one short sentence (e.g. "The article doesn't list the specific items.") and stop. NEVER fabricate names, dates, numbers, ranks, or quotes that are not present in the article content.
 - Never tell the reader to "read the article", "visit the site", "for more information", "do your own research", "check the link", "open the original", or anything similar. The user came here specifically to NOT do that.
-- Never say "I can't access", "I don't have access", "I'm unable to", or anything similar. Just answer with what you know.
+- Never say "I can't access", "I don't have access", "I'm unable to", or anything similar. Just answer with what is in the article content.
 - No editorializing. No opinions. No labeling anything as "clickbait", "bait", "misleading", "sensational", or similar judgmental terms. Report facts only.
 - No political commentary. No personal recommendations.
-- No "according to the article" or "the article says" filler.`;
+- No "according to the article" or "the article says" filler.
+- Headings in the article content are marked with "## " — treat them as section/item titles. They are part of the article, not metadata.`;
 
   if (isDetailed) {
-    return `You are NoBait. You have the full article text. Write a 4-6 sentence detailed summary that gives the reader: (1) the specific answer to what the headline was teasing, (2) the concrete facts and numbers from the article, (3) meaningful context and background, (4) any caveats or unknowns the article itself mentions.
+    return `You are NoBait. The full article text is provided below. Write a 4-6 sentence detailed summary that gives the reader: (1) the specific answer to what the headline was teasing, (2) the concrete facts, names, and numbers FROM THE ARTICLE, (3) meaningful context and background that is present in the article, (4) any caveats or unknowns the article itself mentions. If the headline teases a ranked list, enumerate as many ranked items as the article actually contains (use a numbered list), then stop.
 
 ${RULES}
 
@@ -783,16 +813,17 @@ ${content}
 Response:`;
   }
 
-  return `You are NoBait. You have the article text. Give the reader the specific concrete information the headline was teasing, using the rules below.
+  return `You are NoBait. The article text is provided below. Give the reader the specific concrete information the headline was teasing, drawn ONLY from the article content. Follow the rules below.
 
 ${RULES}
 
 ANSWER STYLE — follow whichever case fits:
 - Yes/No question headline ("Can you X by doing Y?", "Is X doing Y?"): start with "Yes" or "No", then one short clarifying phrase with the key specific from the article if needed. Do not write a paragraph.
 - Headline teases a single name, place, price, rank, number, or short noun ("The #1 city to visit is…", "The actor who…", "The one trick…"): answer with JUST that noun or 2-3 words from the article. Do not pad it into a full sentence.
+- Headline teases a ranked or numbered list ("The 20 greatest X, ranked", "Top 10 Y", "The 5 best Z"): return a numbered list of the items the article actually contains, in the article's order. For each item, give the item name plus any short identifying detail the article includes (year, artist, location, etc.) — one item per line. Include as many items as fit; if the article has more items than you can include, end the list with "...and more in the full article." Do NOT pad with items not in the article. Do NOT invent items from general knowledge.
 - Otherwise: answer in at most 2-3 tight factual sentences with concrete specifics from the article (exact dates, exact numbers, exact names, exact outcomes).
 
-Never restate the headline. If the article only partially answers the headline (e.g. month but not day), state what IS confirmed and what is still unknown in ONE sentence. If the article contradicts the headline, say so.
+Never restate the headline. If the article only partially answers the headline (e.g. month but not day), state what IS confirmed and what is still unknown in ONE sentence. If the article contradicts the headline, say so. If the article content does not actually contain the answer (for example it's an index page, a paywall stub, or unrelated content), say "The article doesn't include that information." in ONE sentence and stop — do NOT guess.
 
 Headline: "${headline}"
 
