@@ -56,11 +56,11 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // --- handleSummarize: orchestrates fetch -> extract -> AI pipeline.
-//     Always returns ok:true as long as the AI responds, even when the
-//     article text couldn't be fetched. In that case contentStatus reports
-//     "blocked" / "paywall" / "fetch_failed" and contentStatusMessage is the
-//     single-line user-facing reason. The UI uses that to show
-//     "<reason>" + "Best guess (may be outdated): …". ---
+//     Returns ok:true with a summary when article text was fetched and the
+//     AI responded. Returns ok:false when the fetch pipeline failed — we
+//     deliberately do NOT fall back to a headline-only AI guess, since this
+//     extension is used on breaking news and any "guess from training data"
+//     would be outside the model's knowledge cutoff. ---
 async function handleSummarize(url, headline, mode) {
   let articleText = null;
   let fetchError = null;
@@ -133,20 +133,27 @@ async function handleSummarize(url, headline, mode) {
     }
   }
 
-  // Phase 3: send to AI — with article text if available, headline-only otherwise.
-  // Pass fetchError along so the prompt knows *why* content is missing.
-  const contentStatus = articleText ? "ok" : (fetchError && fetchError.type) || "fetch_failed";
-  const contentStatusMessage = articleText
-    ? null
-    : (fetchError && fetchError.message) || "Could not load the article.";
+  // If every fetch path failed, fail cleanly. We deliberately do NOT fall
+  // back to a headline-only AI guess: this extension is used on breaking
+  // news, so any "guess from training data" would be outside the model's
+  // knowledge cutoff and would mislead the user.
+  if (!articleText) {
+    return {
+      ok: false,
+      error: "unreadable",
+      message: (fetchError && fetchError.message) || "Couldn't read this article.",
+      contentStatus: (fetchError && fetchError.type) || "fetch_failed",
+    };
+  }
 
+  // articleText is guaranteed non-null from here on.
   try {
-    const summary = await callAI(headline, articleText, fetchError, mode);
+    const summary = await callAI(headline, articleText, mode);
     return {
       ok: true,
       summary,
-      contentStatus,
-      contentStatusMessage,
+      contentStatus: "ok",
+      contentStatusMessage: null,
     };
   } catch (err) {
     return { ok: false, error: "ai_error", message: err.message || "Summarization failed." };
@@ -493,7 +500,7 @@ async function fetchViaWayback(url) {
 
   // Step 3: reuse our regular extractor. If the snapshot is itself a thin
   // shell (rare but possible on very new pages), this will throw and the
-  // caller falls through to headline-only mode.
+  // caller surfaces an unreadable-article error to the user.
   return extractText(html);
 }
 
@@ -629,7 +636,7 @@ function extractText(html) {
     text = text.substring(0, MAX_CONTENT_LENGTH) + "...";
   }
   if (text.length < MIN_CONTENT_LENGTH) {
-    throw createError("fetch_failed", "Could not extract enough text from the article.");
+    throw createError("fetch_failed", "Couldn't read this article.");
   }
   return text;
 }
@@ -710,11 +717,11 @@ function extractMetaDescription(html) {
 }
 
 // --- callAI: sends the prompt to the Cloudflare Worker proxy ---
-async function callAI(headline, content, fetchError, mode) {
+async function callAI(headline, content, mode) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
-  const prompt = buildPrompt(headline, content, fetchError, mode);
+  const prompt = buildPrompt(headline, content, mode);
 
   let response;
   try {
@@ -748,10 +755,10 @@ async function callAI(headline, content, fetchError, mode) {
 
 // --- buildPrompt: constructs the full AI prompt from headline + content.
 //     `mode` is "short" (default) or "detailed" (triggered by the user
-//     clicking the "More context" button in the popup). `fetchError` is
-//     non-null when we couldn't load article text — the model then answers
-//     from general knowledge. ---
-function buildPrompt(headline, content, fetchError, mode) {
+//     clicking the "More context" button in the popup). `content` is
+//     guaranteed non-null: callers only invoke the AI path when article
+//     text was successfully fetched. ---
+function buildPrompt(headline, content, mode) {
   const isDetailed = mode === "detailed";
 
   // Never redirect the user back to the article; never lecture; never
@@ -762,48 +769,6 @@ function buildPrompt(headline, content, fetchError, mode) {
 - No editorializing. No opinions. No labeling anything as "clickbait", "bait", "misleading", "sensational", or similar judgmental terms. Report facts only.
 - No political commentary. No personal recommendations.
 - No "according to the article" or "the article says" filler.`;
-
-  if (!content) {
-    // Headline-only mode: the model has no article text. Important: the user
-    // will see this labeled as "Best guess (may be outdated)", so the model
-    // should behave accordingly — accept the headline as a factual recent
-    // event, give its best guess, and flag freshness rather than confidently
-    // contradicting the headline with stale training data.
-    const FRESHNESS_RULES = `FRESHNESS RULES (critical — this is headline-only mode):
-- Treat the headline as describing a real, recent news event. Do NOT contradict it by saying it "hasn't happened" or "isn't true" based on your training data — your info may be months old.
-- If the headline describes a current event (politics, sports, business, breaking news), give your best guess at the specific answer it teases AND add a short "(info as of [your knowledge cutoff month/year]; may be outdated)" note at the end.
-- If you have no relevant info at all, give the single most likely answer based on the headline's wording and any adjacent facts you know, then say "best guess — couldn't access the article".
-- Never refuse. Never return a non-answer. Always give the user something specific they can use.`;
-
-    if (isDetailed) {
-      return `You are NoBait. You could not fetch the article text for this headline. Give the reader your best guess at the specific answer the headline teases, in 4-6 sentences covering: (1) your best-guess answer, (2) relevant background you know, (3) related numbers or names, (4) caveats about freshness.
-
-${RULES}
-
-${FRESHNESS_RULES}
-
-Headline: "${headline}"
-
-Response:`;
-    }
-
-    return `You are NoBait. You could not fetch the article text for this headline. Give the reader your best guess at the specific answer it teases.
-
-${RULES}
-
-${FRESHNESS_RULES}
-
-ANSWER STYLE — follow whichever case fits:
-- Yes/No question headline ("Can you X by doing Y?", "Is X doing Y?"): start with "Yes" or "No", then one short clarifying phrase. Do not write a paragraph.
-- Headline teases a single name, place, price, rank, number, or short noun ("The #1 city to visit is…", "The actor who…"): answer with JUST that noun or 2-3 words, then a short freshness note in parentheses.
-- Otherwise: answer in at most 1-2 tight factual sentences with concrete specifics, ending with a short freshness note in parentheses.
-
-Never restate the headline.
-
-Headline: "${headline}"
-
-Response:`;
-  }
 
   if (isDetailed) {
     return `You are NoBait. You have the full article text. Write a 4-6 sentence detailed summary that gives the reader: (1) the specific answer to what the headline was teasing, (2) the concrete facts and numbers from the article, (3) meaningful context and background, (4) any caveats or unknowns the article itself mentions.

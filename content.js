@@ -682,67 +682,44 @@
     return wrap;
   }
 
-  // --- renderSummary: replaces the spinner with the AI summary text.
-  //     When contentStatus !== "ok" (blocked / paywall / fetch failed), we
-  //     prepend a one-line reason and a "Best guess (may be outdated):" label,
-  //     then show the summary underneath. A "More context" button lets the
-  //     user regenerate a longer answer; it's disabled when blocked because
-  //     a longer headline-only guess would just be more guessing. ---
+  // --- renderSummary: replaces the spinner with the AI summary text. Only
+  //     called on ok:true responses, which always carry fully fetched article
+  //     content — unreadable articles flow through renderError() instead. ---
   function renderSummary(popup, oldEl, response, url, headline, mode) {
     if (!activePopupHost) return;
 
     const body = document.createElement("div");
     body.className = "nobait-body";
 
-    const status = response.contentStatus || "ok";
-    const isBlocked = status !== "ok";
-
-    if (isBlocked) {
-      const reason = document.createElement("div");
-      reason.className = "nobait-status";
-      reason.textContent = response.contentStatusMessage || "Could not load the article.";
-      body.appendChild(reason);
-
-      const label = document.createElement("div");
-      label.className = "nobait-status-label";
-      label.textContent = "Best guess (may be outdated):";
-      body.appendChild(label);
-    }
-
     const text = document.createElement("div");
     text.className = "nobait-summary";
-    if (isBlocked) text.classList.add("nobait-summary-indent");
     text.textContent = response.summary || "";
     body.appendChild(text);
 
-    // "More context" button — only shown in short mode, disabled when blocked.
+    // "More context" button — only shown in short mode.
     if (mode !== "detailed") {
       const moreBtn = document.createElement("button");
       moreBtn.className = "nobait-more-btn";
       moreBtn.type = "button";
       moreBtn.textContent = "More context";
-      if (isBlocked) {
-        moreBtn.disabled = true;
-        moreBtn.title = "Unavailable — article text couldn't be loaded.";
-      } else {
-        moreBtn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          const loadingEl = buildLoadingEl();
-          if (body.parentNode === popup) {
-            popup.replaceChild(loadingEl, body);
-          }
-          requestSummary(popup, loadingEl, url, headline, "detailed");
-        });
-      }
+      moreBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const loadingEl = buildLoadingEl();
+        if (body.parentNode === popup) {
+          popup.replaceChild(loadingEl, body);
+        }
+        requestSummary(popup, loadingEl, url, headline, "detailed");
+      });
       body.appendChild(moreBtn);
     }
 
     swapContent(popup, oldEl, body);
   }
 
-  // --- renderError: only used for hard errors where the AI itself failed
-  //     (missing response / extension-side exception). Blocked and paywalled
-  //     articles now flow through renderSummary with a status banner. ---
+  // --- renderError: shown whenever we can't return a real summary — either
+  //     the fetch pipeline couldn't read the article, or the AI itself failed.
+  //     The user gets a warning icon, a one-line reason, and a Search Google
+  //     fallback button so they have a path forward. ---
   function renderError(popup, spinnerWrap, errorType, message, headline) {
     if (!activePopupHost) return;
 
