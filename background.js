@@ -22,7 +22,7 @@ const PROXY_URL = "https://nobait-proxy.acr197.workers.dev/summarize";
 const FETCH_TIMEOUT_MS = 10000;
 const AI_TIMEOUT_MS = 15000;
 const MAX_CONTENT_LENGTH = 5000;
-const MIN_CONTENT_LENGTH = 50;
+const MIN_CONTENT_LENGTH = 200;
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
@@ -116,12 +116,15 @@ async function handleSummarize(url, headline) {
   }
 }
 
-// --- captureFetchError: normalizes a fetchArticle error into { type, message } ---
+// --- captureFetchError: normalizes a fetchArticle error into { type, message }.
+//     The message is user-facing and gets fed directly into the AI prompt, so
+//     it should read as a plain sentence the user can understand. ---
 function captureFetchError(err) {
-  return {
-    type: (err && err.errorType) || "fetch_failed",
-    message: (err && err.message) || "Could not load the article.",
-  };
+  const type = (err && err.errorType) || "fetch_failed";
+  let message = (err && err.message) || "Could not load the article.";
+  // Normalize trailing period for consistent formatting inside the prompt.
+  if (!/[.!?]$/.test(message)) message += ".";
+  return { type, message };
 }
 
 // --- isGoogleNewsRedirectUrl: checks if a URL is a Google News redirect ---
@@ -176,8 +179,97 @@ function decodeGoogleNewsUrl(url) {
   return null;
 }
 
-// --- fetchArticle: downloads the page HTML with a timeout ---
-async function fetchArticle(url) {
+// --- Googlebot UA: many sites (esp. paywalled / SPA) serve clean static HTML
+//     to search engines but gate real browsers. A retry with Googlebot UA
+//     rescues a lot of articles that otherwise come back as thin shells. ---
+const GOOGLEBOT_UA =
+  "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+
+// --- fetchArticle: downloads the page HTML with a timeout. If the first
+//     attempt returns a thin/anti-bot/paywall page, retry once as Googlebot. ---
+async function fetchArticle(url, opts) {
+  opts = opts || {};
+  const depth = opts.depth || 0;
+  if (depth > 4) {
+    throw createError("fetch_failed", "Too many redirects while loading the article.");
+  }
+
+  let result;
+  try {
+    result = await fetchRaw(url, BROWSER_UA);
+  } catch (err) {
+    // If the browser UA was blocked, try Googlebot as a last resort
+    if (!opts.noRetry && (err.errorType === "paywall" || err.errorType === "blocked")) {
+      try {
+        result = await fetchRaw(url, GOOGLEBOT_UA);
+      } catch (_) {
+        throw err; // surface the original, more accurate reason
+      }
+    } else {
+      throw err;
+    }
+  }
+
+  let html = result.html;
+
+  // Handle JS-based redirects (common on news aggregator redirect pages)
+  const jsRedirectUrl = extractJsRedirect(html, url);
+  if (jsRedirectUrl && jsRedirectUrl !== url) {
+    return fetchArticle(jsRedirectUrl, { depth: depth + 1 });
+  }
+
+  // Detect anti-bot interstitials (Cloudflare challenge, "Please enable JS",
+  // Akamai Bot Manager, etc.) and convert them into a clean "blocked" error.
+  if (looksLikeAntiBot(html)) {
+    if (!opts.noRetry) {
+      // One retry as Googlebot — anti-bot pages often whitelist search crawlers.
+      try {
+        const retry = await fetchRaw(url, GOOGLEBOT_UA);
+        if (!looksLikeAntiBot(retry.html)) {
+          html = retry.html;
+        } else {
+          throw createError("blocked", "Blocked by the site's bot protection.");
+        }
+      } catch (err) {
+        if (err.errorType) throw err;
+        throw createError("blocked", "Blocked by the site's bot protection.");
+      }
+    } else {
+      throw createError("blocked", "Blocked by the site's bot protection.");
+    }
+  }
+
+  // Detect paywall interstitials by content heuristics.
+  if (looksLikePaywall(html)) {
+    throw createError("paywall", "Behind a paywall.");
+  }
+
+  let text;
+  try {
+    text = extractText(html);
+  } catch (err) {
+    // If extraction failed because the page was too thin, try Googlebot once.
+    if (!opts.noRetry && err.errorType === "fetch_failed") {
+      try {
+        const retry = await fetchRaw(url, GOOGLEBOT_UA);
+        const retryRedirect = extractJsRedirect(retry.html, url);
+        if (retryRedirect && retryRedirect !== url) {
+          return fetchArticle(retryRedirect, { depth: depth + 1 });
+        }
+        text = extractText(retry.html);
+      } catch (_) {
+        throw err;
+      }
+    } else {
+      throw err;
+    }
+  }
+
+  return text;
+}
+
+// --- fetchRaw: single HTTP fetch with a specific UA. Returns { html }. ---
+async function fetchRaw(url, ua) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
@@ -186,70 +278,120 @@ async function fetchArticle(url) {
     response = await fetch(url, {
       signal: controller.signal,
       redirect: "follow",
-      headers: { "User-Agent": BROWSER_UA },
+      headers: {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
     });
   } catch (err) {
     clearTimeout(timer);
     if (err.name === "AbortError") {
-      throw createError("fetch_failed", "Request timed out. The site took too long to respond.");
+      throw createError("fetch_failed", "Site took too long to respond.");
     }
-    throw createError("fetch_failed", "Could not load the article. Network error.");
+    throw createError("fetch_failed", "Network error loading the article.");
   }
 
   clearTimeout(timer);
 
   if (response.status === 401 || response.status === 403) {
-    throw createError("paywall", "This article is behind a paywall or restricted access.");
+    throw createError("paywall", "Blocked by the site (HTTP " + response.status + "). Likely paywall or access restriction.");
   }
   if (response.status === 429) {
-    throw createError("blocked", "This site is rate-limiting requests. Try again later.");
+    throw createError("blocked", "Rate-limited by the site (HTTP 429).");
+  }
+  if (response.status === 451) {
+    throw createError("blocked", "Blocked for legal reasons (HTTP 451).");
   }
   if (!response.ok) {
-    throw createError("fetch_failed", `Could not load the article (HTTP ${response.status}).`);
+    throw createError("fetch_failed", "Site returned HTTP " + response.status + ".");
   }
 
   const contentType = response.headers.get("content-type") || "";
-  if (!contentType.includes("text/html") && !contentType.includes("text/plain")) {
-    throw createError("fetch_failed", "The link doesn't point to a readable article.");
+  if (!contentType.includes("text/html") && !contentType.includes("text/plain") && !contentType.includes("xml")) {
+    throw createError("fetch_failed", "Link doesn't point to a readable article (" + (contentType || "unknown type") + ").");
   }
 
-  let html = await response.text();
+  const html = await response.text();
+  return { html, finalUrl: response.url || url };
+}
 
-  // Handle JS-based redirects (common on news aggregator redirect pages)
-  const jsRedirectUrl = extractJsRedirect(html);
-  if (jsRedirectUrl) {
-    return fetchArticle(jsRedirectUrl);
+// --- looksLikeAntiBot: heuristic for Cloudflare / Akamai / "enable JS" walls ---
+function looksLikeAntiBot(html) {
+  if (!html) return false;
+  const head = html.substring(0, 4000).toLowerCase();
+  // Cloudflare challenge pages
+  if (head.includes("just a moment") && head.includes("cloudflare")) return true;
+  if (head.includes("checking your browser") && head.includes("cloudflare")) return true;
+  if (head.includes("cf-browser-verification")) return true;
+  if (head.includes("cf_chl_opt")) return true;
+  // Akamai / PerimeterX / DataDome
+  if (head.includes("access denied") && head.includes("reference #")) return true;
+  if (head.includes("px-captcha")) return true;
+  if (head.includes("datadome")) return true;
+  // Generic "please enable JavaScript" walls on otherwise empty bodies
+  if (html.length < 2500 && /enable javascript|requires javascript/i.test(head)) return true;
+  return false;
+}
+
+// --- looksLikePaywall: heuristic for paywall interstitials ---
+function looksLikePaywall(html) {
+  if (!html) return false;
+  const lower = html.toLowerCase();
+  // Common NYT/WSJ/FT/Bloomberg paywall markers
+  if (lower.includes("subscribe to continue") && lower.length < 8000) return true;
+  if (lower.includes("to continue reading") && lower.includes("subscribe")) {
+    // Only flag if the body is short — long articles may mention "subscribe" in footers
+    if (lower.length < 6000) return true;
   }
-
-  const text = extractText(html);
-
-  // If we got very little text and the final URL differs from the request,
-  // the page may have been a redirect stub — the extracted text is fine to use
-  return text;
+  return false;
 }
 
 // --- extractJsRedirect: detects common JS/meta redirect patterns in HTML ---
-function extractJsRedirect(html) {
+function extractJsRedirect(html, baseUrl) {
+  const tryParse = (candidate) => {
+    if (!candidate) return null;
+    try {
+      const u = new URL(candidate, baseUrl || undefined);
+      if (u.protocol === "http:" || u.protocol === "https:") return u.href;
+    } catch (_) { /* skip */ }
+    return null;
+  };
+
   // Meta refresh: <meta http-equiv="refresh" content="0;url=...">
   const metaMatch = html.match(
     /<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]+content\s*=\s*["']?\d+\s*;\s*url\s*=\s*["']?([^"'\s>]+)/i
   );
-  if (metaMatch && metaMatch[1]) {
-    try {
-      const u = new URL(metaMatch[1]);
-      if (u.protocol === "http:" || u.protocol === "https:") return u.href;
-    } catch (_) { /* skip */ }
+  const metaUrl = tryParse(metaMatch && metaMatch[1]);
+  if (metaUrl) return metaUrl;
+
+  // Canonical link — Google News redirect stubs often include one pointing at
+  // the real publisher URL.
+  const canonicalMatch = html.match(
+    /<link[^>]+rel\s*=\s*["']?canonical["']?[^>]+href\s*=\s*["']([^"']+)["']/i
+  );
+  const canonicalUrl = tryParse(canonicalMatch && canonicalMatch[1]);
+  if (canonicalUrl && /news\.google\.com/.test(baseUrl || "") && !/news\.google\.com/.test(canonicalUrl)) {
+    return canonicalUrl;
   }
 
-  // window.location / location.href = "..."
-  const jsMatch = html.match(
-    /(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']/i
-  );
-  if (jsMatch && jsMatch[1]) {
-    try {
-      const u = new URL(jsMatch[1]);
-      if (u.protocol === "http:" || u.protocol === "https:") return u.href;
-    } catch (_) { /* skip */ }
+  // Broad set of JS location-assignment patterns:
+  //   window.location = "..."
+  //   window.location.href = "..."
+  //   window.location.replace("...")
+  //   window.location.assign("...")
+  //   document.location = "..."
+  //   top.location = "..."
+  //   self.location = "..."
+  const patterns = [
+    /(?:window|document|top|self|parent)?\.?location(?:\.href)?\s*=\s*["']([^"']+)["']/i,
+    /(?:window|document|top|self|parent)?\.?location\.(?:replace|assign)\s*\(\s*["']([^"']+)["']\s*\)/i,
+    /window\.top\.location(?:\.href)?\s*=\s*["']([^"']+)["']/i,
+  ];
+  for (const re of patterns) {
+    const m = html.match(re);
+    const u = tryParse(m && m[1]);
+    if (u) return u;
   }
 
   return null;
@@ -328,39 +470,58 @@ async function callAI(headline, content, fetchError) {
 //     fetchError (optional) is passed when we couldn't load article text so
 //     the model can explain *why* it's working from the headline alone. ---
 function buildPrompt(headline, content, fetchError) {
+  // The whole point of NoBait is that the user does NOT have to go read the
+  // article themselves. Anything that redirects them back to the source,
+  // tells them to research, or hedges with "I don't have access" is a
+  // failure of the product. Both prompts share this forbidden-phrase list.
+  const FORBIDDEN = `ABSOLUTELY FORBIDDEN — never output ANY of these phrases or anything like them:
+- "do your own research" / "for more information" / "for the latest updates"
+- "open the article" / "open original" / "read the full article" / "click the link"
+- "check local news" / "check official sources" / "refer to" / "visit the website"
+- "I recommend" / "I suggest" / "consider checking" / "you may want to"
+- "I don't have access" / "I cannot access" / "I'm unable to" / "I don't know the content"
+- "try again later" / "contact the site" / "the article is behind"
+The user came here so they would NOT have to do any of that. You are their last stop. Deliver the answer or the honest verdict — never bounce them back.`;
+
   if (!content) {
     const reason = fetchError && fetchError.message
       ? fetchError.message
       : "The article text could not be loaded.";
 
     // Headline-only mode: the model has no article text to work with.
-    return `You are NoBait, an AI that cuts through clickbait headlines. The article text could NOT be loaded (reason: ${reason}). Work from the headline and your general knowledge.
+    // Structure: one short "why it's missing" sentence, then the best
+    // substantive answer we can give from general knowledge.
+    return `You are NoBait, an AI that cuts through clickbait. The article text could not be fetched. Reason: ${reason}
 
-RULES:
-- Answer in 1-3 sentences, direct and specific.
-- Include concrete facts when you can: names, numbers, dates, outcomes.
-- DO NOT write "I don't have access", "I cannot access", or "I don't know the content" — the user already knows the fetch failed; that phrasing is unhelpful.
-- If the headline asks a question you can answer from general knowledge, answer it plainly.
-- If the topic is time-sensitive and you genuinely lack specifics, say exactly: "Couldn't load the article text. Try 'Open original' for the full story." and then add one sentence of useful context from what you do know.
-- If the headline is obviously pure clickbait that promises an answer it cannot keep (e.g. "You won't believe…"), respond with EXACTLY one line starting with \`CLICKBAIT:\` followed by a short snarky sentence calling out the bait.
+${FORBIDDEN}
+
+RESPONSE FORMAT (exactly this shape, 2-3 sentences total):
+1. ONE short sentence stating the specific reason the text couldn't be loaded, in plain English. Examples: "Blocked by the site's bot protection." / "Behind a paywall." / "Site timed out." / "Blocked by robots.txt." Use the reason above verbatim if you don't know better.
+2. THEN 1-2 sentences answering the headline with concrete specifics from your general knowledge — exact dates, exact prices, exact numbers, names, outcomes. If the headline is a question, answer it. If it teases a fact, state the fact.
+3. If you genuinely don't know any specifics and the topic is too fresh for your training data, say so in one honest sentence ("This is more recent than my training data, so I can't confirm specifics.") — but still give whatever useful context you DO have. Do NOT send the user elsewhere.
+
+CLICKBAIT VERDICT: If the headline is pure bait that promises an answer it won't keep (e.g. "You won't believe…", "This one trick…", "Doctors hate…"), respond with EXACTLY one line:
+CLICKBAIT: <one short snarky sentence calling out the bait>
 
 Headline: "${headline}"
 
 Response:`;
   }
 
-  return `You are NoBait, an AI that cuts through clickbait. You've been given the article's text. Tell the reader the SPECIFIC, concrete information that the headline was teasing.
+  return `You are NoBait, an AI that cuts through clickbait. You've been given the article's text. Tell the reader the SPECIFIC, concrete information the headline was teasing.
+
+${FORBIDDEN}
 
 HARD RULES:
-1. Max 2-3 sentences, tight and factual. No filler, no "this article discusses…".
-2. NEVER just rephrase the headline. If the headline says "Samsung sets release for April", your answer MUST name the specific date — or explicitly say only the month is confirmed and no day was given.
-3. ALWAYS prefer specifics: numbers, prices, percentages, dates, names, quantities, outcomes.
-4. If the headline asks a question, answer the question directly using facts from the article.
-5. If the article names specifics that contradict the headline, say so.
-6. If the article partially answers the headline (e.g. month but not day), state what IS confirmed AND what is still unknown in one sentence.
-7. CLICKBAIT DETECTION — if the article genuinely provides no new specifics beyond restating the headline (the classic "the article answers its own question with the same words" pattern), respond with EXACTLY one line in this format:
-   CLICKBAIT: <one short, snarky sentence calling out the article>
-   Use this ONLY when the article truly adds nothing. If there's ANY additional specific fact, do not use the clickbait format — share that fact instead.
+1. Max 2-3 sentences, tight and factual. No filler, no "this article discusses…", no "according to the article".
+2. NEVER just rephrase the headline. If the headline says "Samsung sets release for April", your answer MUST name the specific date from the article — or explicitly say only the month is confirmed and no day was given.
+3. ALWAYS hunt for and surface concrete specifics: exact dates, exact prices, exact percentages, exact numbers, names, quantities, outcomes. That is the entire point of this product.
+4. If the headline asks a question, answer the question directly with facts from the article.
+5. If the article's specifics contradict the headline, say so.
+6. If the article partially answers the headline (e.g. month but not day, or "later this year" with no date), state what IS confirmed AND what is still unknown in one sentence — but do NOT tell the user to go look it up.
+7. CLICKBAIT DETECTION — if the article genuinely provides no new specifics beyond restating the headline, respond with EXACTLY one line:
+   CLICKBAIT: <one short snarky sentence calling out the article>
+   Use this ONLY when the article truly adds nothing. If there's ANY additional specific fact, share the fact instead.
 
 Headline: "${headline}"
 

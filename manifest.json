@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "name": "NoBait",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "See through clickbait instantly. Long-click any headline to get the real answer.",
   "permissions": ["activeTab", "storage", "tabs"],
+  "host_permissions": ["<all_urls>"],
   "action": {
     "default_popup": "popup.html",
     "default_icon": {
