@@ -19,6 +19,7 @@
   const pageMetaEl = document.getElementById("sb-page-meta");
   const listEl = document.getElementById("sb-list");
   const emptyEl = document.getElementById("sb-empty");
+  const emptyRescanBtn = document.getElementById("sb-empty-rescan");
   const unreadableEl = document.getElementById("sb-unreadable");
   const loadingEl = document.getElementById("sb-loading");
 
@@ -81,6 +82,15 @@
         setTimeout(() => refreshBtn.classList.remove("is-spinning"), 350);
       });
     });
+
+    if (emptyRescanBtn) {
+      emptyRescanBtn.addEventListener("click", () => {
+        refreshBtn.classList.add("is-spinning");
+        scanActiveTab().finally(() => {
+          setTimeout(() => refreshBtn.classList.remove("is-spinning"), 350);
+        });
+      });
+    }
 
     settingsToggleBtn.addEventListener("click", () => {
       settingsPanel.classList.toggle("hidden");
@@ -371,30 +381,14 @@
     modalBodyEl.appendChild(loading);
   }
 
-  // --- renderSummary: displays the AI summary, optionally prefaced by a
-  //     one-line reason the content couldn't be fetched. The "More context"
-  //     button is disabled in blocked/paywall states since a longer headline-
-  //     only guess would just be more guessing. ---
+  // --- renderSummary: displays the AI summary in the sidebar modal. Only
+  //     called on ok:true responses, which always carry fully fetched article
+  //     content — unreadable articles flow through renderError() instead. ---
   function renderSummary(response, link, mode) {
     modalBodyEl.innerHTML = "";
 
-    const status = response.contentStatus || "ok";
-    const isBlocked = status !== "ok";
-
     const wrap = document.createElement("div");
     wrap.className = "sb-modal-summary";
-
-    if (isBlocked) {
-      const reason = document.createElement("div");
-      reason.className = "sb-modal-status";
-      reason.textContent = response.contentStatusMessage || "Could not load the article.";
-      wrap.appendChild(reason);
-
-      const label = document.createElement("div");
-      label.className = "sb-modal-status-label";
-      label.textContent = "Its attempt at a summary:";
-      wrap.appendChild(label);
-    }
 
     const text = document.createElement("div");
     text.className = "sb-modal-summary-text";
@@ -407,14 +401,9 @@
       btn.className = "sb-modal-more-btn";
       btn.type = "button";
       btn.textContent = "More context";
-      if (isBlocked) {
-        btn.disabled = true;
-        btn.title = "Unavailable — article text couldn't be loaded.";
-      } else {
-        btn.addEventListener("click", () => {
-          requestModalSummary(link, "detailed");
-        });
-      }
+      btn.addEventListener("click", () => {
+        requestModalSummary(link, "detailed");
+      });
       wrap.appendChild(btn);
     }
 
