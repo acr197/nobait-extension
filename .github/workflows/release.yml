@@ -1,0 +1,66 @@
+name: Release
+
+# Runs whenever main is pushed. Reads the version from manifest.json,
+# and — if a release with that tag doesn't already exist — packages the
+# extension files into a clearly-named zip and creates a GitHub release.
+# Download URL will look like:  nobait-v1.1.0.zip
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create releases and upload assets
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from manifest.json
+        id: ver
+        run: |
+          VERSION=$(node -e "console.log(require('./manifest.json').version)")
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}"    >> "$GITHUB_OUTPUT"
+          echo "zip=nobait-v${VERSION}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if release already exists
+        id: check
+        run: |
+          if gh release view "${{ steps.ver.outputs.tag }}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ steps.ver.outputs.tag }} already exists — skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package extension
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          ZIP="${{ steps.ver.outputs.zip }}"
+          zip "$ZIP" \
+            manifest.json \
+            background.js \
+            content.js \
+            sidebar.js \
+            sidebar.html \
+            sidebar.css \
+            popup.html \
+            popup-settings.js \
+            popup.css
+          zip -r "$ZIP" icons/
+
+      - name: Create GitHub release
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          ZIP="${{ steps.ver.outputs.zip }}"
+          VERSION="${{ steps.ver.outputs.version }}"
+          gh release create "${TAG}" "${ZIP}" \
+            --title "NoBait ${VERSION}" \
+            --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
