@@ -29,6 +29,19 @@ const BROWSER_UA =
 // and sites whose anti-bot blocks our direct fetch.
 const JINA_READER_URL_PREFIX = "https://r.jina.ai/";
 const JINA_TIMEOUT_MS = 20000;
+// Wayback Machine availability API — used to find an archived snapshot when
+// the live article can't be fetched. Returns a closest-snapshot URL we can
+// then feed back through the normal fetchArticle pipeline.
+const WAYBACK_AVAILABILITY_URL = "https://archive.org/wayback/available";
+const WAYBACK_TIMEOUT_MS = 15000;
+// Search-based retrieval — when no direct/Jina/Wayback fetch works, we run
+// a web search for the headline and try to fetch the matching result. Bing
+// HTML is used because it ships real anchors in static HTML (no JS required)
+// and is lenient about scraping. DuckDuckGo HTML is a secondary mirror.
+const BING_SEARCH_URL = "https://www.bing.com/search";
+const DUCKDUCKGO_SEARCH_URL = "https://html.duckduckgo.com/html/";
+const SEARCH_TIMEOUT_MS = 15000;
+const MAX_SEARCH_CANDIDATES = 4;
 
 // --- Message listener: routes SUMMARIZE requests from the content script
 //     and the sidebar. Returns a Promise so the same handler works in Chrome
@@ -126,7 +139,36 @@ async function handleSummarize(url, headline, mode) {
     }
   }
 
-  // Fallback #2: ask the AI as if the user had pasted the headline + publisher
+  // Fallback #2: Wayback Machine. When direct fetch and Jina both fail
+  // (paywall, anti-bot, JS SPA that doesn't render for headless fetchers),
+  // archive.org usually has a static snapshot that's trivially readable.
+  if (!articleText) {
+    try {
+      articleText = await fetchViaWayback(realUrl);
+      if (articleText) fetchError = null;
+    } catch (err) {
+      const captured = captureFetchError(err);
+      if (!fetchError || fetchError.type === "fetch_failed") fetchError = captured;
+    }
+  }
+
+  // Fallback #3: search-based retrieval. This is the same trick Claude.ai
+  // and ChatGPT use internally — search the web for the exact headline,
+  // then read the top result. Different URL (sometimes a different
+  // publisher's coverage of the same story), but the content is still
+  // real reporting rather than an AI guess. This rescues JS-rendered SPAs
+  // that Jina can't render and sites without Wayback snapshots.
+  if (!articleText) {
+    try {
+      articleText = await fetchViaSearchResults(headline, realUrl);
+      if (articleText) fetchError = null;
+    } catch (err) {
+      const captured = captureFetchError(err);
+      if (!fetchError || fetchError.type === "fetch_failed") fetchError = captured;
+    }
+  }
+
+  // Fallback #4: ask the AI as if the user had pasted the headline + publisher
   // into Claude.ai / ChatGPT. The AI uses web search (if available) or its
   // training knowledge to answer. We flag the response with source:"knowledge"
   // so the popup can show the user that the answer is NOT from the article.
@@ -461,6 +503,273 @@ async function fetchViaJinaReader(url) {
     throw createError("fetch_failed", "Reader API returned too little text.");
   }
   return text;
+}
+
+// --- fetchViaWayback: asks archive.org's availability API for the closest
+//     snapshot of the URL, then fetches the archived HTML through the normal
+//     extraction pipeline. Uses the `id_/` variant of the Wayback URL to get
+//     the original un-modified page (no Wayback toolbar iframe injected). ---
+async function fetchViaWayback(url) {
+  if (!url) throw createError("fetch_failed", "No URL for Wayback lookup.");
+
+  const lookupUrl = WAYBACK_AVAILABILITY_URL + "?url=" + encodeURIComponent(url);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WAYBACK_TIMEOUT_MS);
+
+  let response;
+  try {
+    response = await fetch(lookupUrl, {
+      signal: controller.signal,
+      headers: { "Accept": "application/json" },
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err && err.name === "AbortError") {
+      throw createError("fetch_failed", "Wayback Machine took too long to respond.");
+    }
+    throw createError("fetch_failed", "Wayback Machine request failed.");
+  }
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    throw createError(
+      "fetch_failed",
+      "Wayback Machine returned HTTP " + response.status + "."
+    );
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch (_) {
+    throw createError("fetch_failed", "Wayback Machine returned invalid JSON.");
+  }
+
+  const snapshot = data && data.archived_snapshots && data.archived_snapshots.closest;
+  if (!snapshot || !snapshot.available || !snapshot.url) {
+    throw createError("fetch_failed", "No Wayback snapshot found for this article.");
+  }
+
+  // Convert "/web/<ts>/" to "/web/<ts>id_/" to get the raw archived HTML
+  // without the Wayback toolbar wrapper. The id_ variant is what scrapers
+  // and link checkers use because it's byte-identical to the original.
+  const rawSnapshotUrl = snapshot.url.replace(/\/web\/(\d+)\//, "/web/$1id_/");
+
+  // Route through the standard article pipeline so the same extraction,
+  // retries, and paywall/anti-bot detection apply.
+  return fetchArticle(rawSnapshotUrl);
+}
+
+// --- fetchViaSearchResults: runs a web search for the headline (optionally
+//     scoped to the publisher) and tries to fetch the matching result. This
+//     mirrors what the user would get by pasting the headline into Claude.ai
+//     or ChatGPT — the AI searches the web and reads the top result.
+//
+//     Strategy:
+//       1. Query Bing's static-HTML search endpoint (lenient, no JS required).
+//          If Bing is blocked/empty, fall back to DuckDuckGo HTML.
+//       2. Parse the result URLs out of the response HTML.
+//       3. Skip the original URL (already tried) and any obvious non-article
+//          domains (social media, aggregators).
+//       4. For each of the top N candidates, run fetchArticle(). Return the
+//          first one that yields enough text.
+//       5. If no candidate fetches cleanly, fall back to Jina Reader on the
+//          top candidate so we still get SOMETHING real. ---
+async function fetchViaSearchResults(headline, originalUrl) {
+  if (!headline) throw createError("fetch_failed", "No headline for search lookup.");
+
+  // Build a tight query. Quoting the headline greatly improves precision;
+  // most news headlines are long enough that an exact-phrase match returns
+  // the original article or a direct reprint as the first hit.
+  const quoted = '"' + headline.replace(/"/g, "") + '"';
+  const publisher = originalUrl ? getPublisherFromUrl(originalUrl) : "";
+  const query = publisher ? quoted + " " + publisher : quoted;
+
+  // Try Bing first, then DuckDuckGo. Collect the union of candidate URLs
+  // — a broken parser on one engine shouldn't starve us of results.
+  let candidates = [];
+  try {
+    const bingHtml = await fetchSearchEngineHtml(BING_SEARCH_URL + "?q=" + encodeURIComponent(query));
+    candidates = candidates.concat(parseBingResults(bingHtml));
+  } catch (_) { /* try next engine */ }
+
+  if (candidates.length < MAX_SEARCH_CANDIDATES) {
+    try {
+      const ddgHtml = await fetchSearchEngineHtml(DUCKDUCKGO_SEARCH_URL + "?q=" + encodeURIComponent(query));
+      candidates = candidates.concat(parseDuckDuckGoResults(ddgHtml));
+    } catch (_) { /* ignore */ }
+  }
+
+  // Dedupe by hostname+path and filter out the original URL and non-article
+  // domains (video, social, aggregators) that never have useful text.
+  const seen = new Set();
+  const originalKey = canonicalizeForCompare(originalUrl);
+  const filtered = [];
+  for (const candidate of candidates) {
+    const key = canonicalizeForCompare(candidate);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    if (key === originalKey) continue;
+    if (isBlockedSearchHost(candidate)) continue;
+    filtered.push(candidate);
+    if (filtered.length >= MAX_SEARCH_CANDIDATES) break;
+  }
+
+  if (filtered.length === 0) {
+    throw createError("fetch_failed", "Search returned no usable results.");
+  }
+
+  // Race candidates in parallel: first successful fetch wins. Each attempt
+  // tries direct fetch, then Jina Reader for JS-rendered pages. Using
+  // Promise.any keeps wall-clock latency bounded to a single fetch round,
+  // which matters because this path runs after three prior fallbacks.
+  const attempts = filtered.map((candidate) => tryReadCandidate(candidate));
+  try {
+    return await Promise.any(attempts);
+  } catch (aggregate) {
+    // Promise.any throws AggregateError when every attempt failed.
+    const firstErr = aggregate && aggregate.errors && aggregate.errors[0];
+    throw firstErr || createError("fetch_failed", "Couldn't read any search result.");
+  }
+}
+
+// --- tryReadCandidate: attempts to read a single search-result URL, first
+//     via direct fetch, then via Jina Reader. Resolves with the text on
+//     success; rejects if both paths fail (so Promise.any can skip it). ---
+async function tryReadCandidate(candidate) {
+  try {
+    const text = await fetchArticle(candidate);
+    if (text && text.length >= MIN_CONTENT_LENGTH) return text;
+  } catch (_) { /* fall through to Jina */ }
+  const text = await fetchViaJinaReader(candidate);
+  if (text && text.length >= MIN_CONTENT_LENGTH) return text;
+  throw createError("fetch_failed", "Candidate returned too little text.");
+}
+
+// --- fetchSearchEngineHtml: GETs a search engine HTML page with a browser
+//     UA and a tight timeout. Returns the raw HTML body. ---
+async function fetchSearchEngineHtml(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(url, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent": BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err && err.name === "AbortError") {
+      throw createError("fetch_failed", "Search engine took too long.");
+    }
+    throw createError("fetch_failed", "Search engine request failed.");
+  }
+  clearTimeout(timer);
+  if (!response.ok) {
+    throw createError("fetch_failed", "Search engine returned HTTP " + response.status + ".");
+  }
+  return await response.text();
+}
+
+// --- parseBingResults: extracts result URLs from a Bing search HTML page.
+//     Bing ships result anchors as `<h2><a href="https://real.url/...">`
+//     inside `<li class="b_algo">` items. We match the href attributes of
+//     those anchors and filter to external http(s) URLs. ---
+function parseBingResults(html) {
+  if (!html) return [];
+  const urls = [];
+  // Target anchors inside b_algo items. The simpler regex catches all
+  // h2 > a hrefs which in practice are organic result URLs on Bing.
+  const re = /<li[^>]+class\s*=\s*["'][^"']*b_algo[^"']*["'][\s\S]*?<h2[^>]*>\s*<a[^>]+href\s*=\s*["']([^"']+)["']/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const url = m[1];
+    if (/^https?:\/\//i.test(url)) urls.push(url);
+  }
+  // Fallback: if Bing changed markup, grab any h2 > a href.
+  if (urls.length === 0) {
+    const fb = /<h2[^>]*>\s*<a[^>]+href\s*=\s*["'](https?:\/\/[^"']+)["']/gi;
+    let m2;
+    while ((m2 = fb.exec(html)) !== null) {
+      urls.push(m2[1]);
+    }
+  }
+  return urls;
+}
+
+// --- parseDuckDuckGoResults: extracts result URLs from a DuckDuckGo HTML
+//     search page. DDG wraps real URLs in its own redirect
+//     (//duckduckgo.com/l/?uddg=<encoded-real-url>), which we decode back
+//     to the target URL. ---
+function parseDuckDuckGoResults(html) {
+  if (!html) return [];
+  const urls = [];
+  const re = /<a[^>]+class\s*=\s*["'][^"']*result__a[^"']*["'][^>]+href\s*=\s*["']([^"']+)["']/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const href = m[1];
+    const decoded = decodeDuckDuckGoRedirect(href);
+    if (decoded && /^https?:\/\//i.test(decoded)) urls.push(decoded);
+  }
+  return urls;
+}
+
+// --- decodeDuckDuckGoRedirect: turns "//duckduckgo.com/l/?uddg=..." into
+//     the underlying target URL. If the href is already a direct URL,
+//     returns it as-is. URLSearchParams.get() already performs percent-
+//     decoding, so we return the value as-is. ---
+function decodeDuckDuckGoRedirect(href) {
+  try {
+    // DDG hrefs are protocol-relative: prefix with https: to parse.
+    const full = href.startsWith("//") ? "https:" + href : href;
+    const u = new URL(full);
+    if (u.hostname.endsWith("duckduckgo.com") && u.searchParams.has("uddg")) {
+      return u.searchParams.get("uddg");
+    }
+    return u.href;
+  } catch (_) {
+    return null;
+  }
+}
+
+// --- canonicalizeForCompare: returns a stable "host + path" key used to
+//     dedupe candidate URLs and to skip the original article URL when
+//     iterating search results. ---
+function canonicalizeForCompare(url) {
+  if (!url) return "";
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase().replace(/^www\./, "");
+    const path = u.pathname.replace(/\/+$/, "").toLowerCase();
+    return host + path;
+  } catch (_) {
+    return "";
+  }
+}
+
+// --- isBlockedSearchHost: returns true for hosts that never carry useful
+//     article text (video platforms, social media, aggregators). Skipping
+//     them frees up candidate slots for real news sources. ---
+function isBlockedSearchHost(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    const blocked = [
+      "youtube.com", "youtu.be", "m.youtube.com",
+      "twitter.com", "x.com", "t.co",
+      "facebook.com", "m.facebook.com",
+      "instagram.com", "tiktok.com",
+      "reddit.com", "linkedin.com", "pinterest.com",
+      "news.google.com", "bing.com", "duckduckgo.com",
+    ];
+    return blocked.some((b) => host === b || host.endsWith("." + b));
+  } catch (_) {
+    return true;
+  }
 }
 
 // --- looksLikeAntiBot: heuristic for Cloudflare / Akamai / "enable JS" walls ---
