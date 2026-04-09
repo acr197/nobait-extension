@@ -4,6 +4,19 @@
 // --- Cross-browser API shim (Chrome uses `chrome`, Firefox exposes `browser`) ---
 const api = (typeof browser !== "undefined") ? browser : chrome;
 
+// --- Firefox: clicking the action icon opens the sidebar instead of the
+//     trigger-settings popup. The sidebar provides a fallback reader for pages
+//     where long-click / shift-click can't be used (Firefox home, sites that
+//     eat pointer events, etc.). Chrome has no sidebarAction API, so it keeps
+//     the manifest popup as-is. ---
+if (typeof browser !== "undefined" && browser.sidebarAction && browser.action) {
+  // Clearing the popup makes action.onClicked fire when the icon is clicked
+  Promise.resolve(browser.action.setPopup({ popup: "" })).catch(() => {});
+  browser.action.onClicked.addListener(() => {
+    Promise.resolve(browser.sidebarAction.toggle()).catch(() => {});
+  });
+}
+
 // --- Configuration ---
 const PROXY_URL = "https://nobait-proxy.acr197.workers.dev/summarize";
 const FETCH_TIMEOUT_MS = 10000;
