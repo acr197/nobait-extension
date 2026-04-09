@@ -59,13 +59,14 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // --- handleSummarize: orchestrates fetch -> extract -> AI pipeline ---
 async function handleSummarize(url, headline) {
-  let articleText;
+  let articleText = null;
+  let fetchError = null;
 
   // Phase 1: try to fetch the article directly
   try {
     articleText = await fetchArticle(url);
-  } catch (_) {
-    articleText = null;
+  } catch (err) {
+    fetchError = captureFetchError(err);
   }
 
   // Phase 2: for Google News redirect URLs, try alternative approaches
@@ -75,7 +76,10 @@ async function handleSummarize(url, headline) {
     if (realUrl) {
       try {
         articleText = await fetchArticle(realUrl);
-      } catch (_) { /* fall through */ }
+        fetchError = null;
+      } catch (err) {
+        fetchError = captureFetchError(err);
+      }
     }
 
     // 2b: try the RSS variant (server-side redirect)
@@ -87,18 +91,37 @@ async function handleSummarize(url, headline) {
       if (rssUrl !== url) {
         try {
           articleText = await fetchArticle(rssUrl);
-        } catch (_) { /* fall through */ }
+          fetchError = null;
+        } catch (err) {
+          fetchError = captureFetchError(err);
+        }
       }
     }
   }
 
-  // Phase 3: send to AI — with article text if available, headline-only otherwise
+  // Hard failures: surface them to the user directly rather than hallucinating
+  // a summary. Soft failures (generic network / parse issues) still fall
+  // through to headline-only mode so the user sees something useful.
+  if (!articleText && fetchError && (fetchError.type === "paywall" || fetchError.type === "blocked")) {
+    return { ok: false, error: fetchError.type, message: fetchError.message };
+  }
+
+  // Phase 3: send to AI — with article text if available, headline-only otherwise.
+  // Pass fetchError along so the prompt can explain *why* content is missing.
   try {
-    const summary = await callAI(headline, articleText);
+    const summary = await callAI(headline, articleText, fetchError);
     return { ok: true, summary };
   } catch (err) {
     return { ok: false, error: "ai_error", message: err.message || "Summarization failed." };
   }
+}
+
+// --- captureFetchError: normalizes a fetchArticle error into { type, message } ---
+function captureFetchError(err) {
+  return {
+    type: (err && err.errorType) || "fetch_failed",
+    message: (err && err.message) || "Could not load the article.",
+  };
 }
 
 // --- isGoogleNewsRedirectUrl: checks if a URL is a Google News redirect ---
@@ -265,11 +288,11 @@ function extractText(html) {
 }
 
 // --- callAI: sends the prompt to the Cloudflare Worker proxy ---
-async function callAI(headline, content) {
+async function callAI(headline, content, fetchError) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
-  const prompt = buildPrompt(headline, content);
+  const prompt = buildPrompt(headline, content, fetchError);
 
   let response;
   try {
@@ -301,41 +324,50 @@ async function callAI(headline, content) {
   return data.summary;
 }
 
-// --- buildPrompt: constructs the full AI prompt from headline + content ---
-function buildPrompt(headline, content) {
+// --- buildPrompt: constructs the full AI prompt from headline + content.
+//     fetchError (optional) is passed when we couldn't load article text so
+//     the model can explain *why* it's working from the headline alone. ---
+function buildPrompt(headline, content, fetchError) {
   if (!content) {
-    // Headline-only mode: AI answers from its own knowledge
-    return `You are NoBait, an AI that cuts through clickbait. The full article could not be loaded, but based on the headline below and your knowledge, provide the ACTUAL answer or key information the headline is teasing.
+    const reason = fetchError && fetchError.message
+      ? fetchError.message
+      : "The article text could not be loaded.";
 
-Rules:
-- Give the direct answer in 1-3 sentences max
-- No fluff, no filler, no rewording the headline
-- If the headline asks a question, answer it directly
-- If it's a listicle tease, give the key item(s)
-- If it's rage/shock bait, state what actually happened plainly
-- If you genuinely don't know the answer, say so briefly
+    // Headline-only mode: the model has no article text to work with.
+    return `You are NoBait, an AI that cuts through clickbait headlines. The article text could NOT be loaded (reason: ${reason}). Work from the headline and your general knowledge.
+
+RULES:
+- Answer in 1-3 sentences, direct and specific.
+- Include concrete facts when you can: names, numbers, dates, outcomes.
+- DO NOT write "I don't have access", "I cannot access", or "I don't know the content" — the user already knows the fetch failed; that phrasing is unhelpful.
+- If the headline asks a question you can answer from general knowledge, answer it plainly.
+- If the topic is time-sensitive and you genuinely lack specifics, say exactly: "Couldn't load the article text. Try 'Open original' for the full story." and then add one sentence of useful context from what you do know.
+- If the headline is obviously pure clickbait that promises an answer it cannot keep (e.g. "You won't believe…"), respond with EXACTLY one line starting with \`CLICKBAIT:\` followed by a short snarky sentence calling out the bait.
 
 Headline: "${headline}"
 
-Direct answer:`;
+Response:`;
   }
 
-  return `You are NoBait, an AI that cuts through clickbait. Given a headline and the article content, provide the ACTUAL answer or key information the headline is teasing.
+  return `You are NoBait, an AI that cuts through clickbait. You've been given the article's text. Tell the reader the SPECIFIC, concrete information that the headline was teasing.
 
-Rules:
-- Give the direct answer in 1-3 sentences max
-- No fluff, no filler, no rewording the headline
-- If the headline asks a question, answer it directly
-- If it's a listicle tease, give the key item(s)
-- If it's rage/shock bait, state what actually happened plainly
-- If the article doesn't actually answer its own headline, say so
+HARD RULES:
+1. Max 2-3 sentences, tight and factual. No filler, no "this article discusses…".
+2. NEVER just rephrase the headline. If the headline says "Samsung sets release for April", your answer MUST name the specific date — or explicitly say only the month is confirmed and no day was given.
+3. ALWAYS prefer specifics: numbers, prices, percentages, dates, names, quantities, outcomes.
+4. If the headline asks a question, answer the question directly using facts from the article.
+5. If the article names specifics that contradict the headline, say so.
+6. If the article partially answers the headline (e.g. month but not day), state what IS confirmed AND what is still unknown in one sentence.
+7. CLICKBAIT DETECTION — if the article genuinely provides no new specifics beyond restating the headline (the classic "the article answers its own question with the same words" pattern), respond with EXACTLY one line in this format:
+   CLICKBAIT: <one short, snarky sentence calling out the article>
+   Use this ONLY when the article truly adds nothing. If there's ANY additional specific fact, do not use the clickbait format — share that fact instead.
 
 Headline: "${headline}"
 
 Article content:
 ${content}
 
-Direct answer:`;
+Response:`;
 }
 
 // --- createError: builds an Error with an errorType property ---
