@@ -25,6 +25,10 @@ const MAX_CONTENT_LENGTH = 6000;
 const MIN_CONTENT_LENGTH = 140;
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+// Jina AI's free Reader API — used as a last-resort fetch for JS-rendered SPAs
+// and sites whose anti-bot blocks our direct fetch.
+const JINA_READER_URL_PREFIX = "https://r.jina.ai/";
+const JINA_TIMEOUT_MS = 20000;
 
 // --- Message listener: routes SUMMARIZE requests from the content script
 //     and the sidebar. Returns a Promise so the same handler works in Chrome
@@ -88,6 +92,23 @@ async function handleSummarize(url, headline, mode) {
       articleText = await fetchArticle(url);
       fetchError = null;
     } catch (err) {
+      if (!fetchError) fetchError = captureFetchError(err);
+    }
+  }
+
+  // Fallback: server-side Reader API. Catches JS-rendered SPAs (Tom's Guide,
+  // most modern news sites) whose direct HTML is a near-empty skeleton, and
+  // sites whose bot protection blocks our direct fetch. Use the decoded URL
+  // when we have one, otherwise the original — avoids handing Jina the
+  // Google News redirect stub.
+  if (!articleText) {
+    const realUrl = decodeGoogleNewsUrl(url) || url;
+    try {
+      articleText = await fetchViaJinaReader(realUrl);
+      if (articleText) fetchError = null;
+    } catch (err) {
+      // Keep the earlier, more specific error (e.g. "paywall") if we had
+      // one; only overwrite if we had nothing.
       if (!fetchError) fetchError = captureFetchError(err);
     }
   }
@@ -317,6 +338,58 @@ async function fetchRaw(url, ua) {
 
   const html = await response.text();
   return { html, finalUrl: response.url || url };
+}
+
+// --- fetchViaJinaReader: last-resort fetch that delegates to Jina AI's free
+//     Reader API. Jina fetches the URL server-side with a real headless
+//     browser (so JS-rendered SPAs work), strips navigation/ads, and returns
+//     clean text. Used when our own direct fetch returned a thin SPA shell
+//     or was blocked by anti-bot. Free tier: 200 req/min, no API key.
+//     Privacy note: this sends the article URL (but not the user's cookies
+//     or IP) to r.jina.ai. ---
+async function fetchViaJinaReader(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), JINA_TIMEOUT_MS);
+
+  let response;
+  try {
+    response = await fetch(JINA_READER_URL_PREFIX + url, {
+      signal: controller.signal,
+      headers: {
+        "Accept": "text/plain, text/markdown, */*",
+        "X-Return-Format": "text",
+      },
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err && err.name === "AbortError") {
+      throw createError("fetch_failed", "Reader API took too long to respond.");
+    }
+    throw createError("fetch_failed", "Reader API request failed.");
+  }
+
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    throw createError(
+      response.status === 429 ? "blocked" : "fetch_failed",
+      "Reader API returned HTTP " + response.status + "."
+    );
+  }
+
+  let text = (await response.text()) || "";
+  // Collapse whitespace and truncate to the same budget as extractText().
+  text = text.replace(/\s+/g, " ").trim();
+  if (!text) {
+    throw createError("fetch_failed", "Reader API returned empty content.");
+  }
+  if (text.length > MAX_CONTENT_LENGTH) {
+    text = text.substring(0, MAX_CONTENT_LENGTH) + "...";
+  }
+  if (text.length < MIN_CONTENT_LENGTH) {
+    throw createError("fetch_failed", "Reader API returned too little text.");
+  }
+  return text;
 }
 
 // --- looksLikeAntiBot: heuristic for Cloudflare / Akamai / "enable JS" walls ---
