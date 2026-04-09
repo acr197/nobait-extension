@@ -885,6 +885,7 @@
         max-height: 200px;
         overflow-y: auto;
         overscroll-behavior: contain;
+        white-space: pre-wrap;
       }
       .nobait-status {
         font-size: 12.5px;
