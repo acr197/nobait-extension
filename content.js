@@ -53,6 +53,21 @@
   // --- Listen for storage changes so popup toggles take effect immediately ---
   api.storage.onChanged.addListener(onStorageChanged);
 
+  // --- Listen for messages from the sidebar (GET_ARTICLE_LINKS).
+  //     Uses both sendResponse and a Promise return for Chrome/Firefox parity. ---
+  api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg || msg.type !== "GET_ARTICLE_LINKS") return;
+    let result;
+    try {
+      const links = collectArticleLinks();
+      result = { ok: true, links, pageTitle: document.title, pageUrl: location.href };
+    } catch (err) {
+      result = { ok: false, error: String(err && err.message || err) };
+    }
+    try { sendResponse(result); } catch (_) { /* channel may be closed */ }
+    return Promise.resolve(result);
+  });
+
   // --- Event listeners ---
   document.addEventListener("pointerdown", onPointerDown, true);
   document.addEventListener("pointermove", onPointerMove, true);
@@ -290,6 +305,71 @@
     // Collapse whitespace
     text = text.replace(/\s+/g, " ").trim();
     return text || null;
+  }
+
+  // =========================================================================
+  // ARTICLE LINK COLLECTION (for sidebar)
+  // =========================================================================
+
+  // --- collectArticleLinks: scans the current page for article-like links.
+  //     Returns an array of { url, headline } in document order, deduped. ---
+  function collectArticleLinks() {
+    const anchors = document.querySelectorAll("a[href]");
+    const seen = new Set();
+    const results = [];
+    const currentHost = location.hostname.toLowerCase();
+
+    for (const anchor of anchors) {
+      // Skip hidden links
+      if (anchor.offsetParent === null && anchor.getClientRects().length === 0) continue;
+
+      const href = resolveHref(anchor);
+      if (!href) continue;
+
+      // Skip in-page anchors and self-links to the current URL
+      if (href.split("#")[0] === location.href.split("#")[0]) continue;
+
+      // Skip blocked (social, video, shopping, etc.)
+      if (isBlockedUrl(href)) continue;
+
+      // Skip obvious same-host nav/utility links (home, about, etc.)
+      // but keep article links on the current domain
+      let parsed;
+      try { parsed = new URL(href); } catch (_) { continue; }
+      const sameHost = parsed.hostname.toLowerCase() === currentHost;
+      if (sameHost) {
+        const path = parsed.pathname.toLowerCase();
+        // Skip root and very short paths (likely nav)
+        if (path === "/" || path === "" || path.length < 6) continue;
+        // Skip common utility paths
+        if (/^\/(about|contact|privacy|terms|login|signin|signup|register|subscribe|newsletter|search|tag|tags|category|categories|author|authors|archive|archives|rss|feed|sitemap)(\/|$)/.test(path)) continue;
+      }
+
+      const headline = extractHeadline(anchor);
+      if (!headline) continue;
+      const clean = headline.trim();
+      // Require a reasonably substantial headline
+      if (clean.length < 20) continue;
+      if (clean.split(/\s+/).length < 4) continue;
+
+      // Try to unwrap Google News wrapper URLs
+      const finalUrl = unwrapGoogleNewsUrl(anchor, href) || href;
+
+      // Dedupe on final URL + headline
+      const key = finalUrl + "|" + clean.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      let sourceHost = "";
+      try { sourceHost = new URL(finalUrl).hostname.replace(/^www\./, ""); } catch (_) { /* ignore */ }
+
+      results.push({ url: finalUrl, headline: clean, source: sourceHost });
+
+      // Reasonable cap so huge pages don't overwhelm the sidebar
+      if (results.length >= 200) break;
+    }
+
+    return results;
   }
 
   // =========================================================================
