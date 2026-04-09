@@ -640,110 +640,125 @@
       });
     });
 
-    // Request summary from background. Use Promise style so the same code path
-    // works in Chrome (MV3 returns Promises when no callback is given) and
-    // Firefox (browser.runtime.sendMessage always returns a Promise).
-    Promise.resolve(api.runtime.sendMessage({ type: "SUMMARIZE", url, headline }))
+    // Kick off the first (short) summary request.
+    requestSummary(popup, spinnerWrap, url, headline, "short");
+  }
+
+  // --- requestSummary: sends a SUMMARIZE message to background and routes
+  //     the response to renderSummary / renderError. Shared by the initial
+  //     short request and the "More context" detailed re-request. ---
+  function requestSummary(popup, placeholder, url, headline, mode) {
+    Promise.resolve(api.runtime.sendMessage({ type: "SUMMARIZE", url, headline, mode }))
       .then((response) => {
+        if (!activePopupHost) return;
         if (!response) {
-          renderError(popup, spinnerWrap, "fetch_failed", "No response from extension.", headline);
+          renderError(popup, placeholder, "fetch_failed", "No response from extension.", headline);
           return;
         }
         if (response.ok) {
-          renderSummary(popup, spinnerWrap, response.summary);
+          renderSummary(popup, placeholder, response, url, headline, mode);
         } else {
-          renderError(popup, spinnerWrap, response.error, response.message, headline);
+          renderError(popup, placeholder, response.error, response.message, headline);
         }
       })
       .catch(() => {
-        renderError(popup, spinnerWrap, "fetch_failed", "Extension error. Try again.", headline);
+        if (!activePopupHost) return;
+        renderError(popup, placeholder, "fetch_failed", "Extension error. Try again.", headline);
       });
   }
 
-  // --- Rotating tongue-in-cheek lines shown under the PURE CLICKBAIT banner. ---
-  const CLICKBAIT_QUIPS = [
-    "Saved you the click.",
-    "Not even worth lifting a finger.",
-    "All bait, no meal.",
-    "Journalistic rickroll.",
-    "Hook set, line empty.",
-    "You're welcome.",
-    "The article's soul: empty.",
-    "Attention economy 1, your time 0.",
-  ];
-
-  // --- parseClickbaitVerdict: returns the snarky one-liner if the AI's
-  //     response starts with the CLICKBAIT: sentinel, otherwise null. ---
-  function parseClickbaitVerdict(summary) {
-    if (!summary) return null;
-    const m = summary.match(/^\s*CLICKBAIT\s*[:\-]\s*(.*)$/is);
-    if (!m) return null;
-    return (m[1] || "").trim();
+  // --- buildLoadingEl: fresh spinner node so we can swap bodies back to a
+  //     loading state when the user clicks "More context". ---
+  function buildLoadingEl() {
+    const wrap = document.createElement("div");
+    wrap.className = "nobait-body nobait-loading";
+    const spinner = document.createElement("div");
+    spinner.className = "nobait-spinner";
+    wrap.appendChild(spinner);
+    const loadingText = document.createElement("div");
+    loadingText.className = "nobait-loading-text";
+    loadingText.textContent = "Analyzing article\u2026";
+    wrap.appendChild(loadingText);
+    return wrap;
   }
 
-  // --- renderSummary: replaces spinner with the AI summary text ---
-  function renderSummary(popup, spinnerWrap, summary) {
+  // --- renderSummary: replaces the spinner with the AI summary text.
+  //     When contentStatus !== "ok" (blocked / paywall / fetch failed), we
+  //     prepend a one-line reason and an "Its attempt at a summary:" label,
+  //     then show the summary underneath. A "More context" button lets the
+  //     user regenerate a longer answer; it's disabled when blocked because
+  //     a longer headline-only guess would just be more guessing. ---
+  function renderSummary(popup, oldEl, response, url, headline, mode) {
     if (!activePopupHost) return;
 
     const body = document.createElement("div");
     body.className = "nobait-body";
 
-    const verdict = parseClickbaitVerdict(summary);
-    if (verdict !== null) {
-      body.classList.add("nobait-clickbait-body");
+    const status = response.contentStatus || "ok";
+    const isBlocked = status !== "ok";
 
-      const banner = document.createElement("div");
-      banner.className = "nobait-clickbait-banner";
-      banner.textContent = "PURE CLICKBAIT";
-      body.appendChild(banner);
+    if (isBlocked) {
+      const reason = document.createElement("div");
+      reason.className = "nobait-status";
+      reason.textContent = response.contentStatusMessage || "Could not load the article.";
+      body.appendChild(reason);
 
-      if (verdict) {
-        const roast = document.createElement("div");
-        roast.className = "nobait-clickbait-roast";
-        roast.textContent = verdict;
-        body.appendChild(roast);
-      }
-
-      const quip = document.createElement("div");
-      quip.className = "nobait-clickbait-quip";
-      quip.textContent = CLICKBAIT_QUIPS[Math.floor(Math.random() * CLICKBAIT_QUIPS.length)];
-      body.appendChild(quip);
-    } else {
-      const text = document.createElement("div");
-      text.className = "nobait-summary";
-      text.textContent = summary;
-      body.appendChild(text);
+      const label = document.createElement("div");
+      label.className = "nobait-status-label";
+      label.textContent = "Its attempt at a summary:";
+      body.appendChild(label);
     }
 
-    swapContent(popup, spinnerWrap, body);
+    const text = document.createElement("div");
+    text.className = "nobait-summary";
+    if (isBlocked) text.classList.add("nobait-summary-indent");
+    text.textContent = response.summary || "";
+    body.appendChild(text);
+
+    // "More context" button — only shown in short mode, disabled when blocked.
+    if (mode !== "detailed") {
+      const moreBtn = document.createElement("button");
+      moreBtn.className = "nobait-more-btn";
+      moreBtn.type = "button";
+      moreBtn.textContent = "More context";
+      if (isBlocked) {
+        moreBtn.disabled = true;
+        moreBtn.title = "Unavailable — article text couldn't be loaded.";
+      } else {
+        moreBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const loadingEl = buildLoadingEl();
+          if (body.parentNode === popup) {
+            popup.replaceChild(loadingEl, body);
+          }
+          requestSummary(popup, loadingEl, url, headline, "detailed");
+        });
+      }
+      body.appendChild(moreBtn);
+    }
+
+    swapContent(popup, oldEl, body);
   }
 
-  // --- renderError: replaces spinner with error message and Google Search fallback ---
+  // --- renderError: only used for hard errors where the AI itself failed
+  //     (missing response / extension-side exception). Blocked and paywalled
+  //     articles now flow through renderSummary with a status banner. ---
   function renderError(popup, spinnerWrap, errorType, message, headline) {
     if (!activePopupHost) return;
 
     const body = document.createElement("div");
     body.className = "nobait-body nobait-error-body";
 
-    // Error icon
     const icon = document.createElement("div");
     icon.className = "nobait-error-icon";
-    if (errorType === "paywall") {
-      icon.textContent = "\uD83D\uDD12";
-    } else if (errorType === "blocked") {
-      icon.textContent = "\uD83D\uDEAB";
-    } else {
-      icon.textContent = "\u26A0\uFE0F";
-    }
+    icon.textContent = "\u26A0\uFE0F";
     body.appendChild(icon);
 
-    // Error message
     const msg = document.createElement("div");
     msg.className = "nobait-error-msg";
-    msg.textContent = message;
+    msg.textContent = message || "Summarization failed.";
     body.appendChild(msg);
 
-    // Google Search fallback button
     const btn = document.createElement("button");
     btn.className = "nobait-fallback-btn";
     btn.textContent = "Search Google";
@@ -894,41 +909,50 @@
         overflow-y: auto;
         overscroll-behavior: contain;
       }
-      .nobait-clickbait-body {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        text-align: center;
-        gap: 8px;
-        padding: 18px 16px 16px;
+      .nobait-status {
+        font-size: 12.5px;
+        font-weight: 600;
+        color: #b45309;
+        line-height: 1.4;
+        margin-bottom: 8px;
       }
-      .nobait-clickbait-banner {
-        font-size: 19px;
-        font-weight: 900;
-        letter-spacing: 0.06em;
-        color: #dc2626;
+      .nobait-status-label {
+        font-size: 11px;
+        font-weight: 600;
         text-transform: uppercase;
-        text-shadow: 0 1px 0 rgba(220, 38, 38, 0.12);
-        animation: nobait-clickbait-pulse 1.6s ease-in-out infinite;
-      }
-      @keyframes nobait-clickbait-pulse {
-        0%, 100% { transform: scale(1); }
-        50%      { transform: scale(1.035); }
-      }
-      .nobait-clickbait-roast {
-        font-size: 13px;
-        color: #1a1a1a;
-        line-height: 1.45;
-        max-width: 300px;
-      }
-      .nobait-clickbait-quip {
-        margin-top: 4px;
-        padding-top: 8px;
-        border-top: 1px dashed #eee;
-        font-size: 11.5px;
-        font-style: italic;
+        letter-spacing: 0.06em;
         color: #9a9aa6;
-        width: 100%;
+        margin-bottom: 4px;
+      }
+      .nobait-summary-indent {
+        color: #3a3a45;
+      }
+      .nobait-more-btn {
+        margin-top: 12px;
+        padding: 7px 14px;
+        border: 1px solid #e5e5ec;
+        border-radius: 8px;
+        background: #f6f5ff;
+        color: #6c47ff;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+        font-family: inherit;
+        align-self: flex-start;
+      }
+      .nobait-more-btn:hover:not([disabled]) {
+        background: #efeafe;
+        border-color: #d8cfff;
+      }
+      .nobait-more-btn:active:not([disabled]) {
+        transform: scale(0.97);
+      }
+      .nobait-more-btn[disabled] {
+        background: #f3f3f5;
+        color: #b5b5bf;
+        border-color: #ececf0;
+        cursor: not-allowed;
       }
       .nobait-summary::-webkit-scrollbar {
         width: 6px;

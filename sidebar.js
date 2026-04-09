@@ -37,12 +37,6 @@
   //     closed/reopened the modal for a different article. ---
   let activeRequestId = 0;
 
-  // --- RSS-fallback mode: true when the active tab is a privileged page
-  //     (about:home, about:newtab, etc.) and we showed Google News top
-  //     stories instead. In that mode the content script isn't available,
-  //     so clicks must fall back to the inline sidebar modal. ---
-  let inRssMode = false;
-
   // =========================================================================
   // INITIALIZATION
   // =========================================================================
@@ -152,45 +146,48 @@
   async function scanActiveTab() {
     showState("loading");
     listEl.innerHTML = "";
-    inRssMode = false;
+    pageTitleEl.textContent = "";
+    pageMetaEl.textContent = "";
 
     let tab;
     try {
       tab = await getActiveTab();
     } catch (_) {
-      await showUnreadableOrFallback(null);
+      showUnreadable();
       return;
     }
     if (!tab) {
-      await showUnreadableOrFallback(null);
+      showUnreadable();
       return;
     }
 
-    // Update the page info header
+    // Privileged pages (about:, chrome:, moz-extension:, file:, etc.) cannot
+    // be scanned. The sidebar intentionally shows NO articles in that case —
+    // we only ever surface headlines from the current tab, never from a
+    // cached fallback feed.
+    if (!isReadableUrl(tab.url)) {
+      showUnreadable();
+      return;
+    }
+
+    // Update the page info header now that we know the tab is scannable.
     pageTitleEl.textContent = tab.title || "(untitled)";
     pageMetaEl.textContent = "";
 
-    // Privileged pages (about:, chrome:, moz-extension:) can't be scanned —
-    // fall back to Google News top stories so the sidebar isn't empty.
-    if (!isReadableUrl(tab.url)) {
-      await showUnreadableOrFallback(tab);
-      return;
-    }
-
-    // Ask the content script to collect article links
+    // Ask the content script to collect article links.
     let response;
     try {
       response = await Promise.resolve(
         api.tabs.sendMessage(tab.id, { type: "GET_ARTICLE_LINKS" })
       );
     } catch (err) {
-      // Content script not present (file://, privileged page, or injection blocked)
-      await showUnreadableOrFallback(tab);
+      // Content script not present (injection blocked, restricted origin).
+      showUnreadable();
       return;
     }
 
     if (!response || !response.ok || !Array.isArray(response.links)) {
-      await showUnreadableOrFallback(tab);
+      showUnreadable();
       return;
     }
 
@@ -204,33 +201,6 @@
     renderLinks(links);
     pageMetaEl.textContent = links.length + (links.length === 1 ? " article" : " articles") +
       " · " + hostnameOf(tab.url);
-    showState("list");
-  }
-
-  // --- showUnreadableOrFallback: when we can't read the active tab
-  //     (privileged page like about:home, or content script unavailable),
-  //     fetch Google News top stories through background.js and render
-  //     them instead. Falls back to the "can't read" state if that fails. ---
-  async function showUnreadableOrFallback(tab) {
-    let trending;
-    try {
-      const resp = await Promise.resolve(
-        api.runtime.sendMessage({ type: "FETCH_TRENDING_NEWS" })
-      );
-      if (resp && resp.ok && Array.isArray(resp.links) && resp.links.length > 0) {
-        trending = resp.links;
-      }
-    } catch (_) { /* ignore, fall through */ }
-
-    if (!trending) {
-      showUnreadable();
-      return;
-    }
-
-    inRssMode = true;
-    pageTitleEl.textContent = "Top headlines";
-    pageMetaEl.textContent = trending.length + " articles · Google News";
-    renderLinks(trending);
     showState("list");
   }
 
@@ -324,50 +294,54 @@
 
   async function openSummary(link, event) {
     // Preferred path: ask the content script to render the popup in the page
-    // itself, anchored near the cursor so the summary surfaces next to wherever
-    // the user clicked. Falls back to the inline sidebar modal if the content
-    // script isn't reachable (privileged page / RSS fallback).
-    if (!inRssMode) {
-      const clientY = event && typeof event.clientY === "number" ? event.clientY : 120;
-      try {
-        const tab = await getActiveTab();
-        if (tab && tab.id != null) {
-          const resp = await Promise.resolve(
-            api.tabs.sendMessage(tab.id, {
-              type: "SHOW_POPUP_AT",
-              url: link.url,
-              headline: link.headline,
-              // x: small left-edge offset puts the popup just inside the page
-              // viewport, which is already to the right of the sidebar panel.
-              x: 12,
-              y: clientY,
-            })
-          );
-          if (resp && resp.ok) return;
-        }
-      } catch (_) { /* fall through to the inline modal */ }
-    }
+    // itself, anchored near where the user clicked. Fall back to the inline
+    // sidebar modal if the content script isn't reachable.
+    const clientY = event && typeof event.clientY === "number" ? event.clientY : 120;
+    try {
+      const tab = await getActiveTab();
+      if (tab && tab.id != null) {
+        const resp = await Promise.resolve(
+          api.tabs.sendMessage(tab.id, {
+            type: "SHOW_POPUP_AT",
+            url: link.url,
+            headline: link.headline,
+            // x: small left-edge offset puts the popup just inside the page
+            // viewport, which is already to the right of the sidebar panel.
+            x: 12,
+            y: clientY,
+          })
+        );
+        if (resp && resp.ok) return;
+      }
+    } catch (_) { /* fall through to the inline modal */ }
 
     openSummaryInModal(link);
   }
 
   async function openSummaryInModal(link) {
-    const requestId = ++activeRequestId;
-
     modalHeadlineEl.textContent = link.headline;
     modalOpenLink.href = link.url;
-    modalBodyEl.innerHTML = "";
-    const loading = document.createElement("div");
-    loading.className = "sb-modal-loading";
-    loading.innerHTML = '<div class="sb-spinner"></div><div class="sb-modal-loading-text">Analyzing article\u2026</div>';
-    modalBodyEl.appendChild(loading);
-
+    showModalLoading();
     openModal();
+    await requestModalSummary(link, "short");
+  }
+
+  // --- requestModalSummary: shared path for the initial short summary and
+  //     the "More context" detailed re-request. Uses activeRequestId to
+  //     drop stale responses if the user closes or reopens the modal. ---
+  async function requestModalSummary(link, mode) {
+    const requestId = ++activeRequestId;
+    showModalLoading();
 
     let response;
     try {
       response = await Promise.resolve(
-        api.runtime.sendMessage({ type: "SUMMARIZE", url: link.url, headline: link.headline })
+        api.runtime.sendMessage({
+          type: "SUMMARIZE",
+          url: link.url,
+          headline: link.headline,
+          mode,
+        })
       );
     } catch (err) {
       if (requestId !== activeRequestId) return;
@@ -382,64 +356,69 @@
       return;
     }
     if (response.ok) {
-      renderSummary(response.summary);
+      renderSummary(response, link, mode);
     } else {
       renderError(response.error, response.message, link.headline);
     }
   }
 
-  // --- Rotating snarky lines shown with the PURE CLICKBAIT banner. ---
-  const CLICKBAIT_QUIPS = [
-    "Saved you the click.",
-    "Not even worth lifting a finger.",
-    "All bait, no meal.",
-    "Journalistic rickroll.",
-    "Hook set, line empty.",
-    "You're welcome.",
-    "The article's soul: empty.",
-    "Attention economy 1, your time 0.",
-  ];
-
-  function parseClickbaitVerdict(summary) {
-    if (!summary) return null;
-    const m = summary.match(/^\s*CLICKBAIT\s*[:\-]\s*(.*)$/is);
-    if (!m) return null;
-    return (m[1] || "").trim();
+  function showModalLoading() {
+    modalBodyEl.innerHTML = "";
+    const loading = document.createElement("div");
+    loading.className = "sb-modal-loading";
+    loading.innerHTML =
+      '<div class="sb-spinner"></div><div class="sb-modal-loading-text">Analyzing article\u2026</div>';
+    modalBodyEl.appendChild(loading);
   }
 
-  function renderSummary(summary) {
+  // --- renderSummary: displays the AI summary, optionally prefaced by a
+  //     one-line reason the content couldn't be fetched. The "More context"
+  //     button is disabled in blocked/paywall states since a longer headline-
+  //     only guess would just be more guessing. ---
+  function renderSummary(response, link, mode) {
     modalBodyEl.innerHTML = "";
 
-    const verdict = parseClickbaitVerdict(summary);
-    if (verdict !== null) {
-      const wrap = document.createElement("div");
-      wrap.className = "sb-modal-clickbait";
+    const status = response.contentStatus || "ok";
+    const isBlocked = status !== "ok";
 
-      const banner = document.createElement("div");
-      banner.className = "sb-modal-clickbait-banner";
-      banner.textContent = "PURE CLICKBAIT";
-      wrap.appendChild(banner);
+    const wrap = document.createElement("div");
+    wrap.className = "sb-modal-summary";
 
-      if (verdict) {
-        const roast = document.createElement("div");
-        roast.className = "sb-modal-clickbait-roast";
-        roast.textContent = verdict;
-        wrap.appendChild(roast);
-      }
+    if (isBlocked) {
+      const reason = document.createElement("div");
+      reason.className = "sb-modal-status";
+      reason.textContent = response.contentStatusMessage || "Could not load the article.";
+      wrap.appendChild(reason);
 
-      const quip = document.createElement("div");
-      quip.className = "sb-modal-clickbait-quip";
-      quip.textContent = CLICKBAIT_QUIPS[Math.floor(Math.random() * CLICKBAIT_QUIPS.length)];
-      wrap.appendChild(quip);
-
-      modalBodyEl.appendChild(wrap);
-      return;
+      const label = document.createElement("div");
+      label.className = "sb-modal-status-label";
+      label.textContent = "Its attempt at a summary:";
+      wrap.appendChild(label);
     }
 
-    const div = document.createElement("div");
-    div.className = "sb-modal-summary";
-    div.textContent = summary;
-    modalBodyEl.appendChild(div);
+    const text = document.createElement("div");
+    text.className = "sb-modal-summary-text";
+    text.textContent = response.summary || "";
+    wrap.appendChild(text);
+
+    // "More context" button — only offered on short mode results.
+    if (mode !== "detailed") {
+      const btn = document.createElement("button");
+      btn.className = "sb-modal-more-btn";
+      btn.type = "button";
+      btn.textContent = "More context";
+      if (isBlocked) {
+        btn.disabled = true;
+        btn.title = "Unavailable — article text couldn't be loaded.";
+      } else {
+        btn.addEventListener("click", () => {
+          requestModalSummary(link, "detailed");
+        });
+      }
+      wrap.appendChild(btn);
+    }
+
+    modalBodyEl.appendChild(wrap);
   }
 
   function renderError(errorType, message, headline) {
@@ -449,9 +428,7 @@
 
     const icon = document.createElement("div");
     icon.className = "sb-modal-error-icon";
-    if (errorType === "paywall") icon.textContent = "\uD83D\uDD12";
-    else if (errorType === "blocked") icon.textContent = "\uD83D\uDEAB";
-    else icon.textContent = "\u26A0\uFE0F";
+    icon.textContent = "\u26A0\uFE0F";
     wrap.appendChild(icon);
 
     const msg = document.createElement("div");
