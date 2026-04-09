@@ -101,12 +101,22 @@ async function handleSummarize(url, headline, mode) {
     }
   }
 
+  // Resolve the real publisher URL for external fallbacks (Jina, Wayback).
+  // decodeGoogleNewsUrl() works only for older Google News URL formats; for
+  // modern protobuf-encoded IDs it returns null, leaving realUrl as the
+  // Google News SPA stub — which Jina cannot usefully scrape. When decode
+  // fails we follow the RSS redirect (server-side 302) to capture the final
+  // publisher URL from response.url, without needing to read the body.
+  let realUrl = decodeGoogleNewsUrl(url) || null;
+  if (!realUrl && googleNewsRss) {
+    realUrl = await discoverPublisherUrl(googleNewsRss);
+  }
+  realUrl = realUrl || url;
+
   // Fallback #1: server-side Reader API (Jina). Catches JS-rendered SPAs
   // (Tom's Guide, most modern news sites) whose direct HTML is a near-empty
-  // skeleton, and sites whose bot protection blocks our direct fetch. Use
-  // the decoded URL when we have one, otherwise the original — avoids
-  // handing Jina the Google News redirect stub.
-  const realUrl = decodeGoogleNewsUrl(url) || url;
+  // skeleton, and sites whose bot protection blocks our direct fetch. Now
+  // uses the resolved publisher URL so Jina gets the real article page.
   if (!articleText) {
     try {
       articleText = await fetchViaJinaReader(realUrl);
@@ -229,6 +239,40 @@ function decodeGoogleNewsUrl(url) {
     }
   } catch (_) { /* decoding failed */ }
   return null;
+}
+
+// --- discoverPublisherUrl: follows the redirect chain of a URL (typically a
+//     Google News RSS stub) and returns the final destination URL without
+//     reading the response body. Used to give Jina/Wayback the real publisher
+//     URL when the base64-decode of the Google News article ID fails (which is
+//     the common case for modern protobuf-encoded IDs). Returns null on any
+//     error or if the final URL is still on google.com. ---
+async function discoverPublisherUrl(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const resp = await fetch(url, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent": BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+    clearTimeout(timer);
+    // response.url is the final URL after all redirects — no body read needed.
+    const finalUrl = resp.url;
+    if (!finalUrl) return null;
+    let parsed;
+    try { parsed = new URL(finalUrl); } catch (_) { return null; }
+    // Reject if we ended up back on Google (e.g. login redirect, AMP viewer).
+    if (/(?:^|\.)google\.com$/.test(parsed.hostname.toLowerCase())) return null;
+    return finalUrl;
+  } catch (_) {
+    clearTimeout(timer);
+    return null;
+  }
 }
 
 // --- Googlebot UA: many sites (esp. paywalled / SPA) serve clean static HTML
@@ -526,11 +570,32 @@ function looksLikeAntiBot(html) {
 function looksLikePaywall(html) {
   if (!html) return false;
   const lower = html.toLowerCase();
-  // Common NYT/WSJ/FT/Bloomberg paywall markers
-  if (lower.includes("subscribe to continue") && lower.length < 8000) return true;
-  if (lower.includes("to continue reading") && lower.includes("subscribe")) {
-    // Only flag if the body is short — long articles may mention "subscribe" in footers
-    if (lower.length < 6000) return true;
+  const short = lower.length < 8000;
+  // Hard-gate phrases that only appear on paywall/subscribe walls
+  const hardGates = [
+    "subscribe to continue",
+    "subscribe to read",
+    "subscribe to unlock",
+    "start a subscription",
+    "this post is for paid subscribers",
+    "this article is for paid subscribers",
+    "this content is for subscribers",
+    "exclusive to subscribers",
+    "for members only",
+    "become a member to read",
+    "create a free account to read",
+    "sign up to read",
+    "register to read",
+  ];
+  for (const phrase of hardGates) {
+    if (lower.includes(phrase)) return true;
+  }
+  // Softer phrases: only flag on short pages (full articles may mention
+  // "subscribe" in footers without being paywalled)
+  if (short) {
+    if (lower.includes("to continue reading") && lower.includes("subscribe")) return true;
+    if (lower.includes("already a subscriber") && lower.includes("sign in")) return true;
+    if (lower.includes("subscriber-only") || lower.includes("members only")) return true;
   }
   return false;
 }
