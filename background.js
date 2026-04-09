@@ -19,21 +19,22 @@ if (typeof browser !== "undefined" && browser.sidebarAction && browser.action) {
 
 // --- Configuration ---
 const PROXY_URL = "https://nobait-proxy.acr197.workers.dev/summarize";
-const FETCH_TIMEOUT_MS = 10000;
-const AI_TIMEOUT_MS = 15000;
-const MAX_CONTENT_LENGTH = 5000;
-const MIN_CONTENT_LENGTH = 200;
+const FETCH_TIMEOUT_MS = 12000;
+const AI_TIMEOUT_MS = 20000;
+const MAX_CONTENT_LENGTH = 6000;
+const MIN_CONTENT_LENGTH = 140;
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-// --- Message listener: routes SUMMARIZE + FETCH_TRENDING_NEWS requests.
-//     Returns a Promise so the same handler works in Chrome (MV3) and Firefox.
-//     Both browsers accept a Promise return value as the async response. ---
+// --- Message listener: routes SUMMARIZE requests from the content script
+//     and the sidebar. Returns a Promise so the same handler works in Chrome
+//     (MV3) and Firefox. ---
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg) return;
 
   if (msg.type === "SUMMARIZE") {
-    const responsePromise = handleSummarize(msg.url, msg.headline).catch(() => ({
+    const mode = msg.mode === "detailed" ? "detailed" : "short";
+    const responsePromise = handleSummarize(msg.url, msg.headline, mode).catch(() => ({
       ok: false,
       error: "ai_error",
       message: "An unexpected error occurred.",
@@ -43,54 +44,36 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return responsePromise;
   }
-
-  if (msg.type === "FETCH_TRENDING_NEWS") {
-    const responsePromise = handleFetchTrendingNews().catch((err) => ({
-      ok: false,
-      error: "fetch_failed",
-      message: (err && err.message) || "Could not load trending news.",
-    }));
-    responsePromise.then((res) => {
-      try { sendResponse(res); } catch (_) { /* channel may be closed in Firefox */ }
-    });
-    return responsePromise;
-  }
 });
 
-// --- handleSummarize: orchestrates fetch -> extract -> AI pipeline ---
-async function handleSummarize(url, headline) {
+// --- handleSummarize: orchestrates fetch -> extract -> AI pipeline.
+//     Always returns ok:true as long as the AI responds, even when the
+//     article text couldn't be fetched. In that case contentStatus reports
+//     "blocked" / "paywall" / "fetch_failed" and contentStatusMessage is the
+//     single-line user-facing reason. The UI uses that to show
+//     "<reason>" + "Its attempt at a summary: …". ---
+async function handleSummarize(url, headline, mode) {
   let articleText = null;
   let fetchError = null;
 
-  // Phase 1: try to fetch the article directly
-  try {
-    articleText = await fetchArticle(url);
-  } catch (err) {
-    fetchError = captureFetchError(err);
-  }
+  // Google News URLs: the /articles/ and /read/ pages are JS-redirect stubs
+  // that rarely yield useful HTML on direct fetch. The /rss/articles/ variant
+  // returns a server-side 302 straight to the publisher, which fetch() follows
+  // automatically. So for Google News we try the RSS form first.
+  const googleNewsRss = buildGoogleNewsRssUrl(url);
 
-  // Phase 2: for Google News redirect URLs, try alternative approaches
-  if (!articleText && isGoogleNewsRedirectUrl(url)) {
-    // 2a: try to decode the article ID to get the real URL
-    const realUrl = decodeGoogleNewsUrl(url);
-    if (realUrl) {
-      try {
-        articleText = await fetchArticle(realUrl);
-        fetchError = null;
-      } catch (err) {
-        fetchError = captureFetchError(err);
-      }
+  if (googleNewsRss) {
+    try {
+      articleText = await fetchArticle(googleNewsRss);
+    } catch (err) {
+      fetchError = captureFetchError(err);
     }
 
-    // 2b: try the RSS variant (server-side redirect)
     if (!articleText) {
-      const rssUrl = url.replace(
-        /news\.google\.com\/(read|articles)\//,
-        "news.google.com/rss/articles/"
-      );
-      if (rssUrl !== url) {
+      const realUrl = decodeGoogleNewsUrl(url);
+      if (realUrl) {
         try {
-          articleText = await fetchArticle(rssUrl);
+          articleText = await fetchArticle(realUrl);
           fetchError = null;
         } catch (err) {
           fetchError = captureFetchError(err);
@@ -99,20 +82,54 @@ async function handleSummarize(url, headline) {
     }
   }
 
-  // Hard failures: surface them to the user directly rather than hallucinating
-  // a summary. Soft failures (generic network / parse issues) still fall
-  // through to headline-only mode so the user sees something useful.
-  if (!articleText && fetchError && (fetchError.type === "paywall" || fetchError.type === "blocked")) {
-    return { ok: false, error: fetchError.type, message: fetchError.message };
+  // Standard path: fetch the requested URL directly.
+  if (!articleText) {
+    try {
+      articleText = await fetchArticle(url);
+      fetchError = null;
+    } catch (err) {
+      if (!fetchError) fetchError = captureFetchError(err);
+    }
   }
 
   // Phase 3: send to AI — with article text if available, headline-only otherwise.
-  // Pass fetchError along so the prompt can explain *why* content is missing.
+  // Pass fetchError along so the prompt knows *why* content is missing.
+  const contentStatus = articleText ? "ok" : (fetchError && fetchError.type) || "fetch_failed";
+  const contentStatusMessage = articleText
+    ? null
+    : (fetchError && fetchError.message) || "Could not load the article.";
+
   try {
-    const summary = await callAI(headline, articleText, fetchError);
-    return { ok: true, summary };
+    const summary = await callAI(headline, articleText, fetchError, mode);
+    return {
+      ok: true,
+      summary,
+      contentStatus,
+      contentStatusMessage,
+    };
   } catch (err) {
     return { ok: false, error: "ai_error", message: err.message || "Summarization failed." };
+  }
+}
+
+// --- buildGoogleNewsRssUrl: converts a news.google.com article/read URL to
+//     its /rss/articles/ equivalent (which 302s to the publisher). Returns
+//     null if the URL isn't a Google News redirect stub. ---
+function buildGoogleNewsRssUrl(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    if (host !== "news.google.com" && !host.endsWith(".news.google.com")) return null;
+    if (u.pathname.startsWith("/rss/articles/")) return u.href;
+    if (u.pathname.startsWith("/read/") || u.pathname.startsWith("/articles/")) {
+      return u.href.replace(
+        /news\.google\.com\/(read|articles)\//,
+        "news.google.com/rss/articles/"
+      );
+    }
+    return null;
+  } catch (_) {
+    return null;
   }
 }
 
@@ -125,19 +142,6 @@ function captureFetchError(err) {
   // Normalize trailing period for consistent formatting inside the prompt.
   if (!/[.!?]$/.test(message)) message += ".";
   return { type, message };
-}
-
-// --- isGoogleNewsRedirectUrl: checks if a URL is a Google News redirect ---
-function isGoogleNewsRedirectUrl(url) {
-  try {
-    const u = new URL(url);
-    const host = u.hostname.toLowerCase();
-    return (host === "news.google.com" || host.endsWith(".news.google.com")) &&
-      (u.pathname.startsWith("/read/") || u.pathname.startsWith("/articles/") ||
-       u.pathname.startsWith("/rss/articles/"));
-  } catch (_) {
-    return false;
-  }
 }
 
 // --- decodeGoogleNewsUrl: tries to extract the real article URL from the
@@ -185,25 +189,27 @@ function decodeGoogleNewsUrl(url) {
 const GOOGLEBOT_UA =
   "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
 
-// --- fetchArticle: downloads the page HTML with a timeout. If the first
-//     attempt returns a thin/anti-bot/paywall page, retry once as Googlebot. ---
+// --- fetchArticle: downloads the page HTML with a timeout, follows any
+//     meta-refresh / canonical / JS redirect stubs, and retries with a
+//     Googlebot UA when the site blocks real browsers. Returns the extracted
+//     plain text of the final article. ---
 async function fetchArticle(url, opts) {
   opts = opts || {};
   const depth = opts.depth || 0;
-  if (depth > 4) {
+  if (depth > 5) {
     throw createError("fetch_failed", "Too many redirects while loading the article.");
   }
 
+  // Fetch with the browser UA first, then fall back to Googlebot on block.
   let result;
   try {
     result = await fetchRaw(url, BROWSER_UA);
   } catch (err) {
-    // If the browser UA was blocked, try Googlebot as a last resort
-    if (!opts.noRetry && (err.errorType === "paywall" || err.errorType === "blocked")) {
+    if (err.errorType === "paywall" || err.errorType === "blocked") {
       try {
         result = await fetchRaw(url, GOOGLEBOT_UA);
       } catch (_) {
-        throw err; // surface the original, more accurate reason
+        throw err; // surface the more specific original reason
       }
     } else {
       throw err;
@@ -211,61 +217,58 @@ async function fetchArticle(url, opts) {
   }
 
   let html = result.html;
+  // `finalUrl` is where fetch() actually landed after any HTTP 3xx redirects.
+  // We carry it forward so further JS/meta redirects resolve against the real
+  // page and not the pre-redirect Google News stub.
+  let baseUrl = result.finalUrl || url;
 
-  // Handle JS-based redirects (common on news aggregator redirect pages)
-  const jsRedirectUrl = extractJsRedirect(html, url);
-  if (jsRedirectUrl && jsRedirectUrl !== url) {
+  // If the HTML is a JS/meta/canonical redirect stub, hop to the real URL.
+  const jsRedirectUrl = extractJsRedirect(html, baseUrl);
+  if (jsRedirectUrl && jsRedirectUrl !== baseUrl) {
     return fetchArticle(jsRedirectUrl, { depth: depth + 1 });
   }
 
-  // Detect anti-bot interstitials (Cloudflare challenge, "Please enable JS",
-  // Akamai Bot Manager, etc.) and convert them into a clean "blocked" error.
+  // Anti-bot interstitial? Retry once as Googlebot before giving up.
   if (looksLikeAntiBot(html)) {
-    if (!opts.noRetry) {
-      // One retry as Googlebot — anti-bot pages often whitelist search crawlers.
-      try {
-        const retry = await fetchRaw(url, GOOGLEBOT_UA);
-        if (!looksLikeAntiBot(retry.html)) {
-          html = retry.html;
-        } else {
-          throw createError("blocked", "Blocked by the site's bot protection.");
-        }
-      } catch (err) {
-        if (err.errorType) throw err;
+    try {
+      const retry = await fetchRaw(url, GOOGLEBOT_UA);
+      if (looksLikeAntiBot(retry.html)) {
         throw createError("blocked", "Blocked by the site's bot protection.");
       }
-    } else {
+      html = retry.html;
+      baseUrl = retry.finalUrl || baseUrl;
+      const retryRedirect = extractJsRedirect(html, baseUrl);
+      if (retryRedirect && retryRedirect !== baseUrl) {
+        return fetchArticle(retryRedirect, { depth: depth + 1 });
+      }
+    } catch (err) {
+      if (err.errorType) throw err;
       throw createError("blocked", "Blocked by the site's bot protection.");
     }
   }
 
-  // Detect paywall interstitials by content heuristics.
+  // Paywall interstitial.
   if (looksLikePaywall(html)) {
     throw createError("paywall", "Behind a paywall.");
   }
 
-  let text;
+  // Extract readable text. On thin pages, retry once as Googlebot — many SSR
+  // sites ship a richer static HTML to search crawlers than to browsers.
   try {
-    text = extractText(html);
+    return extractText(html);
   } catch (err) {
-    // If extraction failed because the page was too thin, try Googlebot once.
-    if (!opts.noRetry && err.errorType === "fetch_failed") {
-      try {
-        const retry = await fetchRaw(url, GOOGLEBOT_UA);
-        const retryRedirect = extractJsRedirect(retry.html, url);
-        if (retryRedirect && retryRedirect !== url) {
-          return fetchArticle(retryRedirect, { depth: depth + 1 });
-        }
-        text = extractText(retry.html);
-      } catch (_) {
-        throw err;
+    if (err.errorType !== "fetch_failed") throw err;
+    try {
+      const retry = await fetchRaw(url, GOOGLEBOT_UA);
+      const retryRedirect = extractJsRedirect(retry.html, retry.finalUrl || baseUrl);
+      if (retryRedirect && retryRedirect !== (retry.finalUrl || baseUrl)) {
+        return fetchArticle(retryRedirect, { depth: depth + 1 });
       }
-    } else {
+      return extractText(retry.html);
+    } catch (_) {
       throw err;
     }
   }
-
-  return text;
 }
 
 // --- fetchRaw: single HTTP fetch with a specific UA. Returns { html }. ---
@@ -397,44 +400,143 @@ function extractJsRedirect(html, baseUrl) {
   return null;
 }
 
-// --- extractText: strips HTML down to plain text ---
+// --- extractText: pulls readable article text out of raw HTML.
+//     Strategy:
+//       1. Strip obvious non-content blocks (script, style, nav, aside, etc).
+//       2. Try to isolate a main content container (<article>, <main>).
+//       3. Prefer <p> paragraphs from that container.
+//       4. If that's too thin, fall back to stripped full-body text.
+//       5. Last resort: use the page's meta description / og:description. ---
 function extractText(html) {
-  // Remove non-content blocks
-  let text = html.replace(/<script[\s\S]*?<\/script>/gi, " ");
-  text = text.replace(/<style[\s\S]*?<\/style>/gi, " ");
-  text = text.replace(/<nav[\s\S]*?<\/nav>/gi, " ");
-  text = text.replace(/<footer[\s\S]*?<\/footer>/gi, " ");
-  text = text.replace(/<header[\s\S]*?<\/header>/gi, " ");
+  if (!html) throw createError("fetch_failed", "No HTML to extract.");
 
-  // Strip remaining tags
-  text = text.replace(/<[^>]+>/g, " ");
+  // Strip non-content blocks.
+  const cleaned = html
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<template[\s\S]*?<\/template>/gi, " ")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, " ")
+    .replace(/<nav\b[\s\S]*?<\/nav>/gi, " ")
+    .replace(/<footer\b[\s\S]*?<\/footer>/gi, " ")
+    .replace(/<header\b[\s\S]*?<\/header>/gi, " ")
+    .replace(/<aside\b[\s\S]*?<\/aside>/gi, " ")
+    .replace(/<form\b[\s\S]*?<\/form>/gi, " ")
+    .replace(/<figure\b[\s\S]*?<\/figure>/gi, " ")
+    .replace(/<iframe\b[\s\S]*?<\/iframe>/gi, " ");
 
-  // Decode common HTML entities
-  text = text.replace(/&amp;/g, "&");
-  text = text.replace(/&lt;/g, "<");
-  text = text.replace(/&gt;/g, ">");
-  text = text.replace(/&quot;/g, '"');
-  text = text.replace(/&#39;/g, "'");
-  text = text.replace(/&nbsp;/g, " ");
+  // Try to pull out the main content container first.
+  const container = extractMainContainer(cleaned) || cleaned;
 
-  // Collapse whitespace and truncate
-  text = text.replace(/\s+/g, " ").trim();
+  // Prefer the concatenated text of all substantial <p> blocks.
+  let text = extractParagraphs(container);
+
+  // If paragraphs were thin, fall back to stripping tags from the container.
+  if (!text || text.length < MIN_CONTENT_LENGTH) {
+    text = stripTags(container);
+  }
+
+  text = decodeEntities(text).replace(/\s+/g, " ").trim();
+
+  // Last-resort: meta description from the original raw HTML.
+  if (text.length < MIN_CONTENT_LENGTH) {
+    const metaDesc = extractMetaDescription(html);
+    if (metaDesc && metaDesc.length >= 80) {
+      text = metaDesc;
+    }
+  }
+
   if (text.length > MAX_CONTENT_LENGTH) {
     text = text.substring(0, MAX_CONTENT_LENGTH) + "...";
   }
   if (text.length < MIN_CONTENT_LENGTH) {
     throw createError("fetch_failed", "Could not extract enough text from the article.");
   }
-
   return text;
 }
 
+// --- extractMainContainer: returns the inner HTML of the most likely main
+//     content element (<article>, <main>) — whichever has the most content. ---
+function extractMainContainer(html) {
+  let best = null;
+  const articleRe = /<article\b[\s\S]*?<\/article>/gi;
+  let m;
+  while ((m = articleRe.exec(html)) !== null) {
+    if (!best || m[0].length > best.length) best = m[0];
+  }
+  const mainMatch = html.match(/<main\b[\s\S]*?<\/main>/i);
+  if (mainMatch && (!best || mainMatch[0].length > best.length)) {
+    best = mainMatch[0];
+  }
+  return best && best.length > 400 ? best : null;
+}
+
+// --- extractParagraphs: concatenates the inner text of all non-trivial
+//     <p> tags in the given HTML chunk. ---
+function extractParagraphs(html) {
+  const out = [];
+  const re = /<p\b[^>]*>([\s\S]*?)<\/p>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const inner = stripTags(m[1]);
+    if (inner && inner.length >= 40) out.push(inner);
+  }
+  return out.join(" ");
+}
+
+// --- stripTags: removes every remaining HTML tag and collapses whitespace. ---
+function stripTags(html) {
+  return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// --- decodeEntities: decodes the handful of HTML entities we see in article
+//     bodies. Kept regex-based because DOMParser isn't available in MV3
+//     service workers. ---
+function decodeEntities(text) {
+  if (!text) return text;
+  return text
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&mdash;/g, "\u2014")
+    .replace(/&ndash;/g, "\u2013")
+    .replace(/&hellip;/g, "\u2026")
+    .replace(/&rsquo;/g, "\u2019")
+    .replace(/&lsquo;/g, "\u2018")
+    .replace(/&rdquo;/g, "\u201D")
+    .replace(/&ldquo;/g, "\u201C")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)));
+}
+
+// --- extractMetaDescription: returns og:description or <meta name="description">
+//     content from the raw HTML, if present. ---
+function extractMetaDescription(html) {
+  const patterns = [
+    /<meta[^>]+property\s*=\s*["']og:description["'][^>]+content\s*=\s*["']([^"']+)["']/i,
+    /<meta[^>]+content\s*=\s*["']([^"']+)["'][^>]+property\s*=\s*["']og:description["']/i,
+    /<meta[^>]+name\s*=\s*["']description["'][^>]+content\s*=\s*["']([^"']+)["']/i,
+    /<meta[^>]+content\s*=\s*["']([^"']+)["'][^>]+name\s*=\s*["']description["']/i,
+    /<meta[^>]+property\s*=\s*["']twitter:description["'][^>]+content\s*=\s*["']([^"']+)["']/i,
+  ];
+  for (const re of patterns) {
+    const m = html.match(re);
+    if (m && m[1]) return decodeEntities(m[1]);
+  }
+  return null;
+}
+
 // --- callAI: sends the prompt to the Cloudflare Worker proxy ---
-async function callAI(headline, content, fetchError) {
+async function callAI(headline, content, fetchError, mode) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
-  const prompt = buildPrompt(headline, content, fetchError);
+  const prompt = buildPrompt(headline, content, fetchError, mode);
 
   let response;
   try {
@@ -467,61 +569,73 @@ async function callAI(headline, content, fetchError) {
 }
 
 // --- buildPrompt: constructs the full AI prompt from headline + content.
-//     fetchError (optional) is passed when we couldn't load article text so
-//     the model can explain *why* it's working from the headline alone. ---
-function buildPrompt(headline, content, fetchError) {
-  // The whole point of NoBait is that the user does NOT have to go read the
-  // article themselves. Anything that redirects them back to the source,
-  // tells them to research, or hedges with "I don't have access" is a
-  // failure of the product. Both prompts share this forbidden-phrase list.
-  const FORBIDDEN = `ABSOLUTELY FORBIDDEN — never output ANY of these phrases or anything like them:
-- "do your own research" / "for more information" / "for the latest updates"
-- "open the article" / "open original" / "read the full article" / "click the link"
-- "check local news" / "check official sources" / "refer to" / "visit the website"
-- "I recommend" / "I suggest" / "consider checking" / "you may want to"
-- "I don't have access" / "I cannot access" / "I'm unable to" / "I don't know the content"
-- "try again later" / "contact the site" / "the article is behind"
-The user came here so they would NOT have to do any of that. You are their last stop. Deliver the answer or the honest verdict — never bounce them back.`;
+//     `mode` is "short" (default) or "detailed" (triggered by the user
+//     clicking the "More context" button in the popup). `fetchError` is
+//     non-null when we couldn't load article text — the model then answers
+//     from general knowledge. ---
+function buildPrompt(headline, content, fetchError, mode) {
+  const isDetailed = mode === "detailed";
+
+  // Never redirect the user back to the article; never lecture; never
+  // editorialize. These rules are shared by every variant of the prompt.
+  const RULES = `HARD CONSTRAINTS:
+- Never tell the reader to "read the article", "visit the site", "for more information", "do your own research", "check the link", "open the original", or anything similar. The user came here specifically to NOT do that.
+- Never say "I can't access", "I don't have access", "I'm unable to", or anything similar. Just answer with what you know.
+- No editorializing. No opinions. No labeling anything as "clickbait", "bait", "misleading", "sensational", or similar judgmental terms. Report facts only.
+- No political commentary. No personal recommendations.
+- No "according to the article" or "the article says" filler.`;
 
   if (!content) {
-    const reason = fetchError && fetchError.message
-      ? fetchError.message
-      : "The article text could not be loaded.";
-
     // Headline-only mode: the model has no article text to work with.
-    // Structure: one short "why it's missing" sentence, then the best
-    // substantive answer we can give from general knowledge.
-    return `You are NoBait, an AI that cuts through clickbait. The article text could not be fetched. Reason: ${reason}
+    if (isDetailed) {
+      return `You are NoBait. You could not fetch the article text for this headline. Answer it from your general knowledge in 4-6 sentences, covering: the specific fact the headline teases, relevant background and context, any related numbers or names, and any caveats. If the topic is newer than your training data, say so briefly in one sentence but still give whatever useful context you have.
 
-${FORBIDDEN}
+${RULES}
 
-RESPONSE FORMAT (exactly this shape, 2-3 sentences total):
-1. ONE short sentence stating the specific reason the text couldn't be loaded, in plain English. Examples: "Blocked by the site's bot protection." / "Behind a paywall." / "Site timed out." / "Blocked by robots.txt." Use the reason above verbatim if you don't know better.
-2. THEN 1-2 sentences answering the headline with concrete specifics from your general knowledge — exact dates, exact prices, exact numbers, names, outcomes. If the headline is a question, answer it. If it teases a fact, state the fact.
-3. If you genuinely don't know any specifics and the topic is too fresh for your training data, say so in one honest sentence ("This is more recent than my training data, so I can't confirm specifics.") — but still give whatever useful context you DO have. Do NOT send the user elsewhere.
+Headline: "${headline}"
 
-CLICKBAIT VERDICT: If the headline is pure bait that promises an answer it won't keep (e.g. "You won't believe…", "This one trick…", "Doctors hate…"), respond with EXACTLY one line:
-CLICKBAIT: <one short snarky sentence calling out the bait>
+Response:`;
+    }
+
+    return `You are NoBait. You could not fetch the article text for this headline. Answer the headline from your general knowledge using the rules below.
+
+${RULES}
+
+ANSWER STYLE — follow whichever case fits:
+- Yes/No question headline ("Can you X by doing Y?", "Is X doing Y?"): start with "Yes" or "No", then one short clarifying phrase if needed. Do not write a paragraph.
+- Headline teases a single name, place, price, rank, number, or short noun ("The #1 city to visit is…", "The actor who…"): answer with JUST that noun or 2-3 words. Do not pad it into a full sentence.
+- Otherwise: answer in at most 1-2 tight factual sentences with concrete specifics.
+
+Never restate the headline. If the topic is newer than your training data, say so in one short sentence.
 
 Headline: "${headline}"
 
 Response:`;
   }
 
-  return `You are NoBait, an AI that cuts through clickbait. You've been given the article's text. Tell the reader the SPECIFIC, concrete information the headline was teasing.
+  if (isDetailed) {
+    return `You are NoBait. You have the full article text. Write a 4-6 sentence detailed summary that gives the reader: (1) the specific answer to what the headline was teasing, (2) the concrete facts and numbers from the article, (3) meaningful context and background, (4) any caveats or unknowns the article itself mentions.
 
-${FORBIDDEN}
+${RULES}
 
-HARD RULES:
-1. Max 2-3 sentences, tight and factual. No filler, no "this article discusses…", no "according to the article".
-2. NEVER just rephrase the headline. If the headline says "Samsung sets release for April", your answer MUST name the specific date from the article — or explicitly say only the month is confirmed and no day was given.
-3. ALWAYS hunt for and surface concrete specifics: exact dates, exact prices, exact percentages, exact numbers, names, quantities, outcomes. That is the entire point of this product.
-4. If the headline asks a question, answer the question directly with facts from the article.
-5. If the article's specifics contradict the headline, say so.
-6. If the article partially answers the headline (e.g. month but not day, or "later this year" with no date), state what IS confirmed AND what is still unknown in one sentence — but do NOT tell the user to go look it up.
-7. CLICKBAIT DETECTION — if the article genuinely provides no new specifics beyond restating the headline, respond with EXACTLY one line:
-   CLICKBAIT: <one short snarky sentence calling out the article>
-   Use this ONLY when the article truly adds nothing. If there's ANY additional specific fact, share the fact instead.
+Headline: "${headline}"
+
+Article content:
+${content}
+
+Response:`;
+  }
+
+  return `You are NoBait. You have the article text. Give the reader the specific concrete information the headline was teasing, using the rules below.
+
+${RULES}
+
+ANSWER STYLE — follow whichever case fits:
+- Yes/No question headline ("Can you X by doing Y?", "Is X doing Y?"): start with "Yes" or "No", then one short clarifying phrase with the key specific from the article if needed. Do not write a paragraph.
+- Headline teases a single name, place, price, rank, number, or short noun ("The #1 city to visit is…", "The actor who…", "The one trick…"): answer with JUST that noun or 2-3 words from the article. Do not pad it into a full sentence.
+- Otherwise: answer in at most 2-3 tight factual sentences with concrete specifics from the article (exact dates, exact numbers, exact names, exact outcomes).
+
+Never restate the headline. If the article only partially answers the headline (e.g. month but not day), state what IS confirmed and what is still unknown in ONE sentence. If the article contradicts the headline, say so.
 
 Headline: "${headline}"
 
@@ -538,100 +652,3 @@ function createError(errorType, message) {
   return err;
 }
 
-// =========================================================================
-// TRENDING NEWS FALLBACK
-// =========================================================================
-//
-// When the sidebar is opened on a privileged page (about:home, about:newtab,
-// about:blank, etc.), there's no content script to scan for headlines. To
-// keep the sidebar useful we fetch Google News' public top-stories RSS feed
-// and return structured article entries for the sidebar to render. The
-// sidebar shows its inline summary modal for these entries because the
-// source page isn't scriptable.
-
-const TRENDING_RSS_URL = "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en";
-const TRENDING_MAX = 60;
-
-async function handleFetchTrendingNews() {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-  let response;
-  try {
-    response = await fetch(TRENDING_RSS_URL, {
-      signal: controller.signal,
-      redirect: "follow",
-      headers: {
-        "User-Agent": BROWSER_UA,
-        "Accept": "application/rss+xml, application/xml, text/xml, */*",
-      },
-    });
-  } catch (err) {
-    clearTimeout(timer);
-    throw new Error("Could not load trending news.");
-  }
-  clearTimeout(timer);
-
-  if (!response.ok) {
-    throw new Error("Trending news unavailable (HTTP " + response.status + ").");
-  }
-
-  const xml = await response.text();
-  const links = parseGoogleNewsRss(xml);
-  return { ok: true, links };
-}
-
-// --- parseGoogleNewsRss: extracts items from the Google News RSS feed into
-//     { url, headline, source } objects. Uses regex rather than DOMParser
-//     because DOMParser is not available in Chrome MV3 service workers. ---
-function parseGoogleNewsRss(xml) {
-  const out = [];
-  const itemRegex = /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
-  let m;
-  while ((m = itemRegex.exec(xml)) !== null && out.length < TRENDING_MAX) {
-    const item = m[1];
-    const title = extractRssTag(item, "title");
-    const link = extractRssTag(item, "link");
-    const source = extractRssTag(item, "source");
-    if (!title || !link) continue;
-
-    // Google News appends " - SourceName" to titles; strip it so the
-    // sidebar headline is clean.
-    let headline = decodeRssEntities(title).trim();
-    const dashIdx = headline.lastIndexOf(" - ");
-    if (dashIdx > 10 && dashIdx >= headline.length - 60) {
-      headline = headline.substring(0, dashIdx).trim();
-    }
-    if (headline.length < 10) continue;
-
-    const url = decodeRssEntities(link).trim();
-    let sourceName = source ? decodeRssEntities(source).trim() : "";
-    if (!sourceName) sourceName = "news.google.com";
-
-    out.push({ url, headline, source: sourceName });
-  }
-  return out;
-}
-
-// --- extractRssTag: pulls the inner text of <tag>…</tag>, tolerating
-//     attributes on the opening tag and optional CDATA wrappers. ---
-function extractRssTag(xml, tag) {
-  const re = new RegExp(
-    "<" + tag + "\\b[^>]*>\\s*(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?\\s*<\\/" + tag + "\\s*>",
-    "i"
-  );
-  const m = xml.match(re);
-  return m ? m[1] : null;
-}
-
-function decodeRssEntities(str) {
-  return str
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&nbsp;/g, " ");
-}
