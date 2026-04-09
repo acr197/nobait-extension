@@ -29,11 +29,6 @@ const BROWSER_UA =
 // and sites whose anti-bot blocks our direct fetch.
 const JINA_READER_URL_PREFIX = "https://r.jina.ai/";
 const JINA_TIMEOUT_MS = 20000;
-// Internet Archive Wayback Machine — final fallback for sites that block both
-// our direct fetch and Jina. Archived snapshots are plain static HTML served
-// from IA's own infra, so anti-bot and JS-rendering aren't in play.
-const WAYBACK_AVAIL_URL = "https://archive.org/wayback/available";
-const WAYBACK_TIMEOUT_MS = 15000;
 
 // --- Message listener: routes SUMMARIZE requests from the content script
 //     and the sidebar. Returns a Promise so the same handler works in Chrome
@@ -56,11 +51,12 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // --- handleSummarize: orchestrates fetch -> extract -> AI pipeline.
-//     Returns ok:true with a summary when article text was fetched and the
-//     AI responded. Returns ok:false when the fetch pipeline failed — we
-//     deliberately do NOT fall back to a headline-only AI guess, since this
-//     extension is used on breaking news and any "guess from training data"
-//     would be outside the model's knowledge cutoff. ---
+//     Returns ok:true with a summary in two modes:
+//       1. Article fetched + AI summarized → summary grounded in article text
+//       2. Article couldn't be fetched → AI answers from web search /
+//          training knowledge, same as pasting "headline + publisher" into
+//          Claude.ai / ChatGPT. The popup labels this answer clearly so the
+//          user can distinguish it from article-grounded answers. ---
 async function handleSummarize(url, headline, mode) {
   let articleText = null;
   let fetchError = null;
@@ -130,30 +126,31 @@ async function handleSummarize(url, headline, mode) {
     }
   }
 
-  // Fallback #2: Wayback Machine. Catches sites that block both our direct
-  // fetch and Jina (heavily paywalled sites, aggressive anti-bot). Archived
-  // snapshots are plain static HTML served from IA, no anti-bot in play.
+  // Fallback #2: ask the AI as if the user had pasted the headline + publisher
+  // into Claude.ai / ChatGPT. The AI uses web search (if available) or its
+  // training knowledge to answer. We flag the response with source:"knowledge"
+  // so the popup can show the user that the answer is NOT from the article.
   if (!articleText) {
     try {
-      articleText = await fetchViaWayback(realUrl);
-      if (articleText) fetchError = null;
+      const summary = await callAISearch(headline, realUrl, mode);
+      return {
+        ok: true,
+        summary,
+        source: "knowledge",
+        contentStatus: "from_knowledge",
+        contentStatusMessage:
+          "Article couldn't be fetched — this answer is from AI knowledge.",
+      };
     } catch (err) {
-      const captured = captureFetchError(err);
-      if (!fetchError || fetchError.type === "fetch_failed") fetchError = captured;
+      // If even the search-style AI call fails, surface the original fetch
+      // error (which is usually more actionable than an AI timeout).
+      return {
+        ok: false,
+        error: "unreadable",
+        message: (fetchError && fetchError.message) || err.message || "Couldn't read this article.",
+        contentStatus: (fetchError && fetchError.type) || "fetch_failed",
+      };
     }
-  }
-
-  // If every fetch path failed, fail cleanly. We deliberately do NOT fall
-  // back to a headline-only AI guess: this extension is used on breaking
-  // news, so any "guess from training data" would be outside the model's
-  // knowledge cutoff and would mislead the user.
-  if (!articleText) {
-    return {
-      ok: false,
-      error: "unreadable",
-      message: (fetchError && fetchError.message) || "Couldn't read this article.",
-      contentStatus: (fetchError && fetchError.type) || "fetch_failed",
-    };
   }
 
   // articleText is guaranteed non-null from here on.
@@ -162,6 +159,7 @@ async function handleSummarize(url, headline, mode) {
     return {
       ok: true,
       summary,
+      source: "article",
       contentStatus: "ok",
       contentStatusMessage: null,
     };
@@ -463,89 +461,6 @@ async function fetchViaJinaReader(url) {
     throw createError("fetch_failed", "Reader API returned too little text.");
   }
   return text;
-}
-
-// --- fetchViaWayback: final-resort fallback via the Internet Archive's
-//     Wayback Machine. Step 1 queries the availability API for the closest
-//     snapshot; step 2 fetches the raw archived HTML (using the id_ suffix
-//     so IA doesn't inject its own toolbar/navigation); step 3 runs our
-//     regular extractText() over the archived HTML. Works for paywalled
-//     and anti-bot-blocked sites because IA has an archived copy already,
-//     served as plain static HTML from archive.org's own infrastructure. ---
-async function fetchViaWayback(url) {
-  // Step 1: look up the closest snapshot via the availability API.
-  const availController = new AbortController();
-  const availTimer = setTimeout(() => availController.abort(), WAYBACK_TIMEOUT_MS);
-  let availJson;
-  try {
-    const availResponse = await fetch(
-      WAYBACK_AVAIL_URL + "?url=" + encodeURIComponent(url),
-      { signal: availController.signal, headers: { "Accept": "application/json" } }
-    );
-    clearTimeout(availTimer);
-    if (!availResponse.ok) {
-      throw createError("fetch_failed", "Wayback availability check failed (HTTP " + availResponse.status + ").");
-    }
-    availJson = await availResponse.json();
-  } catch (err) {
-    clearTimeout(availTimer);
-    if (err && err.errorType) throw err;
-    if (err && err.name === "AbortError") {
-      throw createError("fetch_failed", "Wayback availability check timed out.");
-    }
-    throw createError("fetch_failed", "Wayback availability check failed.");
-  }
-
-  const snapshot =
-    availJson &&
-    availJson.archived_snapshots &&
-    availJson.archived_snapshots.closest;
-  if (!snapshot || !snapshot.available || !snapshot.url) {
-    throw createError("fetch_failed", "No Wayback snapshot available for this article.");
-  }
-
-  // Convert the standard snapshot URL into the "raw" form by inserting `id_`
-  // after the timestamp. Example:
-  //   https://web.archive.org/web/20250101000000/https://example.com/
-  //   → https://web.archive.org/web/20250101000000id_/https://example.com/
-  // This suppresses IA's toolbar injection so our extractText() sees the
-  // unmodified original page.
-  let snapshotUrl = snapshot.url;
-  const m = snapshotUrl.match(/^(https?:\/\/web\.archive\.org\/web\/\d+)(\/https?:\/\/)/);
-  if (m) snapshotUrl = m[1] + "id_" + m[2];
-
-  // Step 2: fetch the archived HTML directly and run extraction.
-  const htmlController = new AbortController();
-  const htmlTimer = setTimeout(() => htmlController.abort(), FETCH_TIMEOUT_MS);
-  let html;
-  try {
-    const htmlResponse = await fetch(snapshotUrl, {
-      signal: htmlController.signal,
-      redirect: "follow",
-      headers: {
-        "User-Agent": BROWSER_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
-    clearTimeout(htmlTimer);
-    if (!htmlResponse.ok) {
-      throw createError("fetch_failed", "Wayback snapshot fetch failed (HTTP " + htmlResponse.status + ").");
-    }
-    html = await htmlResponse.text();
-  } catch (err) {
-    clearTimeout(htmlTimer);
-    if (err && err.errorType) throw err;
-    if (err && err.name === "AbortError") {
-      throw createError("fetch_failed", "Wayback snapshot fetch timed out.");
-    }
-    throw createError("fetch_failed", "Wayback snapshot fetch failed.");
-  }
-
-  // Step 3: reuse our regular extractor. If the snapshot is itself a thin
-  // shell (rare but possible on very new pages), this will throw and the
-  // caller surfaces an unreadable-article error to the user.
-  return extractText(html);
 }
 
 // --- looksLikeAntiBot: heuristic for Cloudflare / Akamai / "enable JS" walls ---
@@ -895,6 +810,110 @@ Headline: "${headline}"
 Article content:
 ${content}
 
+Response:`;
+}
+
+// --- callAISearch: final-resort AI call used when every fetch path failed.
+//     Sends the headline + publisher to the proxy and asks the model to
+//     answer as if the user had pasted the headline + publisher into
+//     Claude.ai / ChatGPT. The model uses web search (when available) or
+//     its training knowledge. The popup surfaces a banner making it clear
+//     the answer did NOT come from the fetched article. ---
+async function callAISearch(headline, url, mode) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+
+  const prompt = buildSearchPrompt(headline, url, mode);
+
+  let response;
+  try {
+    response = await fetch(PROXY_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: prompt }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === "AbortError") {
+      throw new Error("AI request timed out.");
+    }
+    throw new Error("Could not reach the AI service.");
+  }
+
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    throw new Error(`AI service returned an error (HTTP ${response.status}).`);
+  }
+
+  const data = await response.json();
+  if (!data.summary) {
+    throw new Error("AI returned an empty response.");
+  }
+
+  return data.summary;
+}
+
+// --- getPublisherFromUrl: extracts a human-readable publisher label from a
+//     URL (e.g. "https://www.defector.com/articles/foo" → "defector.com").
+//     Falls back to the raw hostname on any parse error. ---
+function getPublisherFromUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.hostname.replace(/^www\./i, "");
+  } catch (_) {
+    return "";
+  }
+}
+
+// --- buildSearchPrompt: mirrors buildPrompt's rules (same answer-style
+//     cases, same HARD CONSTRAINTS) but swaps "use ONLY the article text"
+//     for "use web search or training knowledge". This is what the user
+//     would get if they pasted the headline + publisher into Claude.ai or
+//     ChatGPT. ---
+function buildSearchPrompt(headline, url, mode) {
+  const isDetailed = mode === "detailed";
+  const publisher = getPublisherFromUrl(url);
+  const publisherLine = publisher ? `Publisher: ${publisher}\n` : "";
+  const urlLine = url ? `URL: ${url}\n` : "";
+
+  const RULES = `HARD CONSTRAINTS:
+- If you have web search available, search for the specific article by this exact headline from this publisher, and report the concrete facts the article contains.
+- If web search is unavailable, answer from your training knowledge — but ONLY if you have specific, confident knowledge of this exact article or its topic. NEVER fabricate names, dates, numbers, ranks, quotes, or list items.
+- If you don't have web search and don't have confident knowledge of this specific article, say "I don't have specific information about this article." in ONE sentence and stop. Do NOT guess.
+- Never tell the reader to "read the article", "visit the site", "check the link", "for more information", "do your own research", or anything similar. The user came here specifically to NOT do that.
+- Never say "I can't access the internet", "I don't have access", "I'm unable to", or anything similar. If you cannot find the information, just say "I don't have specific information about this article." and stop.
+- No editorializing. No opinions. No labeling anything as "clickbait", "bait", "misleading", or similar judgmental terms.
+- No political commentary. No personal recommendations.
+- No "according to my training data", "based on what I know", or similar meta-commentary — just answer.`;
+
+  if (isDetailed) {
+    return `You are NoBait. The extension could not fetch this news article directly. Answer the user's implicit question about what the headline teases, as if the user had pasted the headline and publisher into Claude.ai or ChatGPT. Use web search when available, otherwise use your training knowledge.
+
+Write a 4-6 sentence detailed answer giving: (1) the specific answer to what the headline was teasing, (2) concrete facts, names, and numbers, (3) meaningful context and background, (4) any caveats or unknowns. If the headline teases a ranked list, enumerate the items as a numbered list.
+
+${RULES}
+
+Headline: "${headline}"
+${publisherLine}${urlLine}
+Response:`;
+  }
+
+  return `You are NoBait. The extension could not fetch this news article directly. Answer the user's implicit question about what the headline teases, as if the user had pasted the headline and publisher into Claude.ai or ChatGPT. Use web search when available, otherwise use your training knowledge.
+
+${RULES}
+
+ANSWER STYLE — follow whichever case fits:
+- Yes/No question headline ("Can you X by doing Y?", "Is X doing Y?"): start with "Yes" or "No", then one short clarifying phrase with the key specific. Do not write a paragraph.
+- Headline teases a single name, place, price, rank, number, or short noun ("The #1 city to visit is…", "The actor who…", "The one trick…"): answer with JUST that noun or 2-3 words. Do not pad it into a full sentence.
+- Headline teases a ranked or numbered list ("The 20 greatest X, ranked", "Top 10 Y", "The 5 best Z"): return a numbered list of the items, in the article's order if known. For each item, give the item name plus any short identifying detail (year, artist, location, etc.) — one item per line. End with "...and more in the full article." if truncated.
+- Otherwise: answer in at most 2-3 tight factual sentences with concrete specifics (exact dates, exact numbers, exact names, exact outcomes).
+
+Never restate the headline. If you only partially know the answer, state what IS known and what is unknown in ONE sentence. If you don't have confident knowledge of this specific article, say "I don't have specific information about this article." in ONE sentence and stop.
+
+Headline: "${headline}"
+${publisherLine}${urlLine}
 Response:`;
 }
 

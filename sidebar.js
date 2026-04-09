@@ -381,14 +381,26 @@
     modalBodyEl.appendChild(loading);
   }
 
-  // --- renderSummary: displays the AI summary in the sidebar modal. Only
-  //     called on ok:true responses, which always carry fully fetched article
-  //     content — unreadable articles flow through renderError() instead. ---
+  // --- renderSummary: displays the AI summary in the sidebar modal. Called
+  //     on ok:true responses, which carry either:
+  //       - source:"article" → the summary is grounded in fetched article text
+  //       - source:"knowledge" → the fetch failed and the AI answered from
+  //         web search / training data. We show an amber banner so the
+  //         reader can tell which kind of answer they're looking at. ---
   function renderSummary(response, link, mode) {
     modalBodyEl.innerHTML = "";
 
     const wrap = document.createElement("div");
     wrap.className = "sb-modal-summary";
+
+    if (response.source === "knowledge" || response.contentStatus === "from_knowledge") {
+      const banner = document.createElement("div");
+      banner.className = "sb-modal-status";
+      banner.textContent =
+        response.contentStatusMessage ||
+        "Article couldn't be fetched — answer is from AI knowledge.";
+      wrap.appendChild(banner);
+    }
 
     const text = document.createElement("div");
     text.className = "sb-modal-summary-text";
