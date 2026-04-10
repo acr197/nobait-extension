@@ -74,33 +74,31 @@ async function handleSummarize(url, headline, mode) {
   let articleText = null;
   let fetchError = null;
 
-  // Google News URLs: the /articles/ and /read/ pages are JS-redirect stubs
-  // that rarely yield useful HTML on direct fetch. The /rss/articles/ variant
-  // returns a server-side 302 straight to the publisher, which fetch() follows
-  // automatically. So for Google News we try the RSS form first.
+  // Google News URLs: /articles/ and /read/ pages are JS-redirect stubs that
+  // don't contain article text themselves. Resolve the real publisher URL first
+  // (via base64 decode, HTTP redirect follow, or RSS feed parsing), then fetch
+  // the publisher article directly. This avoids ever extracting text from the
+  // Google News stub page and ensures Jina/Wayback get the publisher URL too.
+  let realUrl = url;
   const googleNewsRss = buildGoogleNewsRssUrl(url);
 
   if (googleNewsRss) {
-    try {
-      articleText = await fetchArticle(googleNewsRss);
-    } catch (err) {
-      fetchError = captureFetchError(err);
-    }
-
-    if (!articleText) {
-      const realUrl = decodeGoogleNewsUrl(url);
-      if (realUrl) {
-        try {
-          articleText = await fetchArticle(realUrl);
-          fetchError = null;
-        } catch (err) {
-          fetchError = captureFetchError(err);
-        }
+    const publisherUrl = decodeGoogleNewsUrl(url) || await discoverPublisherUrl(googleNewsRss);
+    if (publisherUrl) {
+      realUrl = publisherUrl;
+      try {
+        articleText = await fetchArticle(publisherUrl);
+        fetchError = null;
+      } catch (err) {
+        fetchError = captureFetchError(err);
       }
     }
   }
 
   // Standard path: fetch the requested URL directly.
+  // For Google News where publisher URL couldn't be resolved this also attempts
+  // the stub URL — fetch() follows HTTP redirects automatically, so it may
+  // still land on the publisher article via server-side 302.
   if (!articleText) {
     try {
       articleText = await fetchArticle(url);
@@ -110,22 +108,10 @@ async function handleSummarize(url, headline, mode) {
     }
   }
 
-  // Resolve the real publisher URL for external fallbacks (Jina, Wayback).
-  // decodeGoogleNewsUrl() works only for older Google News URL formats; for
-  // modern protobuf-encoded IDs it returns null, leaving realUrl as the
-  // Google News SPA stub — which Jina cannot usefully scrape. When decode
-  // fails we follow the RSS redirect (server-side 302) to capture the final
-  // publisher URL from response.url, without needing to read the body.
-  let realUrl = decodeGoogleNewsUrl(url) || null;
-  if (!realUrl && googleNewsRss) {
-    realUrl = await discoverPublisherUrl(googleNewsRss);
-  }
-  realUrl = realUrl || url;
-
   // Fallback #1: server-side Reader API (Jina). Catches JS-rendered SPAs
   // (Tom's Guide, most modern news sites) whose direct HTML is a near-empty
-  // skeleton, and sites whose bot protection blocks our direct fetch. Now
-  // uses the resolved publisher URL so Jina gets the real article page.
+  // skeleton, and sites whose bot protection blocks our direct fetch.
+  // For Google News, realUrl is already the resolved publisher URL.
   if (!articleText) {
     try {
       articleText = await fetchViaJinaReader(realUrl);
@@ -281,12 +267,13 @@ function decodeGoogleNewsUrl(url) {
   return null;
 }
 
-// --- discoverPublisherUrl: follows the redirect chain of a URL (typically a
-//     Google News RSS stub) and returns the final destination URL without
-//     reading the response body. Used to give Jina/Wayback the real publisher
-//     URL when the base64-decode of the Google News article ID fails (which is
-//     the common case for modern protobuf-encoded IDs). Returns null on any
-//     error or if the final URL is still on google.com. ---
+// --- discoverPublisherUrl: follows the redirect chain of a Google News RSS
+//     stub URL and returns the final publisher article URL. Two strategies:
+//     1. HTTP redirect: if fetch() lands on a non-Google domain, return it.
+//     2. RSS body parse: if the response stays on google.com (e.g. the RSS
+//        endpoint returned feed XML rather than redirecting), read the body
+//        and extract the publisher <link> from the feed. Returns null on any
+//        error or if no publisher URL can be found. ---
 async function discoverPublisherUrl(url) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8000);
@@ -296,23 +283,53 @@ async function discoverPublisherUrl(url) {
       redirect: "follow",
       headers: {
         "User-Agent": BROWSER_UA,
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml,application/rss+xml,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
       },
     });
     clearTimeout(timer);
-    // response.url is the final URL after all redirects — no body read needed.
     const finalUrl = resp.url;
     if (!finalUrl) return null;
     let parsed;
     try { parsed = new URL(finalUrl); } catch (_) { return null; }
-    // Reject if we ended up back on Google (e.g. login redirect, AMP viewer).
-    if (/(?:^|\.)google\.com$/.test(parsed.hostname.toLowerCase())) return null;
-    return finalUrl;
+    // If HTTP redirect landed on a non-Google domain, we're done.
+    if (!/(?:^|\.)google\.com$/.test(parsed.hostname.toLowerCase())) return finalUrl;
+    // Still on google.com — parse the response body as RSS/Atom to find the
+    // publisher link (handles cases where the RSS endpoint returns feed XML
+    // instead of issuing a 302 redirect to the article).
+    try {
+      const body = await resp.text();
+      return extractRssArticleLink(body);
+    } catch (_) { return null; }
   } catch (_) {
     clearTimeout(timer);
     return null;
   }
+}
+
+// --- extractRssArticleLink: scans RSS 2.0 / Atom feed XML for the first
+//     publisher article URL (any <link> text content or href attribute that
+//     points to a non-google.com domain). ---
+function extractRssArticleLink(xml) {
+  if (!xml) return null;
+  // RSS 2.0: <link>https://publisher.com/path</link>
+  const rssRe = /<link[^>]*>(https?:\/\/[^\s<]+)<\/link>/gi;
+  let m;
+  while ((m = rssRe.exec(xml)) !== null) {
+    try {
+      const u = new URL(m[1].trim());
+      if (!/(?:^|\.)google\.com$/.test(u.hostname.toLowerCase())) return u.href;
+    } catch (_) {}
+  }
+  // Atom / Google RSS extension: <link href="https://publisher.com/..." />
+  const atomRe = /<link[^>]+href\s*=\s*["'](https?:\/\/[^"']+)["'][^>]*>/gi;
+  while ((m = atomRe.exec(xml)) !== null) {
+    try {
+      const u = new URL(m[1].trim());
+      if (!/(?:^|\.)google\.com$/.test(u.hostname.toLowerCase())) return u.href;
+    } catch (_) {}
+  }
+  return null;
 }
 
 // --- Googlebot UA: many sites (esp. paywalled / SPA) serve clean static HTML
@@ -901,7 +918,6 @@ function extractText(html) {
     .replace(/<header\b[\s\S]*?<\/header>/gi, " ")
     .replace(/<aside\b[\s\S]*?<\/aside>/gi, " ")
     .replace(/<form\b[\s\S]*?<\/form>/gi, " ")
-    .replace(/<figure\b[\s\S]*?<\/figure>/gi, " ")
     .replace(/<iframe\b[\s\S]*?<\/iframe>/gi, " ");
 
   // Try to pull out the main content container first.
@@ -961,8 +977,10 @@ function extractMainContainer(html) {
 //     where listicle item titles live. ---
 function extractContentBlocks(html) {
   const out = [];
-  // Match h1-h6, p, and li, capturing the tag name and inner HTML.
-  const re = /<(h[1-6]|p|li)\b[^>]*>([\s\S]*?)<\/\1>/gi;
+  // Match h1-h6, p, li, and blockquote, capturing the tag name and inner HTML.
+  // blockquote is included to capture embedded tweet text (pre-hydration Twitter
+  // embeds appear as <blockquote class="twitter-tweet"><p>...</p></blockquote>).
+  const re = /<(h[1-6]|p|li|blockquote)\b[^>]*>([\s\S]*?)<\/\1>/gi;
   let m;
   while ((m = re.exec(html)) !== null) {
     const tag = m[1].toLowerCase();
@@ -976,6 +994,10 @@ function extractContentBlocks(html) {
       // Keep list items even when short — listicles often use <li> for
       // numbered entries like "Nevermind — Nirvana (1991)".
       if (inner.length < 3) continue;
+      out.push(inner);
+    } else if (tag === "blockquote") {
+      // Capture quoted content including tweet text. Skip trivially short ones.
+      if (inner.length < 15) continue;
       out.push(inner);
     } else {
       // Heading: prefix with "## " so the AI sees structure rather than
@@ -1090,7 +1112,7 @@ function buildPrompt(headline, content, mode) {
 - Headings in the article content are marked with "## " — treat them as section/item titles. They are part of the article, not metadata.`;
 
   if (isDetailed) {
-    return `You are NoBait. The full article text is provided below. Write a 4-6 sentence detailed summary that gives the reader: (1) the specific answer to what the headline was teasing, (2) the concrete facts, names, and numbers FROM THE ARTICLE, (3) meaningful context and background that is present in the article, (4) any caveats or unknowns the article itself mentions. If the headline teases a ranked list, enumerate as many ranked items as the article actually contains (use a numbered list), then stop.
+    return `You are NoBait. The full article text is provided below. Write a 4-6 sentence detailed summary that gives the reader: (1) the specific answer to what the headline was teasing, (2) the concrete facts, names, and numbers FROM THE ARTICLE, (3) meaningful context and background that is present in the article, (4) any caveats or unknowns the article itself mentions. If the headline teases a ranked list, enumerate up to 10 ranked items from the article (use a numbered list). If the article contains more than 10, add "That's the most this summary can list." after the 10th.
 
 ${RULES}
 
@@ -1109,7 +1131,7 @@ ${RULES}
 ANSWER STYLE — follow whichever case fits:
 - Yes/No question headline ("Can you X by doing Y?", "Is X doing Y?"): start with "Yes" or "No", then one short clarifying phrase with the key specific from the article if needed. Do not write a paragraph.
 - Headline teases a single name, place, price, rank, number, or short noun ("The #1 city to visit is…", "The actor who…", "The one trick…"): answer with JUST that noun or 2-3 words from the article. Do not pad it into a full sentence.
-- Headline teases a ranked or numbered list ("The 20 greatest X, ranked", "Top 10 Y", "The 5 best Z"): return a numbered list of the items the article actually contains, in the article's order. For each item, give the item name plus any short identifying detail the article includes (year, artist, location, etc.) — one item per line. Include as many items as fit; if the article has more items than you can include, end the list with "...and more in the full article." Do NOT pad with items not in the article. Do NOT invent items from general knowledge.
+- Headline teases a ranked or numbered list ("The 20 greatest X, ranked", "Top 10 Y", "The 5 best Z"): return a numbered list of the items the article actually contains, in the article's order, up to a maximum of 10. For each item, give the item name plus any short identifying detail the article includes (year, artist, location, etc.) — one item per line. If the article has more than 10 items, add exactly one short line after the 10th: "That's the most this summary can list." Do NOT pad with items not in the article. Do NOT invent items from general knowledge.
 - Otherwise: answer in at most 2-3 tight factual sentences with concrete specifics from the article (exact dates, exact numbers, exact names, exact outcomes).
 
 Never restate the headline. If the article only partially answers the headline (e.g. month but not day), state what IS confirmed and what is still unknown in ONE sentence. If the article contradicts the headline, say so. If the article content does not actually contain the answer (for example it's an index page, a paywall stub, or unrelated content), say "The article doesn't include that information." in ONE sentence and stop — do NOT guess.
@@ -1200,7 +1222,7 @@ function buildSearchPrompt(headline, url, mode) {
   if (isDetailed) {
     return `You are NoBait. The extension could not fetch this news article directly. Answer the user's implicit question about what the headline teases, as if the user had pasted the headline and publisher into Claude.ai or ChatGPT. Use web search when available, otherwise use your training knowledge.
 
-Write a 4-6 sentence detailed answer giving: (1) the specific answer to what the headline was teasing, (2) concrete facts, names, and numbers, (3) meaningful context and background, (4) any caveats or unknowns. If the headline teases a ranked list, enumerate the items as a numbered list.
+Write a 4-6 sentence detailed answer giving: (1) the specific answer to what the headline was teasing, (2) concrete facts, names, and numbers, (3) meaningful context and background, (4) any caveats or unknowns. If the headline teases a ranked list, enumerate up to 10 items as a numbered list. If there are more than 10, add "That's the most this summary can list." after the 10th.
 
 ${RULES}
 
@@ -1216,7 +1238,7 @@ ${RULES}
 ANSWER STYLE — follow whichever case fits:
 - Yes/No question headline ("Can you X by doing Y?", "Is X doing Y?"): start with "Yes" or "No", then one short clarifying phrase with the key specific. Do not write a paragraph.
 - Headline teases a single name, place, price, rank, number, or short noun ("The #1 city to visit is…", "The actor who…", "The one trick…"): answer with JUST that noun or 2-3 words. Do not pad it into a full sentence.
-- Headline teases a ranked or numbered list ("The 20 greatest X, ranked", "Top 10 Y", "The 5 best Z"): return a numbered list of the items, in the article's order if known. For each item, give the item name plus any short identifying detail (year, artist, location, etc.) — one item per line. End with "...and more in the full article." if truncated.
+- Headline teases a ranked or numbered list ("The 20 greatest X, ranked", "Top 10 Y", "The 5 best Z"): return a numbered list of up to 10 items, in the article's order if known. For each item, give the item name plus any short identifying detail (year, artist, location, etc.) — one item per line. If there are more than 10, add exactly one short line after the 10th: "That's the most this summary can list."
 - Otherwise: answer in at most 2-3 tight factual sentences with concrete specifics (exact dates, exact numbers, exact names, exact outcomes).
 
 Never restate the headline. If you only partially know the answer, state what IS known and what is unknown in ONE sentence. If you don't have confident knowledge of this specific article, say "I don't have specific information about this article." in ONE sentence and stop.
