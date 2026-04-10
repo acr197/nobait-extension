@@ -407,18 +407,131 @@
     text.textContent = response.summary || "";
     wrap.appendChild(text);
 
-    // "More context" button — only offered on short mode results.
+    // Action row: "More context" + "Alternate source". Only on short mode.
     if (mode !== "detailed") {
-      const btn = document.createElement("button");
-      btn.className = "sb-modal-more-btn";
-      btn.type = "button";
-      btn.textContent = "More context";
-      btn.addEventListener("click", () => {
+      const actions = document.createElement("div");
+      actions.className = "sb-modal-actions";
+
+      const moreBtn = document.createElement("button");
+      moreBtn.className = "sb-modal-more-btn";
+      moreBtn.type = "button";
+      moreBtn.textContent = "More context";
+      moreBtn.addEventListener("click", () => {
         requestModalSummary(link, "detailed");
       });
-      wrap.appendChild(btn);
+      actions.appendChild(moreBtn);
+
+      const altBtn = document.createElement("button");
+      altBtn.className = "sb-modal-alt-btn";
+      altBtn.type = "button";
+      altBtn.textContent = "Alternate source";
+      altBtn.addEventListener("click", () => {
+        requestModalAlternateSource(link);
+      });
+      actions.appendChild(altBtn);
+
+      wrap.appendChild(actions);
     }
 
+    modalBodyEl.appendChild(wrap);
+  }
+
+  // --- requestModalAlternateSource: asks the background to find a different
+  //     publisher's coverage of the headline and renders the result. Tracks
+  //     activeRequestId so closing the modal cancels the in-flight request. ---
+  async function requestModalAlternateSource(link) {
+    const requestId = ++activeRequestId;
+    showModalLoading();
+    const loading = modalBodyEl.querySelector(".sb-modal-loading-text");
+    if (loading) loading.textContent = "Finding another source\u2026";
+
+    let response;
+    try {
+      response = await Promise.resolve(
+        api.runtime.sendMessage({
+          type: "ALTERNATE_SOURCE",
+          url: link.url,
+          headline: link.headline,
+        })
+      );
+    } catch (err) {
+      if (requestId !== activeRequestId) return;
+      renderError("alt_error", "Extension error. Try again.", link.headline);
+      return;
+    }
+
+    if (requestId !== activeRequestId) return;
+
+    if (!response) {
+      renderError("alt_error", "No response from extension.", link.headline);
+      return;
+    }
+    if (response.ok) {
+      renderAlternateSource(response, link);
+    } else {
+      renderError(response.error, response.message, link.headline);
+    }
+  }
+
+  // --- renderAlternateSource: shows the alternate-source result in the
+  //     modal. Includes date, publisher, clickable title, summary, and
+  //     buttons to go back to the original article or fetch yet another. ---
+  function renderAlternateSource(response, link) {
+    modalBodyEl.innerHTML = "";
+
+    const wrap = document.createElement("div");
+    wrap.className = "sb-modal-summary";
+
+    const label = document.createElement("div");
+    label.className = "sb-modal-alt-label";
+    label.textContent = "Alternate source";
+    wrap.appendChild(label);
+
+    const meta = document.createElement("div");
+    meta.className = "sb-modal-alt-meta";
+    const metaParts = [];
+    if (response.date) metaParts.push(response.date);
+    if (response.publisher) metaParts.push(response.publisher);
+    meta.textContent = metaParts.join("  \u00B7  ");
+    wrap.appendChild(meta);
+
+    if (response.title) {
+      const title = document.createElement("a");
+      title.className = "sb-modal-alt-title";
+      title.textContent = response.title;
+      title.href = response.url || "#";
+      title.target = "_blank";
+      title.rel = "noopener noreferrer";
+      wrap.appendChild(title);
+    }
+
+    const text = document.createElement("div");
+    text.className = "sb-modal-summary-text";
+    text.textContent = response.summary || "";
+    wrap.appendChild(text);
+
+    const actions = document.createElement("div");
+    actions.className = "sb-modal-actions";
+
+    const backBtn = document.createElement("button");
+    backBtn.className = "sb-modal-more-btn";
+    backBtn.type = "button";
+    backBtn.textContent = "Original article";
+    backBtn.addEventListener("click", () => {
+      requestModalSummary(link, "short");
+    });
+    actions.appendChild(backBtn);
+
+    const anotherBtn = document.createElement("button");
+    anotherBtn.className = "sb-modal-alt-btn";
+    anotherBtn.type = "button";
+    anotherBtn.textContent = "Try another";
+    anotherBtn.addEventListener("click", () => {
+      requestModalAlternateSource(link);
+    });
+    actions.appendChild(anotherBtn);
+
+    wrap.appendChild(actions);
     modalBodyEl.appendChild(wrap);
   }
 
