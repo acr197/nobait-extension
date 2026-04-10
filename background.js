@@ -34,6 +34,11 @@ const JINA_TIMEOUT_MS = 20000;
 // then feed back through the normal fetchArticle pipeline.
 const WAYBACK_AVAILABILITY_URL = "https://archive.org/wayback/available";
 const WAYBACK_TIMEOUT_MS = 15000;
+// Archive.today — tertiary archive service. Often succeeds on paywalled or
+// Cloudflare-protected sites that Wayback doesn't cover (NYT, WSJ, Bloomberg
+// sometimes). The /newest/ URL pattern redirects to the latest snapshot.
+const ARCHIVE_TODAY_URL = "https://archive.ph/newest/";
+const ARCHIVE_TODAY_TIMEOUT_MS = 15000;
 // Search-based retrieval — when no direct/Jina/Wayback fetch works, we run
 // a web search for the headline and try to fetch the matching result. Bing
 // HTML is used because it ships real anchors in static HTML (no JS required)
@@ -54,6 +59,18 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const responsePromise = handleSummarize(msg.url, msg.headline, mode).catch(() => ({
       ok: false,
       error: "ai_error",
+      message: "An unexpected error occurred.",
+    }));
+    responsePromise.then((res) => {
+      try { sendResponse(res); } catch (_) { /* channel may be closed in Firefox */ }
+    });
+    return responsePromise;
+  }
+
+  if (msg.type === "ALTERNATE_SOURCE") {
+    const responsePromise = handleAlternateSource(msg.url, msg.headline).catch(() => ({
+      ok: false,
+      error: "alt_error",
       message: "An unexpected error occurred.",
     }));
     responsePromise.then((res) => {
@@ -138,12 +155,26 @@ async function handleSummarize(url, headline, mode) {
     }
   }
 
-  // Fallback #3: search-based retrieval. This is the same trick Claude.ai
+  // Fallback #3: Archive.today (archive.ph). Often succeeds on paywalled or
+  // Cloudflare-protected sites that Wayback doesn't cover. Separate from
+  // Wayback because the two services have largely non-overlapping snapshot
+  // coverage.
+  if (!articleText) {
+    try {
+      articleText = await fetchViaArchiveToday(realUrl);
+      if (articleText) fetchError = null;
+    } catch (err) {
+      const captured = captureFetchError(err);
+      if (!fetchError || fetchError.type === "fetch_failed") fetchError = captured;
+    }
+  }
+
+  // Fallback #4: search-based retrieval. This is the same trick Claude.ai
   // and ChatGPT use internally — search the web for the exact headline,
   // then read the top result. Different URL (sometimes a different
   // publisher's coverage of the same story), but the content is still
   // real reporting rather than an AI guess. This rescues JS-rendered SPAs
-  // that Jina can't render and sites without Wayback snapshots.
+  // that Jina can't render and sites without archive snapshots.
   if (!articleText) {
     try {
       articleText = await fetchViaSearchResults(headline, realUrl);
@@ -154,7 +185,7 @@ async function handleSummarize(url, headline, mode) {
     }
   }
 
-  // Fallback #4: ask the AI as if the user had pasted the headline + publisher
+  // Fallback #5: ask the AI as if the user had pasted the headline + publisher
   // into Claude.ai / ChatGPT. The AI uses web search (if available) or its
   // training knowledge to answer. We flag the response with source:"knowledge"
   // so the popup can show the user that the answer is NOT from the article.
@@ -193,6 +224,264 @@ async function handleSummarize(url, headline, mode) {
     };
   } catch (err) {
     return { ok: false, error: "ai_error", message: err.message || "Summarization failed." };
+  }
+}
+
+// --- handleAlternateSource: finds, fetches, and summarizes a different
+//     publisher's article on the same headline. Used by the "Alternate
+//     source" popup button when the user wants a second-opinion summary
+//     from a different outlet. Returns:
+//       { ok:true, title, publisher, date, url, summary }  on success
+//       { ok:false, error, message }                       on failure
+//     Strategy:
+//       1. Search Bing/DDG for the exact headline.
+//       2. Filter out the original publisher and aggregator domains, keep
+//          the most recent-looking news candidates.
+//       3. Race the top candidates through the standard fetch pipeline.
+//       4. Extract title, published date, and article text from the winner.
+//       5. Summarize via callAI in short mode. ---
+async function handleAlternateSource(originalUrl, headline) {
+  if (!headline) {
+    return { ok: false, error: "no_headline", message: "Need a headline to find an alternate source." };
+  }
+
+  // Find candidate URLs from a different publisher.
+  let candidates;
+  try {
+    candidates = await findAlternateCandidates(headline, originalUrl);
+  } catch (err) {
+    return {
+      ok: false,
+      error: "search_failed",
+      message: "Couldn't search for alternate sources.",
+    };
+  }
+
+  if (!candidates || candidates.length === 0) {
+    return {
+      ok: false,
+      error: "no_alternates",
+      message: "No alternate sources found for this story.",
+    };
+  }
+
+  // Try each candidate sequentially. Sequential rather than parallel because
+  // we want the FIRST working result (which Bing/DDG already rank by relevance
+  // & recency), not the fastest race winner.
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      const article = await fetchAlternateArticle(candidate);
+      if (!article || !article.text) continue;
+      const summary = await callAI(article.title || headline, article.text, "short");
+      return {
+        ok: true,
+        title: article.title || headline,
+        publisher: getPublisherFromUrl(candidate),
+        date: article.date || null,
+        url: candidate,
+        summary,
+      };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  return {
+    ok: false,
+    error: "fetch_failed",
+    message: (lastError && lastError.message) || "Couldn't fetch any alternate source.",
+  };
+}
+
+// --- findAlternateCandidates: same search infrastructure as
+//     fetchViaSearchResults, but filters OUT the original publisher (we
+//     want a different outlet) and includes more candidates so we have
+//     more chances to find one that's fetchable. ---
+async function findAlternateCandidates(headline, originalUrl) {
+  const quoted = '"' + headline.replace(/"/g, "") + '"';
+
+  let candidates = [];
+  try {
+    const bingHtml = await fetchSearchEngineHtml(BING_SEARCH_URL + "?q=" + encodeURIComponent(quoted));
+    candidates = candidates.concat(parseBingResults(bingHtml));
+  } catch (_) { /* try DDG */ }
+
+  try {
+    const ddgHtml = await fetchSearchEngineHtml(DUCKDUCKGO_SEARCH_URL + "?q=" + encodeURIComponent(quoted));
+    candidates = candidates.concat(parseDuckDuckGoResults(ddgHtml));
+  } catch (_) { /* ignore */ }
+
+  const originalKey = canonicalizeForCompare(originalUrl);
+  const originalPublisher = getPublisherFromUrl(originalUrl);
+  const seen = new Set();
+  const filtered = [];
+
+  for (const candidate of candidates) {
+    const key = canonicalizeForCompare(candidate);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    if (key === originalKey) continue;
+    if (isBlockedSearchHost(candidate)) continue;
+    // Skip same publisher — we want a different outlet's coverage.
+    const candidatePublisher = getPublisherFromUrl(candidate);
+    if (candidatePublisher && originalPublisher && candidatePublisher === originalPublisher) continue;
+    filtered.push(candidate);
+    if (filtered.length >= 6) break;
+  }
+  return filtered;
+}
+
+// --- fetchAlternateArticle: fetches a single candidate URL, extracts the
+//     article text + title + published date. Reuses fetchArticle's pipeline
+//     but also captures the raw HTML one extra time so we can parse out
+//     metadata that extractText discards. ---
+async function fetchAlternateArticle(url) {
+  // Fetch raw HTML so we can pull title/date/body all from the same payload.
+  let raw;
+  try {
+    raw = await fetchRaw(url, BROWSER_UA);
+  } catch (err) {
+    if (err.errorType === "paywall" || err.errorType === "blocked") {
+      try { raw = await fetchRaw(url, GOOGLEBOT_UA); } catch (_) { /* fall through */ }
+    }
+  }
+
+  if (raw && raw.html) {
+    // Follow JS/meta redirect stubs once.
+    const redirect = extractJsRedirect(raw.html, raw.finalUrl || url);
+    if (redirect && redirect !== (raw.finalUrl || url)) {
+      try {
+        const text = await fetchArticle(redirect);
+        return {
+          title: extractTitle(raw.html) || null,
+          date: extractPublishedDate(raw.html) || null,
+          text,
+        };
+      } catch (_) { /* fall through to local extraction */ }
+    }
+
+    if (!looksLikeAntiBot(raw.html) && !looksLikePaywall(raw.html)) {
+      try {
+        const text = extractText(raw.html);
+        return {
+          title: extractTitle(raw.html),
+          date: extractPublishedDate(raw.html),
+          text,
+        };
+      } catch (_) { /* fall through to Jina */ }
+    }
+  }
+
+  // Fallback: Jina Reader. We lose direct access to the title/date metadata,
+  // but Jina returns clean text that's good enough to summarize.
+  const text = await fetchViaJinaReader(url);
+  return { title: null, date: null, text };
+}
+
+// --- extractTitle: returns the article title from <title>, og:title, or
+//     twitter:title meta tags. Falls back to the first <h1>. ---
+function extractTitle(html) {
+  if (!html) return null;
+  const ogMatch = html.match(/<meta[^>]+property\s*=\s*["']og:title["'][^>]+content\s*=\s*["']([^"']+)["']/i)
+    || html.match(/<meta[^>]+content\s*=\s*["']([^"']+)["'][^>]+property\s*=\s*["']og:title["']/i);
+  if (ogMatch && ogMatch[1]) return decodeEntities(ogMatch[1]).trim();
+  const twMatch = html.match(/<meta[^>]+name\s*=\s*["']twitter:title["'][^>]+content\s*=\s*["']([^"']+)["']/i);
+  if (twMatch && twMatch[1]) return decodeEntities(twMatch[1]).trim();
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (titleMatch && titleMatch[1]) {
+    // Remove the publisher suffix like "Article Name - The Publisher".
+    let title = decodeEntities(stripTags(titleMatch[1])).trim();
+    title = title.replace(/\s*[\|\-—–·]\s*[^|\-—–·]{2,40}$/, "").trim();
+    if (title) return title;
+  }
+  const h1Match = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  if (h1Match && h1Match[1]) return decodeEntities(stripTags(h1Match[1])).trim();
+  return null;
+}
+
+// --- extractPublishedDate: returns a human-readable published date string.
+//     Tries multiple sources in order: JSON-LD datePublished, article:published_time,
+//     <time datetime="">, then various meta tags. Returns null if nothing found. ---
+function extractPublishedDate(html) {
+  if (!html) return null;
+
+  // 1. JSON-LD datePublished (most reliable).
+  const ldRe = /<script[^>]+type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = ldRe.exec(html)) !== null) {
+    try {
+      const data = JSON.parse(m[1].trim());
+      const date = findDatePublishedInJsonLd(data);
+      if (date) return formatDate(date);
+    } catch (_) { /* skip */ }
+  }
+
+  // 2. <meta property="article:published_time" content="...">
+  const metaPatterns = [
+    /<meta[^>]+property\s*=\s*["']article:published_time["'][^>]+content\s*=\s*["']([^"']+)["']/i,
+    /<meta[^>]+name\s*=\s*["']article:published_time["'][^>]+content\s*=\s*["']([^"']+)["']/i,
+    /<meta[^>]+name\s*=\s*["']pubdate["'][^>]+content\s*=\s*["']([^"']+)["']/i,
+    /<meta[^>]+name\s*=\s*["']publishdate["'][^>]+content\s*=\s*["']([^"']+)["']/i,
+    /<meta[^>]+name\s*=\s*["']publish_date["'][^>]+content\s*=\s*["']([^"']+)["']/i,
+    /<meta[^>]+name\s*=\s*["']date["'][^>]+content\s*=\s*["']([^"']+)["']/i,
+    /<meta[^>]+itemprop\s*=\s*["']datePublished["'][^>]+content\s*=\s*["']([^"']+)["']/i,
+  ];
+  for (const re of metaPatterns) {
+    const match = html.match(re);
+    if (match && match[1]) {
+      const formatted = formatDate(match[1]);
+      if (formatted) return formatted;
+    }
+  }
+
+  // 3. <time datetime="..."> element.
+  const timeMatch = html.match(/<time[^>]+datetime\s*=\s*["']([^"']+)["']/i);
+  if (timeMatch && timeMatch[1]) {
+    const formatted = formatDate(timeMatch[1]);
+    if (formatted) return formatted;
+  }
+  return null;
+}
+
+// --- findDatePublishedInJsonLd: recursively walks parsed JSON-LD looking
+//     for any datePublished string field. ---
+function findDatePublishedInJsonLd(obj, depth) {
+  depth = depth || 0;
+  if (!obj || depth > 6) return null;
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const date = findDatePublishedInJsonLd(item, depth + 1);
+      if (date) return date;
+    }
+    return null;
+  }
+  if (typeof obj !== "object") return null;
+  if (typeof obj.datePublished === "string") return obj.datePublished;
+  if (Array.isArray(obj["@graph"])) {
+    const date = findDatePublishedInJsonLd(obj["@graph"], depth + 1);
+    if (date) return date;
+  }
+  for (const key in obj) {
+    const val = obj[key];
+    if (val && typeof val === "object") {
+      const date = findDatePublishedInJsonLd(val, depth + 1);
+      if (date) return date;
+    }
+  }
+  return null;
+}
+
+// --- formatDate: turns an ISO-8601 or similar date string into a short
+//     human-readable form ("Feb 9, 2026"). Returns null on parse failure. ---
+function formatDate(raw) {
+  if (!raw) return null;
+  const d = new Date(raw);
+  if (isNaN(d.getTime())) return null;
+  try {
+    return d.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+  } catch (_) {
+    return d.toISOString().substring(0, 10);
   }
 }
 
@@ -407,6 +696,7 @@ async function fetchArticle(url, opts) {
     return extractText(html);
   } catch (err) {
     if (err.errorType !== "fetch_failed") throw err;
+    // Retry #1: Googlebot UA. Many SSR sites ship richer static HTML to crawlers.
     try {
       const retry = await fetchRaw(url, GOOGLEBOT_UA);
       const retryRedirect = extractJsRedirect(retry.html, retry.finalUrl || baseUrl);
@@ -414,10 +704,34 @@ async function fetchArticle(url, opts) {
         return fetchArticle(retryRedirect, { depth: depth + 1 });
       }
       return extractText(retry.html);
-    } catch (_) {
-      throw err;
+    } catch (_) { /* fall through to AMP */ }
+    // Retry #2: discover an AMP version via <link rel="amphtml"> in the HTML
+    // we already fetched. AMP pages are stripped-down static HTML that's
+    // trivially extractable, so this rescues many JS-heavy SSR sites.
+    const ampUrl = extractAmpUrl(html, baseUrl);
+    if (ampUrl && ampUrl !== baseUrl) {
+      try {
+        return await fetchArticle(ampUrl, { depth: depth + 1 });
+      } catch (_) { /* fall through */ }
     }
+    throw err;
   }
+}
+
+// --- extractAmpUrl: returns the canonical AMP URL declared by the page via
+//     <link rel="amphtml" href="..."> if present. This is the standards-based
+//     AMP discovery method (more reliable than guessing /amp suffixes). ---
+function extractAmpUrl(html, baseUrl) {
+  if (!html) return null;
+  const match = html.match(
+    /<link[^>]+rel\s*=\s*["']amphtml["'][^>]+href\s*=\s*["']([^"']+)["']/i
+  ) || html.match(
+    /<link[^>]+href\s*=\s*["']([^"']+)["'][^>]+rel\s*=\s*["']amphtml["']/i
+  );
+  if (!match) return null;
+  try {
+    return new URL(match[1], baseUrl || undefined).href;
+  } catch (_) { return null; }
 }
 
 // --- fetchRaw: single HTTP fetch with a specific UA. Returns { html }. ---
@@ -575,6 +889,61 @@ async function fetchViaWayback(url) {
   // Route through the standard article pipeline so the same extraction,
   // retries, and paywall/anti-bot detection apply.
   return fetchArticle(rawSnapshotUrl);
+}
+
+// --- fetchViaArchiveToday: requests the latest snapshot of the URL from
+//     archive.ph (Archive.today). Different snapshot coverage from Wayback
+//     and often succeeds on paywalled or Cloudflare-protected pages that
+//     Wayback misses. The /newest/ path issues a 302 to the actual snapshot
+//     page, which fetch() follows automatically. We then strip the Archive
+//     toolbar markup and route through the standard extractor. ---
+async function fetchViaArchiveToday(url) {
+  if (!url) throw createError("fetch_failed", "No URL for Archive.today lookup.");
+
+  const snapshotUrl = ARCHIVE_TODAY_URL + url;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ARCHIVE_TODAY_TIMEOUT_MS);
+
+  let response;
+  try {
+    response = await fetch(snapshotUrl, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent": BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err && err.name === "AbortError") {
+      throw createError("fetch_failed", "Archive.today took too long to respond.");
+    }
+    throw createError("fetch_failed", "Archive.today request failed.");
+  }
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    throw createError(
+      "fetch_failed",
+      "Archive.today returned HTTP " + response.status + "."
+    );
+  }
+
+  // If we landed back on archive.ph search page rather than a snapshot,
+  // there's no archived copy of this URL.
+  const finalUrl = response.url || snapshotUrl;
+  if (/\/newest\//.test(finalUrl) || /^https?:\/\/archive\.ph\/?$/.test(finalUrl)) {
+    throw createError("fetch_failed", "No Archive.today snapshot for this article.");
+  }
+
+  const html = await response.text();
+  if (!html || html.length < 500) {
+    throw createError("fetch_failed", "Archive.today returned empty content.");
+  }
+
+  return extractText(html);
 }
 
 // --- fetchViaSearchResults: runs a web search for the headline (optionally
@@ -892,20 +1261,36 @@ function extractJsRedirect(html, baseUrl) {
 }
 
 // --- extractText: pulls readable article text out of raw HTML.
-//     Strategy:
-//       1. Strip obvious non-content blocks (script, style, nav, aside, etc).
-//       2. Try to isolate a main content container (<article>, <main>).
-//       3. Walk the container in document order, capturing headings,
-//          paragraphs, and list items together. This is critical for
-//          listicles ("20 Best X Ranked"), where item names live in
-//          <h2>/<h3>/<li> and <p>-only extraction would miss them and
-//          force the AI to hallucinate the list.
-//       4. If that's too thin, fall back to stripped full-body text.
-//       5. Last resort: use the page's meta description / og:description. ---
+//     Strategy (in order, first one that produces enough text wins):
+//       1. JSON-LD structured data (schema.org Article.articleBody). This is
+//          the gold standard — standardized, SEO-required, embedded in most
+//          modern news sites (NYT, Reuters, Guardian, WordPress via Yoast).
+//       2. Next.js __NEXT_DATA__ JSON blob — recursively walk for article
+//          body fields. Critical for Next.js sites like Cracked whose HTML
+//          shell is thin but whose JSON payload is full.
+//       3. Class/id-based container detection — div/section with known
+//          article body classes (entry-content, article-body, story-body,
+//          etc.) — more reliable than guessing from <article>/<main>.
+//       4. <article>/<main> tag detection (legacy fallback).
+//       5. Strip scripts/nav/footer/etc. and extract all remaining <p>, <h*>,
+//          <li>, <blockquote> in document order. Preserves listicle structure.
+//       6. Strip-all fallback + meta description last resort. ---
 function extractText(html) {
   if (!html) throw createError("fetch_failed", "No HTML to extract.");
 
-  // Strip non-content blocks.
+  // Strategy 1: JSON-LD structured data (before we strip scripts).
+  const jsonLdBody = extractJsonLdArticleBody(html);
+  if (jsonLdBody && jsonLdBody.length >= MIN_CONTENT_LENGTH) {
+    return finalizeArticleText(jsonLdBody, html);
+  }
+
+  // Strategy 2: __NEXT_DATA__ / embedded JSON (before we strip scripts).
+  const nextDataBody = extractEmbeddedJsonArticleBody(html);
+  if (nextDataBody && nextDataBody.length >= MIN_CONTENT_LENGTH) {
+    return finalizeArticleText(nextDataBody, html);
+  }
+
+  // Strip non-content blocks for DOM-style extraction.
   const cleaned = html
     .replace(/<!--[\s\S]*?-->/g, " ")
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -920,22 +1305,21 @@ function extractText(html) {
     .replace(/<form\b[\s\S]*?<\/form>/gi, " ")
     .replace(/<iframe\b[\s\S]*?<\/iframe>/gi, " ");
 
-  // Try to pull out the main content container first.
-  const container = extractMainContainer(cleaned) || cleaned;
+  // Strategy 3 + 4: Try known article container classes/ids first, then
+  // <article>/<main> tags as fallback.
+  const container = extractArticleContainer(cleaned) || cleaned;
 
-  // Walk headings + paragraphs + list items in document order so we
-  // preserve listicle structure (item title in <h2>, blurb in <p>).
+  // Walk headings + paragraphs + list items + blockquotes in document order.
   let text = extractContentBlocks(container);
 
-  // If structured extraction was thin, fall back to stripping tags from
-  // the container to at least get raw text.
+  // Strategy 5: Strip tags from container as raw-text fallback.
   if (!text || text.length < MIN_CONTENT_LENGTH) {
     text = stripTags(container);
   }
 
   text = decodeEntities(text).replace(/\s+/g, " ").trim();
 
-  // Last-resort: meta description from the original raw HTML.
+  // Strategy 6: meta description as absolute last resort.
   if (text.length < MIN_CONTENT_LENGTH) {
     const metaDesc = extractMetaDescription(html);
     if (metaDesc && metaDesc.length >= 80) {
@@ -952,20 +1336,266 @@ function extractText(html) {
   return text;
 }
 
-// --- extractMainContainer: returns the inner HTML of the most likely main
-//     content element (<article>, <main>) — whichever has the most content. ---
-function extractMainContainer(html) {
-  let best = null;
-  const articleRe = /<article\b[\s\S]*?<\/article>/gi;
-  let m;
-  while ((m = articleRe.exec(html)) !== null) {
-    if (!best || m[0].length > best.length) best = m[0];
+// --- finalizeArticleText: normalizes text extracted via structured data
+//     paths (JSON-LD, __NEXT_DATA__). Strips any HTML the field may contain,
+//     decodes entities, collapses whitespace, and truncates to budget. ---
+function finalizeArticleText(raw, originalHtml) {
+  let text = raw;
+  // articleBody / JSON content fields sometimes contain HTML markup.
+  if (/<[a-z][^>]*>/i.test(text)) {
+    // Preserve structure: convert headings to "## " markers, line-break lists,
+    // then strip everything else. Reuses the same content-block walker.
+    const walked = extractContentBlocks(text);
+    text = (walked && walked.length >= MIN_CONTENT_LENGTH) ? walked : stripTags(text);
   }
-  const mainMatch = html.match(/<main\b[\s\S]*?<\/main>/i);
-  if (mainMatch && (!best || mainMatch[0].length > best.length)) {
-    best = mainMatch[0];
+  text = decodeEntities(text).replace(/\s+/g, " ").trim();
+  // Prepend the headline/title from the page if we can find one, since some
+  // JSON articleBody fields don't include the headline.
+  if (text.length > MAX_CONTENT_LENGTH) {
+    text = text.substring(0, MAX_CONTENT_LENGTH) + "...";
+  }
+  if (text.length < MIN_CONTENT_LENGTH) {
+    throw createError("fetch_failed", "Structured article body was too short.");
+  }
+  return text;
+}
+
+// --- extractJsonLdArticleBody: parses every <script type="application/ld+json">
+//     block in the HTML and returns the articleBody string from the first
+//     Article-typed node it finds. Handles @graph arrays, array roots, and
+//     multi-type Article variants (NewsArticle, BlogPosting, etc.). ---
+function extractJsonLdArticleBody(html) {
+  const ARTICLE_TYPES = [
+    "Article", "NewsArticle", "BlogPosting", "ReportageNewsArticle",
+    "OpinionNewsArticle", "AnalysisNewsArticle", "LiveBlogPosting",
+    "BackgroundNewsArticle", "ReviewNewsArticle",
+  ];
+  const re = /<script[^>]+type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    let jsonText = m[1].trim();
+    // Some CMSes wrap the JSON in HTML comments (<!-- -->).
+    jsonText = jsonText.replace(/^<!--/, "").replace(/-->$/, "").trim();
+    if (!jsonText) continue;
+    let data;
+    try {
+      data = JSON.parse(jsonText);
+    } catch (_) {
+      // Try decoding HTML entities then re-parsing.
+      try {
+        data = JSON.parse(decodeEntities(jsonText));
+      } catch (_) { continue; }
+    }
+    const body = findArticleBodyInJsonLd(data, ARTICLE_TYPES);
+    if (body && body.length >= MIN_CONTENT_LENGTH) return body;
+  }
+  return null;
+}
+
+// --- findArticleBodyInJsonLd: recursively searches a parsed JSON-LD object
+//     for a node whose @type is an Article variant and returns its
+//     articleBody. Handles @graph arrays and nested objects. ---
+function findArticleBodyInJsonLd(obj, articleTypes, depth) {
+  depth = depth || 0;
+  if (!obj || depth > 6) return null;
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const body = findArticleBodyInJsonLd(item, articleTypes, depth + 1);
+      if (body) return body;
+    }
+    return null;
+  }
+  if (typeof obj !== "object") return null;
+  // @graph pattern: object with a @graph array of entities.
+  if (Array.isArray(obj["@graph"])) {
+    const body = findArticleBodyInJsonLd(obj["@graph"], articleTypes, depth + 1);
+    if (body) return body;
+  }
+  // Check if this node is an Article type.
+  let type = obj["@type"];
+  if (Array.isArray(type)) type = type.find((t) => articleTypes.indexOf(t) !== -1) || type[0];
+  if (type && articleTypes.indexOf(type) !== -1) {
+    if (typeof obj.articleBody === "string" && obj.articleBody.length > 200) {
+      return obj.articleBody;
+    }
+  }
+  // Recurse into nested values that are objects/arrays (breadth-limited).
+  for (const key in obj) {
+    const val = obj[key];
+    if (val && typeof val === "object") {
+      const body = findArticleBodyInJsonLd(val, articleTypes, depth + 1);
+      if (body) return body;
+    }
+  }
+  return null;
+}
+
+// --- extractEmbeddedJsonArticleBody: parses <script id="__NEXT_DATA__">,
+//     <script id="__NUXT_DATA__">, and similar embedded JSON blobs used by
+//     modern JS frameworks, then recursively walks the object looking for
+//     the longest string that looks like article content. Critical for
+//     Cracked.com (Next.js) and other React/Vue/Svelte sites whose rendered
+//     HTML is too thin for DOM-style extraction. ---
+function extractEmbeddedJsonArticleBody(html) {
+  const patterns = [
+    /<script[^>]+id\s*=\s*["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i,
+    /<script[^>]+id\s*=\s*["']__NUXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i,
+    /<script[^>]+id\s*=\s*["']__APOLLO_STATE__["'][^>]*>([\s\S]*?)<\/script>/i,
+    /<script[^>]+id\s*=\s*["']__INITIAL_STATE__["'][^>]*>([\s\S]*?)<\/script>/i,
+  ];
+  for (const re of patterns) {
+    const match = html.match(re);
+    if (!match) continue;
+    const jsonText = match[1].trim();
+    if (!jsonText) continue;
+    let data;
+    try {
+      data = JSON.parse(jsonText);
+    } catch (_) {
+      try { data = JSON.parse(decodeEntities(jsonText)); } catch (_) { continue; }
+    }
+    const body = findLongestArticleContent(data);
+    if (body && body.length >= MIN_CONTENT_LENGTH) return body;
+  }
+  return null;
+}
+
+// --- findLongestArticleContent: walks a parsed JSON tree looking for the
+//     longest string value that sits under a key like "body", "content",
+//     "articleBody", "html", etc. and contains enough sentence punctuation
+//     to look like prose. Depth-limited to keep the walker cheap. ---
+function findLongestArticleContent(obj) {
+  const CONTENT_KEYS = new Set([
+    "articlebody", "body", "content", "html", "bodyhtml", "contenthtml",
+    "richtext", "text", "raw", "post_content", "postcontent", "contentrendered",
+    "renderedcontent", "fulltext", "plaintext", "description",
+  ]);
+  let best = "";
+  function walk(node, parentKey, depth) {
+    if (!node || depth > 10) return;
+    if (typeof node === "string") {
+      if (!parentKey) return;
+      if (!CONTENT_KEYS.has(parentKey.toLowerCase())) return;
+      if (node.length < 300) return;
+      // Strip HTML tags if present to measure real text length.
+      const stripped = /<[a-z][^>]*>/i.test(node) ? stripTags(node) : node;
+      if (stripped.length < 200) return;
+      // Must look like prose: has sentence-ending punctuation with a space.
+      if (!/[.!?]\s/.test(stripped)) return;
+      if (stripped.length > best.length) best = node; // keep original (with HTML)
+      return;
+    }
+    if (typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item, parentKey, depth + 1);
+      return;
+    }
+    for (const key in node) {
+      walk(node[key], key, depth + 1);
+    }
+  }
+  walk(obj, null, 0);
+  return best || null;
+}
+
+// --- extractArticleContainer: returns the inner HTML of the most likely
+//     main content container. Tries known article class/id patterns first,
+//     then falls back to <article>/<main> tags. Class-based detection covers
+//     sites whose article body lives in a plain <div> (Cracked, Vox, etc.). ---
+function extractArticleContainer(html) {
+  // Common article body container classes/ids, ordered by specificity.
+  // Sourced from WordPress, Vox, NYT, Reuters, Guardian, BBC, etc.
+  const CLASS_PATTERNS = [
+    "entry-content", "article-body", "articleBody", "post-content",
+    "story-body", "storyBody", "article-content", "post-body", "story-content",
+    "main-content", "c-entry-content", "RichTextStoryBody", "ArticleBody-articleBody",
+    "content__article-body", "body-copy", "article__body", "article__content",
+    "td-post-content", "post__content", "articleContent", "article-text",
+    "entry__content", "single-content", "article-inner",
+  ];
+  let best = null;
+  for (const cls of CLASS_PATTERNS) {
+    const container = findElementByAttr(html, cls);
+    if (container && container.length > 400 && (!best || container.length > best.length)) {
+      best = container;
+    }
+  }
+  // Legacy fallback: <article> / <main> tags.
+  if (!best || best.length < 600) {
+    const articleRe = /<article\b[\s\S]*?<\/article>/gi;
+    let m;
+    while ((m = articleRe.exec(html)) !== null) {
+      if (!best || m[0].length > best.length) best = m[0];
+    }
+    const mainMatch = html.match(/<main\b[\s\S]*?<\/main>/i);
+    if (mainMatch && (!best || mainMatch[0].length > best.length)) {
+      best = mainMatch[0];
+    }
+  }
+  // itemprop="articleBody" (microdata) — spans any tag.
+  if (!best || best.length < 600) {
+    const itemMatch = html.match(/<(\w+)[^>]+itemprop\s*=\s*["']articleBody["'][^>]*>/i);
+    if (itemMatch) {
+      const inner = findElementByStartIndex(html, itemMatch.index, itemMatch[1]);
+      if (inner && inner.length > 400 && (!best || inner.length > best.length)) {
+        best = inner;
+      }
+    }
   }
   return best && best.length > 400 ? best : null;
+}
+
+// --- findElementByAttr: given an HTML string and a class/id substring,
+//     finds the first opening <div|section|article|main> tag whose class
+//     or id attribute contains that substring, then returns the element's
+//     full outerHTML by counting nested tags to locate the matching close.
+//     Regex-only (no DOM), but nest-aware. ---
+function findElementByAttr(html, needle) {
+  // Match any opening block-level tag containing class="...needle..." or id="...needle..."
+  const re = new RegExp(
+    "<(div|section|article|main)\\b[^>]*(?:class|id)\\s*=\\s*[\"'][^\"']*\\b" +
+      needle.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&") +
+      "\\b[^\"']*[\"'][^>]*>",
+    "i"
+  );
+  const match = re.exec(html);
+  if (!match) return null;
+  return findElementByStartIndex(html, match.index, match[1]);
+}
+
+// --- findElementByStartIndex: walks forward from a tag start index counting
+//     open/close tags of the same name until it finds the matching close.
+//     Handles self-closing tags and nested elements. Returns the outerHTML
+//     substring or null if the element can't be balanced. ---
+function findElementByStartIndex(html, startIdx, tagName) {
+  const lcName = tagName.toLowerCase();
+  const openRe = new RegExp("<" + lcName + "\\b", "gi");
+  const closeRe = new RegExp("</" + lcName + "\\s*>", "gi");
+  // Start scanning just after the opening tag.
+  let scanFrom = html.indexOf(">", startIdx);
+  if (scanFrom < 0) return null;
+  scanFrom += 1;
+  let depth = 1;
+  openRe.lastIndex = scanFrom;
+  closeRe.lastIndex = scanFrom;
+  // Cap the search to avoid pathological regex runtime on huge pages.
+  const MAX_SCAN = Math.min(html.length, startIdx + 200000);
+  while (depth > 0) {
+    openRe.lastIndex = Math.max(openRe.lastIndex, scanFrom);
+    closeRe.lastIndex = Math.max(closeRe.lastIndex, scanFrom);
+    const openMatch = openRe.exec(html);
+    const closeMatch = closeRe.exec(html);
+    if (!closeMatch || closeMatch.index >= MAX_SCAN) return null;
+    if (openMatch && openMatch.index < closeMatch.index && openMatch.index < MAX_SCAN) {
+      depth++;
+      scanFrom = openMatch.index + lcName.length + 1;
+    } else {
+      depth--;
+      scanFrom = closeMatch.index + closeMatch[0].length;
+      if (depth === 0) return html.substring(startIdx, scanFrom);
+    }
+  }
+  return null;
 }
 
 // --- extractContentBlocks: walks the container in document order and

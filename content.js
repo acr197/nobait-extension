@@ -710,8 +710,13 @@
     text.textContent = response.summary || "";
     body.appendChild(text);
 
-    // "More context" button — only shown in short mode.
+    // Action row: "More context" + "Alternate source" buttons. Only shown
+    // in short mode (after detailed expansion the user has all the info we
+    // can fetch from this article and would just want a fresh source).
     if (mode !== "detailed") {
+      const actions = document.createElement("div");
+      actions.className = "nobait-actions";
+
       const moreBtn = document.createElement("button");
       moreBtn.className = "nobait-more-btn";
       moreBtn.type = "button";
@@ -724,8 +729,129 @@
         }
         requestSummary(popup, loadingEl, url, headline, "detailed");
       });
-      body.appendChild(moreBtn);
+      actions.appendChild(moreBtn);
+
+      const altBtn = document.createElement("button");
+      altBtn.className = "nobait-alt-btn";
+      altBtn.type = "button";
+      altBtn.textContent = "Alternate source";
+      altBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const loadingEl = buildLoadingEl();
+        loadingEl.querySelector(".nobait-loading-text").textContent =
+          "Finding another source\u2026";
+        if (body.parentNode === popup) {
+          popup.replaceChild(loadingEl, body);
+        }
+        requestAlternateSource(popup, loadingEl, url, headline);
+      });
+      actions.appendChild(altBtn);
+
+      body.appendChild(actions);
     }
+
+    swapContent(popup, oldEl, body);
+  }
+
+  // --- requestAlternateSource: sends an ALTERNATE_SOURCE message to the
+  //     background script to find and summarize a different publisher's
+  //     coverage of the same headline. Routes the response to
+  //     renderAlternateSource (or renderError on failure). ---
+  function requestAlternateSource(popup, placeholder, url, headline) {
+    Promise.resolve(
+      api.runtime.sendMessage({ type: "ALTERNATE_SOURCE", url, headline })
+    )
+      .then((response) => {
+        if (!activePopupHost) return;
+        if (!response) {
+          renderError(popup, placeholder, "fetch_failed", "No response from extension.", headline);
+          return;
+        }
+        if (response.ok) {
+          renderAlternateSource(popup, placeholder, response, url, headline);
+        } else {
+          renderError(popup, placeholder, response.error, response.message, headline);
+        }
+      })
+      .catch(() => {
+        if (!activePopupHost) return;
+        renderError(popup, placeholder, "fetch_failed", "Extension error. Try again.", headline);
+      });
+  }
+
+  // --- renderAlternateSource: displays the alternate-source result in the
+  //     popup. Layout: status label, then a meta line with date · publisher,
+  //     then the alternate article title (clickable), then the summary. ---
+  function renderAlternateSource(popup, oldEl, response, originalUrl, originalHeadline) {
+    if (!activePopupHost) return;
+
+    const body = document.createElement("div");
+    body.className = "nobait-body";
+
+    const label = document.createElement("div");
+    label.className = "nobait-alt-label";
+    label.textContent = "Alternate source";
+    body.appendChild(label);
+
+    const meta = document.createElement("div");
+    meta.className = "nobait-alt-meta";
+    const metaParts = [];
+    if (response.date) metaParts.push(response.date);
+    if (response.publisher) metaParts.push(response.publisher);
+    meta.textContent = metaParts.join("  \u00B7  ");
+    body.appendChild(meta);
+
+    if (response.title) {
+      const title = document.createElement("a");
+      title.className = "nobait-alt-title";
+      title.textContent = response.title;
+      title.href = response.url || "#";
+      title.target = "_blank";
+      title.rel = "noopener noreferrer";
+      title.addEventListener("click", (e) => e.stopPropagation());
+      body.appendChild(title);
+    }
+
+    const summary = document.createElement("div");
+    summary.className = "nobait-summary";
+    summary.textContent = response.summary || "";
+    body.appendChild(summary);
+
+    // Let the user fetch yet another alternate or go back to the original.
+    const actions = document.createElement("div");
+    actions.className = "nobait-actions";
+
+    const backBtn = document.createElement("button");
+    backBtn.className = "nobait-more-btn";
+    backBtn.type = "button";
+    backBtn.textContent = "Original article";
+    backBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const loadingEl = buildLoadingEl();
+      if (body.parentNode === popup) {
+        popup.replaceChild(loadingEl, body);
+      }
+      requestSummary(popup, loadingEl, originalUrl, originalHeadline, "short");
+    });
+    actions.appendChild(backBtn);
+
+    const anotherBtn = document.createElement("button");
+    anotherBtn.className = "nobait-alt-btn";
+    anotherBtn.type = "button";
+    anotherBtn.textContent = "Try another";
+    anotherBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const loadingEl = buildLoadingEl();
+      loadingEl.querySelector(".nobait-loading-text").textContent =
+        "Finding another source\u2026";
+      if (body.parentNode === popup) {
+        popup.replaceChild(loadingEl, body);
+      }
+      requestAlternateSource(popup, loadingEl, originalUrl, originalHeadline);
+    });
+    actions.appendChild(anotherBtn);
+
+    body.appendChild(actions);
 
     swapContent(popup, oldEl, body);
   }
@@ -919,32 +1045,74 @@
       .nobait-summary-indent {
         color: #3a3a45;
       }
-      .nobait-more-btn {
+      .nobait-actions {
+        display: flex;
+        gap: 8px;
         margin-top: 12px;
-        padding: 7px 14px;
-        border: 1px solid #e5e5ec;
+        flex-wrap: wrap;
+      }
+      .nobait-more-btn,
+      .nobait-alt-btn {
+        padding: 7px 12px;
         border-radius: 8px;
-        background: #f6f5ff;
-        color: #6c47ff;
         font-size: 12px;
         font-weight: 600;
         cursor: pointer;
         transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
         font-family: inherit;
-        align-self: flex-start;
       }
-      .nobait-more-btn:hover:not([disabled]) {
+      .nobait-more-btn {
+        border: 1px solid #e5e5ec;
+        background: #f6f5ff;
+        color: #6c47ff;
+      }
+      .nobait-alt-btn {
+        border: 1px solid #d8cfff;
+        background: #ffffff;
+        color: #6c47ff;
+      }
+      .nobait-more-btn:hover:not([disabled]),
+      .nobait-alt-btn:hover:not([disabled]) {
         background: #efeafe;
-        border-color: #d8cfff;
+        border-color: #c7baff;
       }
-      .nobait-more-btn:active:not([disabled]) {
+      .nobait-more-btn:active:not([disabled]),
+      .nobait-alt-btn:active:not([disabled]) {
         transform: scale(0.97);
       }
-      .nobait-more-btn[disabled] {
+      .nobait-more-btn[disabled],
+      .nobait-alt-btn[disabled] {
         background: #f3f3f5;
         color: #b5b5bf;
         border-color: #ececf0;
         cursor: not-allowed;
+      }
+      .nobait-alt-label {
+        font-size: 10px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #6c47ff;
+        margin-bottom: 4px;
+      }
+      .nobait-alt-meta {
+        font-size: 11.5px;
+        color: #888;
+        margin-bottom: 6px;
+      }
+      .nobait-alt-title {
+        display: block;
+        font-size: 13.5px;
+        font-weight: 600;
+        color: #1a1a1a;
+        line-height: 1.35;
+        margin-bottom: 8px;
+        text-decoration: none;
+        border-bottom: 1px solid #f0f0f0;
+        padding-bottom: 8px;
+      }
+      .nobait-alt-title:hover {
+        color: #6c47ff;
       }
       .nobait-summary::-webkit-scrollbar {
         width: 6px;
