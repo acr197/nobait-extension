@@ -56,10 +56,17 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "SUMMARIZE") {
     const mode = msg.mode === "detailed" ? "detailed" : "short";
-    const responsePromise = handleSummarize(msg.url, msg.headline, mode).catch(() => ({
+    const responsePromise = handleSummarize(msg.url, msg.headline, mode).catch((err) => ({
       ok: false,
       error: "ai_error",
       message: "An unexpected error occurred.",
+      debug: [{
+        t: 0,
+        stage: "uncaught",
+        status: "fail",
+        detail: (err && err.message) || String(err),
+        data: null,
+      }],
     }));
     responsePromise.then((res) => {
       try { sendResponse(res); } catch (_) { /* channel may be closed in Firefox */ }
@@ -68,10 +75,17 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "ALTERNATE_SOURCE") {
-    const responsePromise = handleAlternateSource(msg.url, msg.headline).catch(() => ({
+    const responsePromise = handleAlternateSource(msg.url, msg.headline).catch((err) => ({
       ok: false,
       error: "alt_error",
       message: "An unexpected error occurred.",
+      debug: [{
+        t: 0,
+        stage: "uncaught",
+        status: "fail",
+        detail: (err && err.message) || String(err),
+        data: null,
+      }],
     }));
     responsePromise.then((res) => {
       try { sendResponse(res); } catch (_) { /* channel may be closed in Firefox */ }
@@ -86,9 +100,23 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 //       2. Article couldn't be fetched → AI answers from web search /
 //          training knowledge, same as pasting "headline + publisher" into
 //          Claude.ai / ChatGPT. The popup labels this answer clearly so the
-//          user can distinguish it from article-grounded answers. ---
+//          user can distinguish it from article-grounded answers.
+//
+//     Every response (ok or not) carries a `debug` array — a timestamped log
+//     of every fetch attempt, extraction result, and AI call. Debug mode in
+//     the popup renders it as a diagnostic panel under the summary so the
+//     user can see exactly which fallback ran, which stage failed, and copy
+//     the entries back into Claude Code for investigation. ---
 async function handleSummarize(url, headline, mode) {
+  const debug = createDebugLog();
+  debug.log("start", "info", "begin summarize", {
+    url,
+    headline,
+    mode,
+  });
+
   let articleText = null;
+  let articleSource = null; // label for the fetcher that succeeded
   let fetchError = null;
 
   // Google News URLs: /articles/ and /read/ pages are JS-redirect stubs that
@@ -100,14 +128,34 @@ async function handleSummarize(url, headline, mode) {
   const googleNewsRss = buildGoogleNewsRssUrl(url);
 
   if (googleNewsRss) {
-    const publisherUrl = decodeGoogleNewsUrl(url) || await discoverPublisherUrl(googleNewsRss);
+    debug.log("google_news", "info", "Google News stub detected, resolving publisher URL");
+    let publisherUrl = decodeGoogleNewsUrl(url);
+    if (publisherUrl) {
+      debug.log("google_news", "ok", "decoded from base64 article id", { publisherUrl });
+    } else {
+      publisherUrl = await discoverPublisherUrl(googleNewsRss);
+      if (publisherUrl) {
+        debug.log("google_news", "ok", "resolved via RSS redirect", { publisherUrl });
+      } else {
+        debug.log("google_news", "fail", "could not resolve publisher URL");
+      }
+    }
     if (publisherUrl) {
       realUrl = publisherUrl;
+      debug.log("direct_fetch", "info", "fetching resolved publisher URL", { url: publisherUrl });
       try {
         articleText = await fetchArticle(publisherUrl);
+        articleSource = "direct_fetch(google_news_resolved)";
         fetchError = null;
+        debug.log("direct_fetch", "ok", `got ${articleText.length} chars`, {
+          length: articleText.length,
+          preview: previewText(articleText),
+        });
       } catch (err) {
         fetchError = captureFetchError(err);
+        debug.log("direct_fetch", "fail", fetchError.message, {
+          errorType: fetchError.type,
+        });
       }
     }
   }
@@ -117,11 +165,21 @@ async function handleSummarize(url, headline, mode) {
   // the stub URL — fetch() follows HTTP redirects automatically, so it may
   // still land on the publisher article via server-side 302.
   if (!articleText) {
+    debug.log("direct_fetch", "info", "attempting direct fetch", { url });
     try {
       articleText = await fetchArticle(url);
+      articleSource = "direct_fetch";
       fetchError = null;
+      debug.log("direct_fetch", "ok", `got ${articleText.length} chars`, {
+        length: articleText.length,
+        preview: previewText(articleText),
+      });
     } catch (err) {
-      if (!fetchError) fetchError = captureFetchError(err);
+      const captured = captureFetchError(err);
+      if (!fetchError) fetchError = captured;
+      debug.log("direct_fetch", "fail", captured.message, {
+        errorType: captured.type,
+      });
     }
   }
 
@@ -130,15 +188,26 @@ async function handleSummarize(url, headline, mode) {
   // skeleton, and sites whose bot protection blocks our direct fetch.
   // For Google News, realUrl is already the resolved publisher URL.
   if (!articleText) {
+    debug.log("jina_reader", "info", "attempting Jina Reader API", { url: realUrl });
     try {
       articleText = await fetchViaJinaReader(realUrl);
-      if (articleText) fetchError = null;
+      if (articleText) {
+        articleSource = "jina_reader";
+        fetchError = null;
+        debug.log("jina_reader", "ok", `got ${articleText.length} chars`, {
+          length: articleText.length,
+          preview: previewText(articleText),
+        });
+      }
     } catch (err) {
       // Overwrite the generic "could not extract enough text" error from
       // the direct-fetch path so the user can tell which layer failed;
       // preserve more-specific errors like "paywall" / "blocked".
       const captured = captureFetchError(err);
       if (!fetchError || fetchError.type === "fetch_failed") fetchError = captured;
+      debug.log("jina_reader", "fail", captured.message, {
+        errorType: captured.type,
+      });
     }
   }
 
@@ -146,12 +215,23 @@ async function handleSummarize(url, headline, mode) {
   // (paywall, anti-bot, JS SPA that doesn't render for headless fetchers),
   // archive.org usually has a static snapshot that's trivially readable.
   if (!articleText) {
+    debug.log("wayback", "info", "attempting Wayback Machine", { url: realUrl });
     try {
       articleText = await fetchViaWayback(realUrl);
-      if (articleText) fetchError = null;
+      if (articleText) {
+        articleSource = "wayback";
+        fetchError = null;
+        debug.log("wayback", "ok", `got ${articleText.length} chars`, {
+          length: articleText.length,
+          preview: previewText(articleText),
+        });
+      }
     } catch (err) {
       const captured = captureFetchError(err);
       if (!fetchError || fetchError.type === "fetch_failed") fetchError = captured;
+      debug.log("wayback", "fail", captured.message, {
+        errorType: captured.type,
+      });
     }
   }
 
@@ -160,12 +240,23 @@ async function handleSummarize(url, headline, mode) {
   // Wayback because the two services have largely non-overlapping snapshot
   // coverage.
   if (!articleText) {
+    debug.log("archive_today", "info", "attempting Archive.today", { url: realUrl });
     try {
       articleText = await fetchViaArchiveToday(realUrl);
-      if (articleText) fetchError = null;
+      if (articleText) {
+        articleSource = "archive_today";
+        fetchError = null;
+        debug.log("archive_today", "ok", `got ${articleText.length} chars`, {
+          length: articleText.length,
+          preview: previewText(articleText),
+        });
+      }
     } catch (err) {
       const captured = captureFetchError(err);
       if (!fetchError || fetchError.type === "fetch_failed") fetchError = captured;
+      debug.log("archive_today", "fail", captured.message, {
+        errorType: captured.type,
+      });
     }
   }
 
@@ -176,12 +267,26 @@ async function handleSummarize(url, headline, mode) {
   // real reporting rather than an AI guess. This rescues JS-rendered SPAs
   // that Jina can't render and sites without archive snapshots.
   if (!articleText) {
+    debug.log("search", "info", "attempting search-based retrieval", {
+      headline,
+      originalUrl: realUrl,
+    });
     try {
       articleText = await fetchViaSearchResults(headline, realUrl);
-      if (articleText) fetchError = null;
+      if (articleText) {
+        articleSource = "search_result";
+        fetchError = null;
+        debug.log("search", "ok", `got ${articleText.length} chars from a search result`, {
+          length: articleText.length,
+          preview: previewText(articleText),
+        });
+      }
     } catch (err) {
       const captured = captureFetchError(err);
       if (!fetchError || fetchError.type === "fetch_failed") fetchError = captured;
+      debug.log("search", "fail", captured.message, {
+        errorType: captured.type,
+      });
     }
   }
 
@@ -190,8 +295,13 @@ async function handleSummarize(url, headline, mode) {
   // training knowledge to answer. We flag the response with source:"knowledge"
   // so the popup can show the user that the answer is NOT from the article.
   if (!articleText) {
+    debug.log("ai_knowledge", "info", "all fetch paths failed, asking AI from knowledge");
     try {
       const summary = await callAISearch(headline, realUrl, mode);
+      debug.log("ai_knowledge", "ok", `AI returned ${summary.length} chars`, {
+        length: summary.length,
+      });
+      debug.log("done", "info", "returning knowledge-source summary");
       return {
         ok: true,
         summary,
@@ -199,32 +309,83 @@ async function handleSummarize(url, headline, mode) {
         contentStatus: "from_knowledge",
         contentStatusMessage:
           "Article couldn't be fetched — this answer is from AI knowledge.",
+        debug: debug.entries,
       };
     } catch (err) {
+      debug.log("ai_knowledge", "fail", err.message || "AI knowledge call failed");
       // If even the search-style AI call fails, surface the original fetch
       // error (which is usually more actionable than an AI timeout).
+      debug.log("done", "fail", "all paths exhausted");
       return {
         ok: false,
         error: "unreadable",
         message: (fetchError && fetchError.message) || err.message || "Couldn't read this article.",
         contentStatus: (fetchError && fetchError.type) || "fetch_failed",
+        debug: debug.entries,
       };
     }
   }
 
   // articleText is guaranteed non-null from here on.
+  debug.log("ai_summarize", "info", `calling AI with content from ${articleSource}`, {
+    contentLength: articleText.length,
+    mode,
+  });
   try {
     const summary = await callAI(headline, articleText, mode);
+    debug.log("ai_summarize", "ok", `AI returned ${summary.length} chars`, {
+      length: summary.length,
+    });
+    debug.log("done", "ok", "returning article-grounded summary");
     return {
       ok: true,
       summary,
       source: "article",
       contentStatus: "ok",
       contentStatusMessage: null,
+      debug: debug.entries,
     };
   } catch (err) {
-    return { ok: false, error: "ai_error", message: err.message || "Summarization failed." };
+    debug.log("ai_summarize", "fail", err.message || "AI call failed");
+    debug.log("done", "fail", "AI error after fetch");
+    return {
+      ok: false,
+      error: "ai_error",
+      message: err.message || "Summarization failed.",
+      debug: debug.entries,
+    };
   }
+}
+
+// --- createDebugLog: returns a small logger object used by handleSummarize
+//     (and handleAlternateSource) to record a timestamped trace of every
+//     fetch attempt and AI call. The debug array is attached to every
+//     response so the popup can render it under the summary when debug
+//     mode is on. ---
+function createDebugLog() {
+  const start = Date.now();
+  const entries = [];
+  return {
+    entries,
+    log(stage, status, detail, data) {
+      entries.push({
+        t: Date.now() - start,
+        stage,
+        status: status || "info",
+        detail: detail || "",
+        data: data || null,
+      });
+    },
+  };
+}
+
+// --- previewText: short prefix of fetched article text, used in debug
+//     entries so the user can see whether the extractor actually pulled
+//     real article prose or just navigation/footer junk. ---
+function previewText(text) {
+  if (!text) return "";
+  const trimmed = text.replace(/\s+/g, " ").trim();
+  return trimmed.length > 200 ? trimmed.substring(0, 200) + "…" : trimmed;
 }
 
 // --- handleAlternateSource: finds, fetches, and summarizes a different
@@ -241,27 +402,46 @@ async function handleSummarize(url, headline, mode) {
 //       4. Extract title, published date, and article text from the winner.
 //       5. Summarize via callAI in short mode. ---
 async function handleAlternateSource(originalUrl, headline) {
+  const debug = createDebugLog();
+  debug.log("alt_start", "info", "begin alternate source lookup", {
+    originalUrl,
+    headline,
+  });
+
   if (!headline) {
-    return { ok: false, error: "no_headline", message: "Need a headline to find an alternate source." };
+    debug.log("alt_start", "fail", "no headline provided");
+    return {
+      ok: false,
+      error: "no_headline",
+      message: "Need a headline to find an alternate source.",
+      debug: debug.entries,
+    };
   }
 
   // Find candidate URLs from a different publisher.
   let candidates;
   try {
     candidates = await findAlternateCandidates(headline, originalUrl);
+    debug.log("alt_search", "ok", `found ${candidates.length} candidate(s)`, {
+      candidates,
+    });
   } catch (err) {
+    debug.log("alt_search", "fail", "search engine error");
     return {
       ok: false,
       error: "search_failed",
       message: "Couldn't search for alternate sources.",
+      debug: debug.entries,
     };
   }
 
   if (!candidates || candidates.length === 0) {
+    debug.log("alt_search", "fail", "no candidates after filtering");
     return {
       ok: false,
       error: "no_alternates",
       message: "No alternate sources found for this story.",
+      debug: debug.entries,
     };
   }
 
@@ -270,10 +450,23 @@ async function handleAlternateSource(originalUrl, headline) {
   // & recency), not the fastest race winner.
   let lastError = null;
   for (const candidate of candidates) {
+    debug.log("alt_fetch", "info", "trying candidate", { url: candidate });
     try {
       const article = await fetchAlternateArticle(candidate);
-      if (!article || !article.text) continue;
+      if (!article || !article.text) {
+        debug.log("alt_fetch", "fail", "candidate returned no text", { url: candidate });
+        continue;
+      }
+      debug.log("alt_fetch", "ok", `got ${article.text.length} chars`, {
+        url: candidate,
+        length: article.text.length,
+        title: article.title || null,
+        preview: previewText(article.text),
+      });
+      debug.log("ai_summarize", "info", "calling AI on alternate article");
       const summary = await callAI(article.title || headline, article.text, "short");
+      debug.log("ai_summarize", "ok", `AI returned ${summary.length} chars`);
+      debug.log("done", "ok", "returning alternate summary");
       return {
         ok: true,
         title: article.title || headline,
@@ -281,16 +474,22 @@ async function handleAlternateSource(originalUrl, headline) {
         date: article.date || null,
         url: candidate,
         summary,
+        debug: debug.entries,
       };
     } catch (err) {
       lastError = err;
+      debug.log("alt_fetch", "fail", (err && err.message) || "candidate failed", {
+        url: candidate,
+      });
     }
   }
 
+  debug.log("done", "fail", "all candidates exhausted");
   return {
     ok: false,
     error: "fetch_failed",
     message: (lastError && lastError.message) || "Couldn't fetch any alternate source.",
+    debug: debug.entries,
   };
 }
 

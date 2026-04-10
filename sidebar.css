@@ -701,3 +701,193 @@ body {
   color: var(--brand);
   background: var(--brand-soft);
 }
+
+/* ─── Debug panel ─────────────────────────────────────────────────────── */
+
+.sb-debug-panel {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.sb-debug-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-soft);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+}
+
+.sb-debug-header:hover {
+  background: var(--brand-soft);
+}
+
+.sb-debug-chev {
+  font-size: 10px;
+  color: var(--text-muted);
+  width: 10px;
+  display: inline-block;
+}
+
+.sb-debug-title {
+  flex: 1;
+}
+
+.sb-debug-copy {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: var(--border);
+  color: var(--text-soft);
+  cursor: pointer;
+  user-select: none;
+}
+
+.sb-debug-copy:hover {
+  background: var(--border-strong);
+}
+
+.sb-debug-body {
+  max-height: 260px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px 12px 10px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.sb-debug-panel.sb-debug-collapsed .sb-debug-body {
+  display: none;
+}
+
+.sb-debug-meta {
+  padding: 4px 0 6px;
+  margin-bottom: 4px;
+  border-bottom: 1px dotted var(--border-strong);
+  color: var(--text-soft);
+  font-size: 10px;
+  word-break: break-word;
+}
+
+.sb-debug-entry {
+  padding: 3px 0;
+  border-bottom: 1px dotted var(--border);
+}
+
+.sb-debug-entry:last-child {
+  border-bottom: none;
+}
+
+.sb-debug-line {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.sb-debug-time {
+  color: var(--text-muted);
+  white-space: pre;
+  min-width: 44px;
+  text-align: right;
+}
+
+.sb-debug-stage {
+  color: var(--brand);
+  font-weight: 700;
+}
+
+.sb-debug-status {
+  font-weight: 700;
+  font-size: 9.5px;
+  padding: 0 4px;
+  border-radius: 3px;
+}
+
+.sb-debug-ok .sb-debug-status {
+  color: #166534;
+  background: #dcfce7;
+}
+
+.sb-debug-fail .sb-debug-status {
+  color: #991b1b;
+  background: #fee2e2;
+}
+
+.sb-debug-info .sb-debug-status {
+  color: #475569;
+  background: #e2e8f0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .sb-debug-ok .sb-debug-status {
+    color: #86efac;
+    background: #14532d;
+  }
+  .sb-debug-fail .sb-debug-status {
+    color: #fca5a5;
+    background: #7f1d1d;
+  }
+  .sb-debug-info .sb-debug-status {
+    color: #cbd5e1;
+    background: #334155;
+  }
+}
+
+.sb-debug-detail {
+  flex: 1 1 100%;
+  color: var(--text);
+  word-break: break-word;
+  margin-left: 50px;
+}
+
+.sb-debug-data {
+  padding-left: 50px;
+  color: var(--text-soft);
+}
+
+.sb-debug-kv {
+  display: flex;
+  gap: 4px;
+  word-break: break-word;
+}
+
+.sb-debug-key {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.sb-debug-val {
+  color: var(--text);
+  word-break: break-all;
+}
+
+.sb-debug-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.sb-debug-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.sb-debug-body::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}

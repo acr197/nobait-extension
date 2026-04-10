@@ -26,6 +26,11 @@
   const longClickEl = document.getElementById("sb-trigger-longclick");
   const shiftClickEl = document.getElementById("sb-trigger-shiftclick");
   const ctrlClickEl = document.getElementById("sb-trigger-ctrlclick");
+  const debugModeEl = document.getElementById("sb-setting-debugmode");
+
+  // --- Debug mode mirrors the popup setting; controls whether the modal
+  //     summary appends a diagnostic log panel under the response. ---
+  let debugMode = true;
 
   const modalEl = document.getElementById("sb-modal");
   const modalBackdrop = modalEl.querySelector(".sb-modal-backdrop");
@@ -99,6 +104,7 @@
     longClickEl.addEventListener("change", saveSettings);
     shiftClickEl.addEventListener("change", saveSettings);
     ctrlClickEl.addEventListener("change", saveSettings);
+    debugModeEl.addEventListener("change", saveSettings);
 
     modalCloseBtn.addEventListener("click", closeModal);
     modalBackdrop.addEventListener("click", closeModal);
@@ -121,15 +127,21 @@
         if (typeof s.longClick === "boolean") longClickEl.checked = s.longClick;
         if (typeof s.shiftClick === "boolean") shiftClickEl.checked = s.shiftClick;
         if (typeof s.ctrlClick === "boolean") ctrlClickEl.checked = s.ctrlClick;
+        if (typeof s.debugMode === "boolean") {
+          debugModeEl.checked = s.debugMode;
+          debugMode = s.debugMode;
+        }
       })
       .catch(() => { /* ignore */ });
   }
 
   function saveSettings() {
+    debugMode = debugModeEl.checked;
     const settings = {
       longClick: longClickEl.checked,
       shiftClick: shiftClickEl.checked,
       ctrlClick: ctrlClickEl.checked,
+      debugMode: debugModeEl.checked,
     };
     Promise.resolve(api.storage.sync.set({ [STORAGE_KEY]: settings })).catch(() => {});
   }
@@ -355,20 +367,31 @@
       );
     } catch (err) {
       if (requestId !== activeRequestId) return;
-      renderError("ai_error", "Extension error. Try again.", link.headline);
+      renderError("ai_error", "Extension error. Try again.", link.headline, {
+        ok: false,
+        error: "ai_error",
+        message: "Extension error. Try again.",
+        debug: [{
+          t: 0,
+          stage: "sendMessage",
+          status: "fail",
+          detail: (err && err.message) || String(err),
+          data: null,
+        }],
+      });
       return;
     }
 
     if (requestId !== activeRequestId) return;
 
     if (!response) {
-      renderError("ai_error", "No response from extension.", link.headline);
+      renderError("ai_error", "No response from extension.", link.headline, null);
       return;
     }
     if (response.ok) {
       renderSummary(response, link, mode);
     } else {
-      renderError(response.error, response.message, link.headline);
+      renderError(response.error, response.message, link.headline, response);
     }
   }
 
@@ -434,6 +457,7 @@
     }
 
     modalBodyEl.appendChild(wrap);
+    appendDebugPanel(response);
   }
 
   // --- requestModalAlternateSource: asks the background to find a different
@@ -456,20 +480,31 @@
       );
     } catch (err) {
       if (requestId !== activeRequestId) return;
-      renderError("alt_error", "Extension error. Try again.", link.headline);
+      renderError("alt_error", "Extension error. Try again.", link.headline, {
+        ok: false,
+        error: "alt_error",
+        message: "Extension error. Try again.",
+        debug: [{
+          t: 0,
+          stage: "sendMessage",
+          status: "fail",
+          detail: (err && err.message) || String(err),
+          data: null,
+        }],
+      });
       return;
     }
 
     if (requestId !== activeRequestId) return;
 
     if (!response) {
-      renderError("alt_error", "No response from extension.", link.headline);
+      renderError("alt_error", "No response from extension.", link.headline, null);
       return;
     }
     if (response.ok) {
       renderAlternateSource(response, link);
     } else {
-      renderError(response.error, response.message, link.headline);
+      renderError(response.error, response.message, link.headline, response);
     }
   }
 
@@ -533,9 +568,10 @@
 
     wrap.appendChild(actions);
     modalBodyEl.appendChild(wrap);
+    appendDebugPanel(response);
   }
 
-  function renderError(errorType, message, headline) {
+  function renderError(errorType, message, headline, response) {
     modalBodyEl.innerHTML = "";
     const wrap = document.createElement("div");
     wrap.className = "sb-modal-error";
@@ -561,5 +597,193 @@
     wrap.appendChild(btn);
 
     modalBodyEl.appendChild(wrap);
+    appendDebugPanel(response);
+  }
+
+  // =========================================================================
+  // DEBUG PANEL
+  // =========================================================================
+
+  // --- appendDebugPanel: appends a collapsible diagnostic log under the
+  //     modal body when debug mode is on AND the background returned a
+  //     debug array. Mirrors the on-page popup's panel so the user gets the
+  //     same investigation surface no matter which UI they used. ---
+  function appendDebugPanel(response) {
+    if (!debugMode) return;
+    if (!response || !Array.isArray(response.debug) || response.debug.length === 0) return;
+
+    const panel = document.createElement("div");
+    panel.className = "sb-debug-panel";
+
+    const header = document.createElement("button");
+    header.className = "sb-debug-header";
+    header.type = "button";
+
+    const chev = document.createElement("span");
+    chev.className = "sb-debug-chev";
+    chev.textContent = "\u25BE"; // ▾
+    header.appendChild(chev);
+
+    const title = document.createElement("span");
+    title.className = "sb-debug-title";
+    const last = response.debug[response.debug.length - 1];
+    const totalMs = last && typeof last.t === "number" ? last.t : 0;
+    title.textContent =
+      "Debug log \u00B7 " + response.debug.length + " entries \u00B7 " + totalMs + "ms";
+    header.appendChild(title);
+
+    const copyBtn = document.createElement("span");
+    copyBtn.className = "sb-debug-copy";
+    copyBtn.textContent = "Copy";
+    copyBtn.title = "Copy debug log to clipboard";
+    copyBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      copyDebugLog(response, copyBtn);
+    });
+    header.appendChild(copyBtn);
+
+    header.addEventListener("click", () => {
+      const collapsed = panel.classList.toggle("sb-debug-collapsed");
+      chev.textContent = collapsed ? "\u25B8" : "\u25BE"; // ▸ : ▾
+    });
+
+    panel.appendChild(header);
+
+    const body = document.createElement("div");
+    body.className = "sb-debug-body";
+
+    if (response.error || response.contentStatus || response.source) {
+      const meta = document.createElement("div");
+      meta.className = "sb-debug-meta";
+      const parts = [];
+      parts.push("ok=" + (response.ok ? "true" : "false"));
+      if (response.error) parts.push("error=" + response.error);
+      if (response.contentStatus) parts.push("contentStatus=" + response.contentStatus);
+      if (response.source) parts.push("source=" + response.source);
+      meta.textContent = parts.join(" \u00B7 ");
+      body.appendChild(meta);
+    }
+
+    for (const entry of response.debug) {
+      body.appendChild(buildDebugEntry(entry));
+    }
+
+    panel.appendChild(body);
+    modalBodyEl.appendChild(panel);
+  }
+
+  function buildDebugEntry(entry) {
+    const row = document.createElement("div");
+    row.className = "sb-debug-entry sb-debug-" + (entry.status || "info");
+
+    const line = document.createElement("div");
+    line.className = "sb-debug-line";
+
+    const time = document.createElement("span");
+    time.className = "sb-debug-time";
+    time.textContent = (typeof entry.t === "number" ? entry.t : 0) + "ms";
+    line.appendChild(time);
+
+    const stage = document.createElement("span");
+    stage.className = "sb-debug-stage";
+    stage.textContent = entry.stage || "?";
+    line.appendChild(stage);
+
+    const status = document.createElement("span");
+    status.className = "sb-debug-status";
+    status.textContent = (entry.status || "info").toUpperCase();
+    line.appendChild(status);
+
+    const detail = document.createElement("span");
+    detail.className = "sb-debug-detail";
+    detail.textContent = entry.detail || "";
+    line.appendChild(detail);
+
+    row.appendChild(line);
+
+    if (entry.data && typeof entry.data === "object") {
+      const data = document.createElement("div");
+      data.className = "sb-debug-data";
+      for (const key in entry.data) {
+        const val = entry.data[key];
+        if (val == null) continue;
+        const kv = document.createElement("div");
+        kv.className = "sb-debug-kv";
+        const k = document.createElement("span");
+        k.className = "sb-debug-key";
+        k.textContent = key + ":";
+        kv.appendChild(k);
+        const v = document.createElement("span");
+        v.className = "sb-debug-val";
+        v.textContent = typeof val === "object" ? JSON.stringify(val) : String(val);
+        kv.appendChild(v);
+        data.appendChild(kv);
+      }
+      row.appendChild(data);
+    }
+
+    return row;
+  }
+
+  function copyDebugLog(response, feedbackEl) {
+    const lines = [];
+    lines.push("NoBait debug log");
+    const head = [];
+    head.push("ok=" + (response.ok ? "true" : "false"));
+    if (response.error) head.push("error=" + response.error);
+    if (response.contentStatus) head.push("contentStatus=" + response.contentStatus);
+    if (response.source) head.push("source=" + response.source);
+    lines.push(head.join(" "));
+    if (response.message) lines.push("message: " + response.message);
+    if (response.summary) {
+      const s = String(response.summary);
+      lines.push("summary: " + (s.length > 400 ? s.substring(0, 400) + "..." : s));
+    }
+    lines.push("---");
+    for (const entry of response.debug || []) {
+      lines.push(
+        "[" + (entry.t || 0) + "ms] " +
+        (entry.stage || "?") + " " +
+        (entry.status || "info") + ": " +
+        (entry.detail || "")
+      );
+      if (entry.data && typeof entry.data === "object") {
+        for (const key in entry.data) {
+          const val = entry.data[key];
+          if (val == null) continue;
+          const str = typeof val === "object" ? JSON.stringify(val) : String(val);
+          lines.push("    " + key + ": " + str);
+        }
+      }
+    }
+    const text = lines.join("\n");
+
+    const flash = (label) => {
+      const prev = feedbackEl.textContent;
+      feedbackEl.textContent = label;
+      setTimeout(() => { feedbackEl.textContent = prev; }, 1200);
+    };
+
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text)
+          .then(() => flash("Copied!"))
+          .catch(() => flash("Copy failed"));
+        return;
+      }
+    } catch (_) { /* fall through */ }
+
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.cssText = "position:fixed;top:-1000px;left:-1000px;";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+      flash("Copied!");
+    } catch (_) {
+      flash("Copy failed");
+    }
   }
 })();

@@ -59,6 +59,11 @@
   let enableLongClick = true;
   let enableShiftClick = true;
   let enableCtrlClick = false;
+  // --- Debug mode: when on, the popup renders a diagnostic log panel
+  //     under the summary so the user can see exactly which fetch path ran
+  //     and where it failed. Defaults to true so first-run users see the
+  //     pipeline at work without having to find the toggle. ---
+  let debugMode = true;
 
   // --- Load trigger settings from storage ---
   loadTriggerSettings();
@@ -135,6 +140,7 @@
         if (typeof s.longClick === "boolean") enableLongClick = s.longClick;
         if (typeof s.shiftClick === "boolean") enableShiftClick = s.shiftClick;
         if (typeof s.ctrlClick === "boolean") enableCtrlClick = s.ctrlClick;
+        if (typeof s.debugMode === "boolean") debugMode = s.debugMode;
       }).catch(() => { /* ignore */ });
     } catch (_) { /* ignore */ }
   }
@@ -147,6 +153,7 @@
     if (typeof s.longClick === "boolean") enableLongClick = s.longClick;
     if (typeof s.shiftClick === "boolean") enableShiftClick = s.shiftClick;
     if (typeof s.ctrlClick === "boolean") enableCtrlClick = s.ctrlClick;
+    if (typeof s.debugMode === "boolean") debugMode = s.debugMode;
   }
 
   // =========================================================================
@@ -652,18 +659,29 @@
       .then((response) => {
         if (!activePopupHost) return;
         if (!response) {
-          renderError(popup, placeholder, "fetch_failed", "No response from extension.", headline);
+          renderError(popup, placeholder, "fetch_failed", "No response from extension.", headline, null);
           return;
         }
         if (response.ok) {
           renderSummary(popup, placeholder, response, url, headline, mode);
         } else {
-          renderError(popup, placeholder, response.error, response.message, headline);
+          renderError(popup, placeholder, response.error, response.message, headline, response);
         }
       })
-      .catch(() => {
+      .catch((err) => {
         if (!activePopupHost) return;
-        renderError(popup, placeholder, "fetch_failed", "Extension error. Try again.", headline);
+        renderError(popup, placeholder, "fetch_failed", "Extension error. Try again.", headline, {
+          ok: false,
+          error: "fetch_failed",
+          message: "Extension error. Try again.",
+          debug: [{
+            t: 0,
+            stage: "sendMessage",
+            status: "fail",
+            detail: (err && err.message) || String(err),
+            data: null,
+          }],
+        });
       });
   }
 
@@ -690,6 +708,7 @@
   //         reader can tell which kind of answer they're looking at. ---
   function renderSummary(popup, oldEl, response, url, headline, mode) {
     if (!activePopupHost) return;
+    renderDebugPanel(popup, response);
 
     const body = document.createElement("div");
     body.className = "nobait-body";
@@ -764,18 +783,29 @@
       .then((response) => {
         if (!activePopupHost) return;
         if (!response) {
-          renderError(popup, placeholder, "fetch_failed", "No response from extension.", headline);
+          renderError(popup, placeholder, "fetch_failed", "No response from extension.", headline, null);
           return;
         }
         if (response.ok) {
           renderAlternateSource(popup, placeholder, response, url, headline);
         } else {
-          renderError(popup, placeholder, response.error, response.message, headline);
+          renderError(popup, placeholder, response.error, response.message, headline, response);
         }
       })
-      .catch(() => {
+      .catch((err) => {
         if (!activePopupHost) return;
-        renderError(popup, placeholder, "fetch_failed", "Extension error. Try again.", headline);
+        renderError(popup, placeholder, "fetch_failed", "Extension error. Try again.", headline, {
+          ok: false,
+          error: "fetch_failed",
+          message: "Extension error. Try again.",
+          debug: [{
+            t: 0,
+            stage: "sendMessage",
+            status: "fail",
+            detail: (err && err.message) || String(err),
+            data: null,
+          }],
+        });
       });
   }
 
@@ -784,6 +814,7 @@
   //     then the alternate article title (clickable), then the summary. ---
   function renderAlternateSource(popup, oldEl, response, originalUrl, originalHeadline) {
     if (!activePopupHost) return;
+    renderDebugPanel(popup, response);
 
     const body = document.createElement("div");
     body.className = "nobait-body";
@@ -859,9 +890,12 @@
   // --- renderError: shown whenever we can't return a real summary — either
   //     the fetch pipeline couldn't read the article, or the AI itself failed.
   //     The user gets a warning icon, a one-line reason, and a Search Google
-  //     fallback button so they have a path forward. ---
-  function renderError(popup, spinnerWrap, errorType, message, headline) {
+  //     fallback button so they have a path forward. The optional `response`
+  //     argument carries the full background-script payload (incl. debug log)
+  //     so the diagnostic panel can render under the error message. ---
+  function renderError(popup, spinnerWrap, errorType, message, headline, response) {
     if (!activePopupHost) return;
+    renderDebugPanel(popup, response);
 
     const body = document.createElement("div");
     body.className = "nobait-body nobait-error-body";
@@ -902,6 +936,204 @@
     }, 150);
   }
 
+  // --- renderDebugPanel: appends (or replaces) the diagnostic log panel as
+  //     a sibling of .nobait-body so it persists across "More context" body
+  //     swaps and updates whenever a new background response arrives.
+  //     Renders only when debugMode is on AND the response actually carries
+  //     a debug log (errors that don't reach background still pass null). ---
+  function renderDebugPanel(popup, response) {
+    if (!debugMode) return;
+    if (!response || !Array.isArray(response.debug) || response.debug.length === 0) return;
+
+    const existing = popup.querySelector(".nobait-debug-panel");
+    if (existing) existing.remove();
+
+    const panel = document.createElement("div");
+    panel.className = "nobait-debug-panel";
+
+    const header = document.createElement("button");
+    header.className = "nobait-debug-header";
+    header.type = "button";
+
+    const chev = document.createElement("span");
+    chev.className = "nobait-debug-chev";
+    chev.textContent = "\u25BE"; // ▾
+    header.appendChild(chev);
+
+    const title = document.createElement("span");
+    title.className = "nobait-debug-title";
+    const last = response.debug[response.debug.length - 1];
+    const totalMs = last && typeof last.t === "number" ? last.t : 0;
+    title.textContent =
+      "Debug log \u00B7 " + response.debug.length + " entries \u00B7 " + totalMs + "ms";
+    header.appendChild(title);
+
+    const copyBtn = document.createElement("span");
+    copyBtn.className = "nobait-debug-copy";
+    copyBtn.textContent = "Copy";
+    copyBtn.title = "Copy debug log to clipboard";
+    copyBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      copyDebugLog(response, copyBtn);
+    });
+    header.appendChild(copyBtn);
+
+    header.addEventListener("click", () => {
+      const collapsed = panel.classList.toggle("nobait-debug-collapsed");
+      chev.textContent = collapsed ? "\u25B8" : "\u25BE"; // ▸ : ▾
+    });
+
+    panel.appendChild(header);
+
+    const body = document.createElement("div");
+    body.className = "nobait-debug-body";
+
+    if (response.error || response.contentStatus) {
+      const meta = document.createElement("div");
+      meta.className = "nobait-debug-meta";
+      const parts = [];
+      parts.push("ok=" + (response.ok ? "true" : "false"));
+      if (response.error) parts.push("error=" + response.error);
+      if (response.contentStatus) parts.push("contentStatus=" + response.contentStatus);
+      if (response.source) parts.push("source=" + response.source);
+      meta.textContent = parts.join(" \u00B7 ");
+      body.appendChild(meta);
+    }
+
+    for (const entry of response.debug) {
+      body.appendChild(buildDebugEntry(entry));
+    }
+
+    panel.appendChild(body);
+    popup.appendChild(panel);
+  }
+
+  // --- buildDebugEntry: renders a single debug log line. Stage in purple,
+  //     status color-coded (green=ok / red=fail / gray=info), detail in
+  //     normal weight, and any structured `data` keys indented underneath. ---
+  function buildDebugEntry(entry) {
+    const row = document.createElement("div");
+    row.className = "nobait-debug-entry nobait-debug-" + (entry.status || "info");
+
+    const line = document.createElement("div");
+    line.className = "nobait-debug-line";
+
+    const time = document.createElement("span");
+    time.className = "nobait-debug-time";
+    const tStr = (typeof entry.t === "number" ? entry.t : 0) + "ms";
+    time.textContent = tStr;
+    line.appendChild(time);
+
+    const stage = document.createElement("span");
+    stage.className = "nobait-debug-stage";
+    stage.textContent = entry.stage || "?";
+    line.appendChild(stage);
+
+    const status = document.createElement("span");
+    status.className = "nobait-debug-status";
+    status.textContent = (entry.status || "info").toUpperCase();
+    line.appendChild(status);
+
+    const detail = document.createElement("span");
+    detail.className = "nobait-debug-detail";
+    detail.textContent = entry.detail || "";
+    line.appendChild(detail);
+
+    row.appendChild(line);
+
+    if (entry.data && typeof entry.data === "object") {
+      const data = document.createElement("div");
+      data.className = "nobait-debug-data";
+      for (const key in entry.data) {
+        const val = entry.data[key];
+        if (val == null) continue;
+        const kv = document.createElement("div");
+        kv.className = "nobait-debug-kv";
+        const k = document.createElement("span");
+        k.className = "nobait-debug-key";
+        k.textContent = key + ":";
+        kv.appendChild(k);
+        const v = document.createElement("span");
+        v.className = "nobait-debug-val";
+        v.textContent = typeof val === "object" ? JSON.stringify(val) : String(val);
+        kv.appendChild(v);
+        data.appendChild(kv);
+      }
+      row.appendChild(data);
+    }
+
+    return row;
+  }
+
+  // --- copyDebugLog: serializes the response + debug entries as plain text
+  //     so the user can paste it into Claude Code to investigate. Falls back
+  //     to a temporary textarea + execCommand on the off chance the page
+  //     denies clipboard access (some sites override navigator.clipboard). ---
+  function copyDebugLog(response, feedbackEl) {
+    const lines = [];
+    lines.push("NoBait debug log");
+    const head = [];
+    head.push("ok=" + (response.ok ? "true" : "false"));
+    if (response.error) head.push("error=" + response.error);
+    if (response.contentStatus) head.push("contentStatus=" + response.contentStatus);
+    if (response.source) head.push("source=" + response.source);
+    lines.push(head.join(" "));
+    if (response.message) lines.push("message: " + response.message);
+    if (response.summary) {
+      const s = String(response.summary);
+      lines.push("summary: " + (s.length > 400 ? s.substring(0, 400) + "..." : s));
+    }
+    lines.push("---");
+    for (const entry of response.debug || []) {
+      lines.push(
+        "[" + (entry.t || 0) + "ms] " +
+        (entry.stage || "?") + " " +
+        (entry.status || "info") + ": " +
+        (entry.detail || "")
+      );
+      if (entry.data && typeof entry.data === "object") {
+        for (const key in entry.data) {
+          const val = entry.data[key];
+          if (val == null) continue;
+          const str = typeof val === "object" ? JSON.stringify(val) : String(val);
+          lines.push("    " + key + ": " + str);
+        }
+      }
+    }
+    const text = lines.join("\n");
+
+    const flash = (label) => {
+      const prev = feedbackEl.textContent;
+      feedbackEl.textContent = label;
+      setTimeout(() => { feedbackEl.textContent = prev; }, 1200);
+    };
+
+    let copied = false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text)
+          .then(() => flash("Copied!"))
+          .catch(() => flash("Copy failed"));
+        copied = true;
+      }
+    } catch (_) { /* fall through */ }
+
+    if (!copied) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.cssText = "position:fixed;top:-1000px;left:-1000px;";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+        flash("Copied!");
+      } catch (_) {
+        flash("Copy failed");
+      }
+    }
+  }
+
   // --- closePopup: removes the popup host from the DOM ---
   function closePopup() {
     if (activePopupHost) {
@@ -929,6 +1161,9 @@
       .nobait-popup {
         width: 360px;
         max-width: calc(100vw - 32px);
+        max-height: calc(100vh - 40px);
+        display: flex;
+        flex-direction: column;
         background: #ffffff;
         border-radius: 14px;
         box-shadow:
@@ -942,6 +1177,11 @@
         transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1),
                     transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
         will-change: opacity, transform;
+      }
+      .nobait-header,
+      .nobait-headline,
+      .nobait-body {
+        flex: 0 0 auto;
       }
       .nobait-popup.nobait-visible {
         opacity: 1;
@@ -1168,6 +1408,156 @@
       @keyframes nobait-fade-in {
         from { opacity: 0; transform: translateY(4px); }
         to { opacity: 1; transform: translateY(0); }
+      }
+      .nobait-debug-panel {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        border-top: 1px solid #eceef3;
+        background: #fafbfd;
+      }
+      .nobait-debug-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        font-family: inherit;
+        font-size: 11px;
+        font-weight: 600;
+        color: #555;
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        text-align: left;
+        letter-spacing: 0.02em;
+        flex: 0 0 auto;
+      }
+      .nobait-debug-header:hover {
+        background: #f0f1f5;
+      }
+      .nobait-debug-chev {
+        font-size: 10px;
+        color: #888;
+        width: 10px;
+        display: inline-block;
+      }
+      .nobait-debug-title {
+        flex: 1;
+        color: #555;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        font-size: 10px;
+      }
+      .nobait-debug-copy {
+        font-size: 10px;
+        font-weight: 600;
+        padding: 3px 8px;
+        border-radius: 4px;
+        background: #eceff5;
+        color: #555;
+        cursor: pointer;
+        user-select: none;
+      }
+      .nobait-debug-copy:hover {
+        background: #dfe2eb;
+      }
+      .nobait-debug-body {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        padding: 4px 12px 10px;
+        max-height: 240px;
+        font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+        font-size: 10.5px;
+        line-height: 1.5;
+        color: #333;
+      }
+      .nobait-debug-panel.nobait-debug-collapsed .nobait-debug-body {
+        display: none;
+      }
+      .nobait-debug-meta {
+        padding: 4px 0 6px;
+        margin-bottom: 4px;
+        border-bottom: 1px dotted #d8dbe3;
+        color: #5a5a66;
+        font-size: 10px;
+        word-break: break-word;
+      }
+      .nobait-debug-entry {
+        padding: 3px 0;
+        border-bottom: 1px dotted #e8eaf0;
+      }
+      .nobait-debug-entry:last-child {
+        border-bottom: none;
+      }
+      .nobait-debug-line {
+        display: flex;
+        gap: 6px;
+        align-items: baseline;
+        flex-wrap: wrap;
+      }
+      .nobait-debug-time {
+        color: #8a8a92;
+        white-space: pre;
+        min-width: 44px;
+        text-align: right;
+      }
+      .nobait-debug-stage {
+        color: #6c47ff;
+        font-weight: 700;
+      }
+      .nobait-debug-status {
+        font-weight: 700;
+        font-size: 9.5px;
+        padding: 0 4px;
+        border-radius: 3px;
+      }
+      .nobait-debug-ok .nobait-debug-status {
+        color: #166534;
+        background: #dcfce7;
+      }
+      .nobait-debug-fail .nobait-debug-status {
+        color: #991b1b;
+        background: #fee2e2;
+      }
+      .nobait-debug-info .nobait-debug-status {
+        color: #475569;
+        background: #e2e8f0;
+      }
+      .nobait-debug-detail {
+        flex: 1 1 100%;
+        color: #333;
+        word-break: break-word;
+        margin-left: 50px;
+      }
+      .nobait-debug-data {
+        padding-left: 50px;
+        color: #5a5a66;
+      }
+      .nobait-debug-kv {
+        display: flex;
+        gap: 4px;
+        word-break: break-word;
+      }
+      .nobait-debug-key {
+        color: #8a8a92;
+        flex-shrink: 0;
+      }
+      .nobait-debug-val {
+        color: #333;
+        word-break: break-all;
+      }
+      .nobait-debug-body::-webkit-scrollbar {
+        width: 6px;
+      }
+      .nobait-debug-body::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      .nobait-debug-body::-webkit-scrollbar-thumb {
+        background: #ccd1dd;
+        border-radius: 3px;
       }
     `;
   }
