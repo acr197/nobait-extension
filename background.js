@@ -684,6 +684,13 @@ function formatDate(raw) {
   }
 }
 
+// --- isGoogleDomain: returns true for google.com and Google-owned CDN/asset
+//     domains that will never host publisher articles. ---
+function isGoogleDomain(hostname) {
+  const h = hostname.toLowerCase();
+  return /(?:^|\.)(?:google\.com|googleusercontent\.com|gstatic\.com|ggpht\.com|googleapis\.com)$/.test(h);
+}
+
 // --- buildGoogleNewsRssUrl: converts a news.google.com article/read URL to
 //     its /rss/articles/ equivalent (which 302s to the publisher). Returns
 //     null if the URL isn't a Google News redirect stub. ---
@@ -781,7 +788,7 @@ async function discoverPublisherUrl(url) {
     let parsed;
     try { parsed = new URL(finalUrl); } catch (_) { return null; }
     // If HTTP redirect landed on a non-Google domain, we're done.
-    if (!/(?:^|\.)google\.com$/.test(parsed.hostname.toLowerCase())) return finalUrl;
+    if (!isGoogleDomain(parsed.hostname)) return finalUrl;
     // Still on google.com — parse the response body as RSS/Atom to find the
     // publisher link (handles cases where the RSS endpoint returns feed XML
     // instead of issuing a 302 redirect to the article).
@@ -806,7 +813,7 @@ function extractRssArticleLink(xml) {
   while ((m = rssRe.exec(xml)) !== null) {
     try {
       const u = new URL(m[1].trim());
-      if (!/(?:^|\.)google\.com$/.test(u.hostname.toLowerCase())) return u.href;
+      if (!isGoogleDomain(u.hostname)) return u.href;
     } catch (_) {}
   }
   // Atom / Google RSS extension: <link href="https://publisher.com/..." />
@@ -814,7 +821,7 @@ function extractRssArticleLink(xml) {
   while ((m = atomRe.exec(xml)) !== null) {
     try {
       const u = new URL(m[1].trim());
-      if (!/(?:^|\.)google\.com$/.test(u.hostname.toLowerCase())) return u.href;
+      if (!isGoogleDomain(u.hostname)) return u.href;
     } catch (_) {}
   }
   return null;
