@@ -12,10 +12,13 @@ const STATUS_DISPLAY_MS = 1500;
 const longClickEl = document.getElementById("trigger-longclick");
 const shiftClickEl = document.getElementById("trigger-shiftclick");
 const ctrlClickEl = document.getElementById("trigger-ctrlclick");
+const debugModeEl = document.getElementById("setting-debugmode");
 const statusEl = document.getElementById("status");
 
 // --- loadSettings: reads saved trigger state and updates checkboxes.
-//     Uses Promise style so it works on both Chrome (MV3) and Firefox. ---
+//     Uses Promise style so it works on both Chrome (MV3) and Firefox.
+//     debugMode defaults to true if never saved — keeps the user's first
+//     experience loud so they can see the fetch pipeline at work. ---
 function loadSettings() {
   Promise.resolve(api.storage.sync.get([STORAGE_KEY]))
     .then((result) => {
@@ -24,6 +27,7 @@ function loadSettings() {
       if (typeof s.longClick === "boolean") longClickEl.checked = s.longClick;
       if (typeof s.shiftClick === "boolean") shiftClickEl.checked = s.shiftClick;
       if (typeof s.ctrlClick === "boolean") ctrlClickEl.checked = s.ctrlClick;
+      if (typeof s.debugMode === "boolean") debugModeEl.checked = s.debugMode;
     })
     .catch(() => { /* ignore */ });
 }
@@ -34,6 +38,7 @@ function saveSettings() {
     longClick: longClickEl.checked,
     shiftClick: shiftClickEl.checked,
     ctrlClick: ctrlClickEl.checked,
+    debugMode: debugModeEl.checked,
   };
 
   Promise.resolve(api.storage.sync.set({ [STORAGE_KEY]: settings }))
@@ -70,3 +75,4 @@ renderVersion();
 longClickEl.addEventListener("change", saveSettings);
 shiftClickEl.addEventListener("change", saveSettings);
 ctrlClickEl.addEventListener("change", saveSettings);
+debugModeEl.addEventListener("change", saveSettings);
