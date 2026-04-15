@@ -19,6 +19,9 @@ if (typeof browser !== "undefined" && browser.sidebarAction && browser.action) {
 
 // --- Configuration ---
 const PROXY_URL = "https://nobait-proxy.acr197.workers.dev/summarize";
+// Endpoint for OpenAI web-search-powered fallback (gpt-4o-search-preview).
+// The Worker at /search must accept { text, model } and return { summary }.
+const OPENAI_SEARCH_URL = "https://nobait-proxy.acr197.workers.dev/search";
 const FETCH_TIMEOUT_MS = 12000;
 const AI_TIMEOUT_MS = 20000;
 const MAX_CONTENT_LENGTH = 9000;
@@ -158,6 +161,7 @@ const ARTICLE_SOURCE_LABELS = {
   "wayback": "the Wayback Machine",
   "archive_today": "Archive.today",
   "search_result": "a search result",
+  "openai_search": "OpenAI web search",
   "knowledge": "AI knowledge",
 };
 function labelForArticleSource(src) {
@@ -247,11 +251,13 @@ async function handleSummarize(url, headline, mode, sendProgress) {
       debug.log("direct_fetch", "info", "fetching resolved publisher URL", { url: publisherUrl });
       progress("Reading the article\u2026");
       try {
-        articleText = await fetchArticle(publisherUrl);
+        const meta = {};
+        articleText = await fetchArticle(publisherUrl, { meta });
         articleSource = "direct_fetch(google_news_resolved)";
         fetchError = null;
         debug.log("direct_fetch", "ok", `got ${articleText.length} chars`, {
           length: articleText.length,
+          finalUrl: meta.finalUrl || publisherUrl,
           preview: previewText(articleText),
         });
       } catch (err) {
@@ -275,11 +281,14 @@ async function handleSummarize(url, headline, mode, sendProgress) {
     debug.log("direct_fetch", "info", "attempting direct fetch", { url });
     progress("Reading the article\u2026");
     try {
-      articleText = await fetchArticle(url);
+      const meta = {};
+      articleText = await fetchArticle(url, { meta });
       articleSource = "direct_fetch";
       fetchError = null;
       debug.log("direct_fetch", "ok", `got ${articleText.length} chars`, {
         length: articleText.length,
+        finalUrl: meta.finalUrl || url,
+        redirected: meta.httpRedirected || false,
         preview: previewText(articleText),
       });
     } catch (err) {
@@ -402,7 +411,44 @@ async function handleSummarize(url, headline, mode, sendProgress) {
     }
   }
 
-  // Fallback #5: ask the AI as if the user had pasted the headline + publisher
+  // Fallback #5: OpenAI web search (gpt-4o-search-preview). Runs a live web
+  // search specifically for the article headline + publisher, so the AI
+  // reports real article facts rather than guessing from training data.
+  // Requires the Worker's /search endpoint; if it's unavailable the step is
+  // silently skipped and we fall through to ai_knowledge.
+  if (!articleText) {
+    debug.log("openai_search", "info", "attempting OpenAI web search", {
+      headline,
+      url: realUrl,
+    });
+    progress("Searching the web with AI\u2026");
+    try {
+      const searchSummary = await callOpenAIWebSearch(headline, realUrl);
+      if (searchSummary && searchSummary.length >= 100) {
+        debug.log("openai_search", "ok", `got ${searchSummary.length} chars from web search`, {
+          length: searchSummary.length,
+        });
+        debug.log("done", "ok", "returning openai_search summary");
+        return {
+          ok: true,
+          summary: searchSummary,
+          source: "openai_search",
+          articleSource: "openai_search",
+          articleSourceLabel: "OpenAI web search",
+          contentStatus: "from_search",
+          contentStatusMessage:
+            "Article couldn't be fetched directly — answer is from an OpenAI web search.",
+          debug: debug.entries,
+        };
+      } else {
+        debug.log("openai_search", "fail", "web search returned no usable content");
+      }
+    } catch (err) {
+      debug.log("openai_search", "fail", (err && err.message) || "OpenAI web search failed");
+    }
+  }
+
+  // Fallback #6: ask the AI as if the user had pasted the headline + publisher
   // into Claude.ai / ChatGPT. The AI uses web search (if available) or its
   // training knowledge to answer. We flag the response with source:"knowledge"
   // so the popup can show the user that the answer is NOT from the article.
@@ -587,7 +633,10 @@ async function handleAlternateSource(originalUrl, headline, sendProgress) {
       });
       debug.log("ai_summarize", "info", "calling AI on alternate article");
       progress("Summarizing\u2026");
-      const summary = await callAI(article.title || headline, article.text, "short");
+      // Pass the ORIGINAL headline as the question to answer, not the alt
+      // article's title. The alt article is context; the user's question is
+      // still the original headline.
+      const summary = await callAI(article.title || headline, article.text, "short", headline);
       debug.log("ai_summarize", "ok", `AI returned ${summary.length} chars`);
       debug.log("done", "ok", "returning alternate summary");
       const publisher = getPublisherFromUrl(candidate);
@@ -1126,6 +1175,13 @@ async function fetchArticle(url, opts) {
   // We carry it forward so further JS/meta redirects resolve against the real
   // page and not the pre-redirect Google News stub.
   let baseUrl = result.finalUrl || url;
+
+  // Write the first-hop final URL back to caller so debug logs can show
+  // exactly where we landed (e.g. google.com/rss/… → publisher article).
+  if (opts.meta && depth === 0) {
+    opts.meta.finalUrl = baseUrl;
+    opts.meta.httpRedirected = (baseUrl !== url);
+  }
 
   // If the HTML is a JS/meta/canonical redirect stub, hop to the real URL.
   const jsRedirectUrl = extractJsRedirect(html, baseUrl);
@@ -1798,7 +1854,11 @@ function extractText(html) {
     text = text.substring(0, MAX_CONTENT_LENGTH) + "...";
   }
   if (text.length < MIN_CONTENT_LENGTH) {
-    throw createError("fetch_failed", "Couldn't read this article.");
+    const shortLen = text.length;
+    const reason = shortLen === 0
+      ? "The page has no readable text — likely a JavaScript-rendered SPA shell or empty redirect stub."
+      : `Article content was too short (${shortLen} chars). Page may be a stub, thin preview, or paywall landing.`;
+    throw createError("fetch_failed", reason);
   }
   return text;
 }
@@ -2152,12 +2212,16 @@ function extractMetaDescription(html) {
   return null;
 }
 
-// --- callAI: sends the prompt to the Cloudflare Worker proxy ---
-async function callAI(headline, content, mode) {
+// --- callAI: sends the prompt to the Cloudflare Worker proxy.
+//     Optional 4th arg `targetQuestion`: when the article content comes from
+//     an alternate source, this is the ORIGINAL headline (the user's real
+//     question) so the AI answers that question even while reading a different
+//     article. When omitted, headline == targetQuestion (normal path). ---
+async function callAI(headline, content, mode, targetQuestion) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
-  const prompt = buildPrompt(headline, content, mode);
+  const prompt = buildPrompt(headline, content, mode, targetQuestion);
 
   let response;
   try {
@@ -2190,12 +2254,18 @@ async function callAI(headline, content, mode) {
 }
 
 // --- buildPrompt: constructs the full AI prompt from headline + content.
-//     `mode` is "short" (default) or "detailed" (triggered by the user
-//     clicking the "More context" button in the popup). `content` is
-//     guaranteed non-null: callers only invoke the AI path when article
-//     text was successfully fetched. ---
-function buildPrompt(headline, content, mode) {
+//     `mode` is "short" (default) or "detailed" (triggered by "Dig Deeper").
+//     `content` is guaranteed non-null.
+//     Optional `targetQuestion`: when reading an ALTERNATE SOURCE article,
+//     this is the original headline the user wanted answered. The AI must
+//     answer THAT question, treating the alternate article as supporting
+//     evidence rather than the primary subject. ---
+function buildPrompt(headline, content, mode, targetQuestion) {
   const isDetailed = mode === "detailed";
+  const hasAltTarget = targetQuestion && targetQuestion !== headline;
+  const altSourceNote = hasAltTarget
+    ? `\n\nIMPORTANT: You are reading an ALTERNATE SOURCE article (titled below). The user's original question is: "${targetQuestion}". Answer THAT specific question using the alternate article as context. Do NOT summarize the alternate article generically — answer the original question.`
+    : "";
 
   // Never redirect the user back to the article; never lecture; never
   // editorialize. These rules are shared by every variant of the prompt.
@@ -2209,7 +2279,7 @@ function buildPrompt(headline, content, mode) {
 - Headings in the article content are marked with "## " — treat them as section/item titles. They are part of the article, not metadata.`;
 
   if (isDetailed) {
-    return `You are NoBait. The full article text is provided below. Write a 4-6 sentence detailed summary that gives the reader: (1) the specific answer to what the headline was teasing, (2) the concrete facts, names, and numbers FROM THE ARTICLE, (3) meaningful context and background that is present in the article, (4) any caveats or unknowns the article itself mentions. If the headline teases a ranked list, enumerate up to 10 ranked items from the article (use a numbered list). If the article contains more than 10, add "That's the most this summary can list." after the 10th.
+    return `You are NoBait. The full article text is provided below. Write a 4-6 sentence detailed summary that gives the reader: (1) the specific answer to what the headline was teasing, (2) the concrete facts, names, and numbers FROM THE ARTICLE, (3) meaningful context and background that is present in the article, (4) any caveats or unknowns the article itself mentions. If the headline teases a ranked list, enumerate up to 10 ranked items from the article (use a numbered list). If the article contains more than 10, add "That's the most this summary can list." after the 10th.${altSourceNote}
 
 ${RULES}
 
@@ -2221,7 +2291,7 @@ ${content}
 Response:`;
   }
 
-  return `You are NoBait. The article text is provided below. Give the reader the specific concrete information the headline was teasing, drawn ONLY from the article content. Follow the rules below.
+  return `You are NoBait. The article text is provided below. Give the reader the specific concrete information the headline was teasing, drawn ONLY from the article content. Follow the rules below.${altSourceNote}
 
 ${RULES}
 
@@ -2239,6 +2309,47 @@ Article content:
 ${content}
 
 Response:`;
+}
+
+// --- callOpenAIWebSearch: calls the Worker's /search endpoint which routes to
+//     gpt-4o-search-preview with live web search enabled. This runs after
+//     all fetch paths have failed. The prompt asks the model to find the
+//     specific article by headline+publisher and answer what the headline
+//     teases, just like a user would expect from a web-search AI assistant.
+//     Returns null / throws on failure so the caller can fall through. ---
+async function callOpenAIWebSearch(headline, url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+
+  const publisher = getPublisherFromUrl(url);
+  const prompt = [
+    `Find this article and answer the following question based on it: ${headline}`,
+    `Article: ${headline}`,
+    publisher ? `Source: ${publisher}` : "",
+  ].filter(Boolean).join("\n");
+
+  let response;
+  try {
+    response = await fetch(OPENAI_SEARCH_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: prompt, model: "gpt-4o-search-preview" }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === "AbortError") throw new Error("OpenAI search request timed out.");
+    throw new Error("Could not reach the OpenAI search endpoint.");
+  }
+
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    throw new Error(`OpenAI search endpoint returned HTTP ${response.status}.`);
+  }
+
+  const data = await response.json();
+  return (data && data.summary) ? data.summary : null;
 }
 
 // --- callAISearch: final-resort AI call used when every fetch path failed.

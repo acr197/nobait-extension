@@ -565,7 +565,8 @@ body {
 .sb-modal-actions {
   display: flex;
   gap: 8px;
-  margin-top: 14px;
+  margin-top: 12px;
+  padding-bottom: 2px;
   flex-wrap: wrap;
 }
 
