@@ -1724,27 +1724,58 @@ async function fetchSearchEngineHtml(url) {
   return await response.text();
 }
 
+// --- decodeBingRedirect: Bing wraps organic result URLs in bing.com/ck/a
+//     redirect links. The real destination is base64url-encoded in the `u`
+//     query parameter with an "a1" sentinel prefix:
+//       https://www.bing.com/ck/a?!&&p=...&u=a1<base64url>&ntb=1
+//     Strip the "a1" prefix, restore standard base64 padding, atob-decode,
+//     then validate the result is a real http(s) URL. Returns the input href
+//     unchanged if it is not a Bing redirect or decoding fails. ---
+function decodeBingRedirect(href) {
+  try {
+    const u = new URL(href);
+    if ((u.hostname !== "bing.com" && u.hostname !== "www.bing.com") ||
+        !u.pathname.startsWith("/ck/a")) return href;
+    const uParam = u.searchParams.get("u");
+    if (!uParam || !uParam.startsWith("a1")) return href;
+    // Strip the "a1" sentinel prefix, then convert base64url → standard base64.
+    let b64 = uParam.slice(2).replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4 !== 0) b64 += "=";
+    const decoded = atob(b64);
+    const real = new URL(decoded);
+    if (real.protocol === "http:" || real.protocol === "https:") return real.href;
+    return href;
+  } catch (_) {
+    return href;
+  }
+}
+
 // --- parseBingResults: extracts result URLs from a Bing search HTML page.
-//     Bing ships result anchors as `<h2><a href="https://real.url/...">`
-//     inside `<li class="b_algo">` items. We match the href attributes of
-//     those anchors and filter to external http(s) URLs. ---
+//     Bing ships result anchors as `<h2><a href="https://www.bing.com/ck/a...">
+//     inside `<li class="b_algo">` items. The href is a Bing redirect whose
+//     real destination is base64url-encoded in the `u` query parameter.
+//     We decode that redirect before applying host filtering. ---
 function parseBingResults(html) {
   if (!html) return [];
   const urls = [];
-  // Target anchors inside b_algo items. The simpler regex catches all
-  // h2 > a hrefs which in practice are organic result URLs on Bing.
+  // Target anchors inside b_algo items. Each href is typically a
+  // bing.com/ck/a redirect — decodeBingRedirect resolves it to the real URL
+  // before we add it to the list, so downstream host filtering and
+  // deduplication operate on the actual destination domain.
   const re = /<li[^>]+class\s*=\s*["'][^"']*b_algo[^"']*["'][\s\S]*?<h2[^>]*>\s*<a[^>]+href\s*=\s*["']([^"']+)["']/gi;
   let m;
   while ((m = re.exec(html)) !== null) {
-    const url = m[1];
-    if (/^https?:\/\//i.test(url)) urls.push(url);
+    const raw = m[1];
+    const decoded = decodeBingRedirect(raw);
+    if (/^https?:\/\//i.test(decoded)) urls.push(decoded);
   }
-  // Fallback: if Bing changed markup, grab any h2 > a href.
+  // Fallback: if Bing changed markup, grab any h2 > a href and decode it.
   if (urls.length === 0) {
     const fb = /<h2[^>]*>\s*<a[^>]+href\s*=\s*["'](https?:\/\/[^"']+)["']/gi;
     let m2;
     while ((m2 = fb.exec(html)) !== null) {
-      urls.push(m2[1]);
+      const decoded = decodeBingRedirect(m2[1]);
+      if (/^https?:\/\//i.test(decoded)) urls.push(decoded);
     }
   }
   return urls;
@@ -2487,7 +2518,17 @@ async function callProxyWebSearch(headline, url) {
   clearTimeout(timer);
 
   if (!response.ok) {
-    throw new Error(`AI proxy returned HTTP ${response.status}.`);
+    // Read the Worker's JSON error body so the detail (OpenAI status, model
+    // error message, etc.) is visible in the extension's debug log.
+    let workerDetail = "";
+    try {
+      const errBody = await response.json();
+      workerDetail = errBody.detail || errBody.error || "";
+    } catch (_) { /* non-JSON error body — ignore */ }
+    throw new Error(
+      `AI proxy returned HTTP ${response.status}` +
+      (workerDetail ? ": " + workerDetail : "") + "."
+    );
   }
 
   let data;
@@ -2536,7 +2577,17 @@ async function callAISearch(headline, url, mode) {
   clearTimeout(timer);
 
   if (!response.ok) {
-    throw new Error(`AI service returned an error (HTTP ${response.status}).`);
+    // Read the Worker's JSON error body so the detail (OpenAI status, model
+    // error message, etc.) is visible in the extension's debug log.
+    let workerDetail = "";
+    try {
+      const errBody = await response.json();
+      workerDetail = errBody.detail || errBody.error || "";
+    } catch (_) { /* non-JSON error body — ignore */ }
+    throw new Error(
+      `AI service returned an error (HTTP ${response.status})` +
+      (workerDetail ? ": " + workerDetail : "") + "."
+    );
   }
 
   let data;

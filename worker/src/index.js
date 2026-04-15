@@ -22,7 +22,7 @@
 // Model: defaults to gpt-5 via the OpenAI Responses API
 // (POST https://api.openai.com/v1/responses).
 
-const WORKER_VERSION = "1.0.1";
+const WORKER_VERSION = "1.0.2";
 const DEFAULT_MODEL = "gpt-5";
 const OPENAI_URL = "https://api.openai.com/v1/responses";
 // Conservative upstream timeout so a slow model response doesn't hold the
@@ -50,6 +50,25 @@ function json(body, status, extraHeaders) {
 
 export default {
   async fetch(request, env) {
+    // Top-level catch ensures the Worker always returns JSON and never lets
+    // Cloudflare serve its generic HTML 500 page, which the extension can't
+    // parse and which produces a silent failure in the debug log.
+    try {
+      return await handleRequest(request, env);
+    } catch (err) {
+      return json(
+        {
+          error: "internal_error",
+          detail: (err && err.message) || String(err),
+          version: WORKER_VERSION,
+        },
+        500,
+      );
+    }
+  },
+};
+
+async function handleRequest(request, env) {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
@@ -167,8 +186,7 @@ export default {
       model: DEFAULT_MODEL,
       version: WORKER_VERSION,
     });
-  },
-};
+}
 
 // Walk the OpenAI Responses API payload and return the concatenated text.
 // Supports both the convenience `output_text` field and the canonical
