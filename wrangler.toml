@@ -1,0 +1,16 @@
+# Cloudflare Worker config for the NoBait AI proxy.
+#
+# Deployed via Cloudflare's GitHub integration (Workers Builds): every push
+# to `main` that changes this file or `worker/src/**` triggers a build and
+# redeploys https://nobait-proxy.acr197.workers.dev.
+#
+# Required Cloudflare secrets (set ONCE via the dashboard or
+# `wrangler secret put OPENAI_API_KEY`; do NOT commit):
+#   OPENAI_API_KEY  — OpenAI API key with access to the Responses API
+#                     and the `gpt-5` model.
+
+name = "nobait-proxy"
+main = "worker/src/index.js"
+compatibility_date = "2025-04-01"
+# nodejs_compat is not required; the Worker only uses the standard fetch /
+# Web Crypto / URL APIs exposed by the Workers runtime.
