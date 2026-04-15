@@ -225,6 +225,11 @@ async function handleSummarize(url, headline, mode, sendProgress) {
       // --- Attempt 2: follow HTTP redirect / parse RSS body ---
       const { publisherUrl: discovered, htmlBody } = await discoverPublisherUrl(googleNewsRss);
       htmlBodyForFallback = htmlBody;
+      debug.log("google_news", "info", "RSS fetch result", {
+        publisherFound: !!discovered,
+        discoveredUrl: discovered || null,
+        htmlBodyLength: htmlBody ? htmlBody.length : null,
+      });
 
       if (discovered && isValidPublisherUrl(discovered)) {
         publisherUrl = discovered;
@@ -239,7 +244,65 @@ async function handleSummarize(url, headline, mode, sendProgress) {
           const extracted = extractArticleUrlFromHtml(htmlBodyForFallback);
           if (extracted && isValidPublisherUrl(extracted)) {
             publisherUrl = extracted;
-            debug.log("google_news", "info", "extracted publisher URL from HTML body", { publisherUrl });
+            debug.log("google_news", "ok", "extracted publisher URL from RSS HTML body", { publisherUrl });
+          } else {
+            debug.log("google_news", "info", "HTML extraction found no valid URL", {
+              extractedUrl: extracted || null,
+              htmlPreview: htmlBodyForFallback.substring(0, 300),
+            });
+          }
+        } else {
+          debug.log("google_news", "info", "no HTML body from RSS fetch (possible network failure or non-HTML response)");
+        }
+      }
+
+      // --- Attempt 4: retry RSS URL without localization query parameters.
+      //     Google sometimes returns a JS-redirect HTML stub instead of a 302
+      //     when locale params are present; stripping them may yield a clean redirect. ---
+      if (!publisherUrl && googleNewsRss.includes("?")) {
+        const cleanRss = googleNewsRss.split("?")[0];
+        debug.log("google_news", "info", "retrying RSS URL without query params", { url: cleanRss });
+        const { publisherUrl: clean, htmlBody: cleanHtml } = await discoverPublisherUrl(cleanRss);
+        if (clean && isValidPublisherUrl(clean)) {
+          publisherUrl = clean;
+          debug.log("google_news", "ok", "resolved via clean RSS URL (no query params)", { publisherUrl });
+        } else if (cleanHtml) {
+          const extracted = extractArticleUrlFromHtml(cleanHtml);
+          if (extracted && isValidPublisherUrl(extracted)) {
+            publisherUrl = extracted;
+            debug.log("google_news", "ok", "extracted publisher URL from clean RSS HTML", { publisherUrl });
+          } else {
+            debug.log("google_news", "info", "clean RSS HTML extraction also found no valid URL", {
+              extractedUrl: extracted || null,
+            });
+          }
+        }
+      }
+
+      // --- Attempt 5: fetch the non-RSS /articles/ path directly.
+      //     The /rss/articles/ and /articles/ server paths sometimes behave
+      //     differently — one may HTTP-302 cleanly where the other returns HTML. ---
+      if (!publisherUrl) {
+        const articleUrl = googleNewsRss
+          .replace(/\/rss\/articles\//, "/articles/")
+          .split("?")[0];
+        if (articleUrl !== googleNewsRss) {
+          debug.log("google_news", "info", "retrying as /articles/ path (non-RSS)", { url: articleUrl });
+          const { publisherUrl: direct, htmlBody: directHtml } = await discoverPublisherUrl(articleUrl);
+          if (direct && isValidPublisherUrl(direct)) {
+            publisherUrl = direct;
+            debug.log("google_news", "ok", "resolved via /articles/ path", { publisherUrl });
+          } else if (directHtml) {
+            const extracted = extractArticleUrlFromHtml(directHtml);
+            if (extracted && isValidPublisherUrl(extracted)) {
+              publisherUrl = extracted;
+              debug.log("google_news", "ok", "extracted publisher URL from /articles/ HTML", { publisherUrl });
+            } else {
+              debug.log("google_news", "info", "/articles/ HTML extraction found no valid URL", {
+                extractedUrl: extracted || null,
+                htmlPreview: directHtml.substring(0, 300),
+              });
+            }
           }
         }
       }
@@ -409,8 +472,9 @@ async function handleSummarize(url, headline, mode, sendProgress) {
       originalUrl: searchUrl,
     });
     progress("Searching the web for this story\u2026");
+    const searchLog = (detail, data) => debug.log("search", "info", detail, data);
     try {
-      articleText = await fetchViaSearchResults(headline, searchUrl);
+      articleText = await fetchViaSearchResults(headline, searchUrl, searchLog);
       if (articleText) {
         articleSource = "search_result";
         fetchError = null;
@@ -463,7 +527,9 @@ async function handleSummarize(url, headline, mode, sendProgress) {
         debug.log("openai_search", "fail", "web search returned no usable content");
       }
     } catch (err) {
-      debug.log("openai_search", "fail", (err && err.message) || "OpenAI web search failed");
+      const msg = (err && err.message) || "OpenAI web search failed";
+      const hint = !OPENAI_API_KEY ? " (OPENAI_API_KEY is empty — set it in background.js)" : "";
+      debug.log("openai_search", "fail", msg + hint);
     }
   }
 
@@ -1506,7 +1572,9 @@ async function fetchViaArchiveToday(url) {
 //          first one that yields enough text.
 //       5. If no candidate fetches cleanly, fall back to Jina Reader on the
 //          top candidate so we still get SOMETHING real. ---
-async function fetchViaSearchResults(headline, originalUrl) {
+async function fetchViaSearchResults(headline, originalUrl, onDebug) {
+  const log = typeof onDebug === "function" ? onDebug : () => {};
+
   if (!headline) throw createError("fetch_failed", "No headline for search lookup.");
 
   // Build a tight query. Quoting the headline greatly improves precision;
@@ -1516,19 +1584,62 @@ async function fetchViaSearchResults(headline, originalUrl) {
   const publisher = originalUrl ? getPublisherFromUrl(originalUrl) : "";
   const query = publisher ? quoted + " " + publisher : quoted;
 
+  log("search query", { query, publisher: publisher || null, exactPhrase: true });
+
   // Try Bing first, then DuckDuckGo. Collect the union of candidate URLs
   // — a broken parser on one engine shouldn't starve us of results.
   let candidates = [];
   try {
     const bingHtml = await fetchSearchEngineHtml(BING_SEARCH_URL + "?q=" + encodeURIComponent(query));
-    candidates = candidates.concat(parseBingResults(bingHtml));
-  } catch (_) { /* try next engine */ }
+    const bingRaw = parseBingResults(bingHtml);
+    // Heuristic: a very short response with no results usually means CAPTCHA / bot block.
+    const bingBlocked = bingRaw.length === 0 && bingHtml.length < 6000;
+    log(`Bing: ${bingRaw.length} raw results${bingBlocked ? " (CAPTCHA/block suspected)" : ""}`, {
+      rawCount: bingRaw.length,
+      htmlLength: bingHtml.length,
+      captchaSuspected: bingBlocked,
+    });
+    candidates = candidates.concat(bingRaw);
+  } catch (err) {
+    log("Bing request failed", { error: (err && err.message) || String(err) });
+  }
 
   if (candidates.length < MAX_SEARCH_CANDIDATES) {
     try {
       const ddgHtml = await fetchSearchEngineHtml(DUCKDUCKGO_SEARCH_URL + "?q=" + encodeURIComponent(query));
-      candidates = candidates.concat(parseDuckDuckGoResults(ddgHtml));
-    } catch (_) { /* ignore */ }
+      const ddgRaw = parseDuckDuckGoResults(ddgHtml);
+      const ddgBlocked = ddgRaw.length === 0 && ddgHtml.length < 6000;
+      log(`DDG: ${ddgRaw.length} raw results${ddgBlocked ? " (CAPTCHA/block suspected)" : ""}`, {
+        rawCount: ddgRaw.length,
+        htmlLength: ddgHtml.length,
+        captchaSuspected: ddgBlocked,
+      });
+      candidates = candidates.concat(ddgRaw);
+    } catch (err) {
+      log("DDG request failed", { error: (err && err.message) || String(err) });
+    }
+  }
+
+  // If exact-phrase search returned nothing, retry without quotes. Bing/DDG
+  // sometimes refuse exact-phrase queries for breaking-news articles that
+  // aren't yet fully indexed.
+  if (candidates.length === 0) {
+    const broadQuery = headline.trim() + (publisher ? " " + publisher : "");
+    log("retrying without quotes (exact-phrase search returned 0 results)", { query: broadQuery });
+    try {
+      const bingHtml = await fetchSearchEngineHtml(BING_SEARCH_URL + "?q=" + encodeURIComponent(broadQuery));
+      const bingRaw = parseBingResults(bingHtml);
+      log(`Bing (unquoted): ${bingRaw.length} raw results`, { rawCount: bingRaw.length, htmlLength: bingHtml.length });
+      candidates = candidates.concat(bingRaw);
+    } catch (_) {}
+    if (candidates.length < MAX_SEARCH_CANDIDATES) {
+      try {
+        const ddgHtml = await fetchSearchEngineHtml(DUCKDUCKGO_SEARCH_URL + "?q=" + encodeURIComponent(broadQuery));
+        const ddgRaw = parseDuckDuckGoResults(ddgHtml);
+        log(`DDG (unquoted): ${ddgRaw.length} raw results`, { rawCount: ddgRaw.length, htmlLength: ddgHtml.length });
+        candidates = candidates.concat(ddgRaw);
+      } catch (_) {}
+    }
   }
 
   // Dedupe by hostname+path and filter out the original URL and non-article
@@ -1536,15 +1647,23 @@ async function fetchViaSearchResults(headline, originalUrl) {
   const seen = new Set();
   const originalKey = canonicalizeForCompare(originalUrl);
   const filtered = [];
+  const rejected = [];
   for (const candidate of candidates) {
     const key = canonicalizeForCompare(candidate);
-    if (!key || seen.has(key)) continue;
+    if (!key || seen.has(key)) { rejected.push({ url: candidate, reason: "duplicate/invalid" }); continue; }
     seen.add(key);
-    if (key === originalKey) continue;
-    if (isBlockedSearchHost(candidate)) continue;
+    if (originalKey && key === originalKey) { rejected.push({ url: candidate, reason: "same as original" }); continue; }
+    if (isBlockedSearchHost(candidate)) { rejected.push({ url: candidate, reason: "blocked host" }); continue; }
     filtered.push(candidate);
     if (filtered.length >= MAX_SEARCH_CANDIDATES) break;
   }
+
+  if (rejected.length > 0) {
+    log(`filtered out ${rejected.length} of ${candidates.length} total candidates`, {
+      rejected: rejected.slice(0, 8),
+    });
+  }
+  log(`${filtered.length} candidate(s) to fetch`, { candidates: filtered });
 
   if (filtered.length === 0) {
     throw createError("fetch_failed", "Search returned no usable results.");
@@ -2453,17 +2572,16 @@ function buildSearchPrompt(headline, url, mode) {
   const publisherLine = publisher ? `Publisher: ${publisher}\n` : "";
 
   const RULES = `HARD CONSTRAINTS:
-- Always attempt an answer. NEVER say "I don't have specific information about this article", "I cannot access", "I'm unable to", or anything that refuses to answer. If the exact article is unknown, give the best answer based on context, general knowledge, and what is likely true given the headline and publisher. Label your response as approximate if needed, but always answer.
-- NEVER fabricate specific names, dates, numbers, quotes, or list items you are not confident about. If uncertain about specifics, give what you do know and state what is unknown in one short phrase.
-- Never tell the reader to "read the article", "visit the site", "check the link", "for more information", or anything similar. The user came here specifically to NOT do that.
-- No editorializing. No opinions. No labeling anything as "clickbait", "bait", "misleading", or similar judgmental terms.
-- No political commentary. No personal recommendations.
-- No "according to my training data", "based on what I know", or similar meta-commentary — just answer.`;
+- Always attempt a specific, substantive answer. NEVER say "I don't have specific information", "I cannot access", "details are not available", "specific details are not provided", or any variant of refusing to answer. Even if you cannot confirm the exact article, use your training knowledge to give the most probable answer — then qualify if needed ("likely", "as of [date]", "based on available reporting"). Label your response as approximate rather than refusing.
+- When the headline names a specific analyst, firm, or institution (e.g. "Piper Sandler", "Goldman Sachs", "Morgan Stanley"), use whatever you know about their published research, stock picks, price targets, or public statements to name the specific stock, company, or recommendation they were referring to. Do not give only a category answer ("a cloud company") when you can name the specific one.
+- NEVER fabricate numbers, dates, or quotes you aren't confident about. If genuinely uncertain about a specific, give your best inference and note the uncertainty briefly.
+- Never tell the reader to "read the article", "visit the site", "check the link", or anything similar.
+- No editorializing. No opinions. No "according to my training data" or similar meta-commentary — just answer.`;
 
   if (isDetailed) {
-    return `You are NoBait. The extension could not fetch this news article directly. Answer the user's implicit question about what the headline teases, using your training knowledge. Always attempt a substantive answer.
+    return `You are NoBait. The extension could not fetch this news article directly. Give the most specific, useful answer you can from your training knowledge. Always name names — if the headline references a company, person, stock, or place that you can identify, identify it.
 
-Write a 4-6 sentence detailed answer giving: (1) the specific answer to what the headline was teasing, (2) concrete facts, names, and numbers you are confident about, (3) meaningful context and background, (4) any caveats or unknowns. If the headline teases a ranked list, enumerate up to 10 items as a numbered list (use only items you are confident about). If there are more than 10, add "That's the most this summary can list." after the 10th.
+Write a 4-6 sentence detailed answer giving: (1) the specific answer to what the headline was teasing (name the company/person/place/number), (2) concrete facts you are confident about, (3) meaningful context and background, (4) any caveats or unknowns. If the headline teases a ranked list, enumerate up to 10 items as a numbered list. If there are more than 10, add "That's the most this summary can list." after the 10th.
 
 ${RULES}
 
@@ -2472,17 +2590,18 @@ ${publisherLine}
 Response:`;
   }
 
-  return `You are NoBait. The extension could not fetch this news article directly. Answer the user's implicit question about what the headline teases, using your training knowledge. Always attempt a substantive answer.
+  return `You are NoBait. The extension could not fetch this news article directly. Give the most specific, useful answer you can from your training knowledge. Always name names — if the headline references a company, person, stock, or place that you can identify, identify it.
 
 ${RULES}
 
 ANSWER STYLE — follow whichever case fits:
-- Yes/No question headline ("Can you X by doing Y?", "Is X doing Y?"): start with "Yes" or "No", then one short clarifying phrase with the key specific. Do not write a paragraph.
-- Headline teases a single name, place, price, rank, number, or short noun ("The #1 city to visit is…", "The actor who…", "The one trick…"): answer with JUST that noun or 2-3 words. Do not pad it into a full sentence.
-- Headline teases a ranked or numbered list ("The 20 greatest X, ranked", "Top 10 Y", "The 5 best Z"): return a numbered list of up to 10 items you are confident about. For each item, give the item name plus any short identifying detail (year, artist, location, etc.) — one item per line. If there are more than 10, add exactly one short line after the 10th: "That's the most this summary can list."
+- Analyst/firm recommendation headline ("says Piper Sandler", "says Goldman", "says JPMorgan" etc.): name the specific stock, company, or asset the analyst was recommending, along with any price target or rating you know about. Do not give only a category like "a cloud company".
+- Yes/No question headline: start with "Yes" or "No", then one short clarifying phrase with the key specific. Do not write a paragraph.
+- Headline teases a single name, place, price, rank, number, or short noun: answer with JUST that noun or 2-3 words. Do not pad it into a full sentence.
+- Headline teases a ranked or numbered list ("The 20 greatest X, ranked", "Top 10 Y"): return a numbered list of up to 10 items you are confident about, one per line, with a short identifying detail each. Add "That's the most this summary can list." after the 10th if there are more.
 - Named person headline ("Who is X?", "X appointed as…"): give a 1-2 sentence factual description of who the person is and their relevance.
 - Location headline ("Where is X?", "The city that…"): name the location and give a brief identifying detail.
-- Otherwise: answer in at most 2-3 tight factual sentences with concrete specifics (exact dates, exact numbers, exact names, exact outcomes). If only partial information is known, state what IS known and note what is uncertain in one phrase.
+- Otherwise: answer in at most 2-3 tight factual sentences with concrete specifics (exact names, numbers, outcomes). If only partial information is known, state what IS known and note what is uncertain in one phrase.
 
 Never restate the headline.
 
