@@ -129,17 +129,43 @@ async function handleSummarize(url, headline, mode) {
 
   if (googleNewsRss) {
     debug.log("google_news", "info", "Google News stub detected, resolving publisher URL");
-    let publisherUrl = decodeGoogleNewsUrl(url);
-    if (publisherUrl) {
+
+    let publisherUrl = null;
+    let htmlBodyForFallback = null;
+
+    // --- Attempt 1: base64 decode (no network call) ---
+    const decoded = decodeGoogleNewsUrl(url);
+    if (decoded && isValidPublisherUrl(decoded)) {
+      publisherUrl = decoded;
       debug.log("google_news", "ok", "decoded from base64 article id", { publisherUrl });
     } else {
-      publisherUrl = await discoverPublisherUrl(googleNewsRss);
-      if (publisherUrl) {
+      if (decoded) {
+        debug.log("google_news", "info", "decoded URL failed validation (image/CDN URL), skipping", { invalidUrl: decoded });
+      }
+
+      // --- Attempt 2: follow HTTP redirect / parse RSS body ---
+      const { publisherUrl: discovered, htmlBody } = await discoverPublisherUrl(googleNewsRss);
+      htmlBodyForFallback = htmlBody;
+
+      if (discovered && isValidPublisherUrl(discovered)) {
+        publisherUrl = discovered;
         debug.log("google_news", "ok", "resolved via RSS redirect", { publisherUrl });
       } else {
-        debug.log("google_news", "fail", "could not resolve publisher URL");
+        if (discovered) {
+          debug.log("google_news", "info", "resolved URL failed validation (image/CDN URL), trying HTML extraction", { invalidUrl: discovered });
+        }
+
+        // --- Attempt 3: extract canonical / og:url / first external href ---
+        if (htmlBodyForFallback) {
+          const extracted = extractArticleUrlFromHtml(htmlBodyForFallback);
+          if (extracted && isValidPublisherUrl(extracted)) {
+            publisherUrl = extracted;
+            debug.log("google_news", "info", "extracted publisher URL from HTML body", { publisherUrl });
+          }
+        }
       }
     }
+
     if (publisherUrl) {
       realUrl = publisherUrl;
       debug.log("direct_fetch", "info", "fetching resolved publisher URL", { url: publisherUrl });
@@ -157,6 +183,10 @@ async function handleSummarize(url, headline, mode) {
           errorType: fetchError.type,
         });
       }
+    } else {
+      debug.log("google_news", "fail", "could not resolve publisher URL", {
+        errorType: "fetch_failed",
+      });
     }
   }
 
@@ -691,6 +721,28 @@ function isGoogleDomain(hostname) {
   return /(?:^|\.)(?:google\.com|googleusercontent\.com|gstatic\.com|ggpht\.com|googleapis\.com)$/.test(h);
 }
 
+// --- isValidPublisherUrl: returns false for URLs that are clearly not article
+//     pages — googleusercontent.com thumbnails/favicons, image resize CDN
+//     URLs (=w16, =w32, …), and bare image file paths. We check this after
+//     every Google News resolution attempt so image URLs extracted by mistake
+//     from base64 article IDs or HTML/RSS bodies never reach the fetch
+//     pipeline. ---
+function isValidPublisherUrl(url) {
+  try {
+    const u = new URL(url);
+    const h = u.hostname.toLowerCase();
+    // Reject all *.googleusercontent.com (thumbnails, favicons, profile pics…)
+    if (/(?:^|\.)googleusercontent\.com$/.test(h)) return false;
+    // Reject image-resize CDN parameters like =w16, =w32, =w256
+    if (/=w\d+/.test(u.href)) return false;
+    // Reject bare image file extensions
+    if (/\.(png|jpg|jpeg|ico|gif|webp)(\?.*)?$/i.test(u.pathname)) return false;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 // --- buildGoogleNewsRssUrl: converts a news.google.com article/read URL to
 //     its /rss/articles/ equivalent (which 302s to the publisher). Returns
 //     null if the URL isn't a Google News redirect stub. ---
@@ -763,12 +815,14 @@ function decodeGoogleNewsUrl(url) {
 }
 
 // --- discoverPublisherUrl: follows the redirect chain of a Google News RSS
-//     stub URL and returns the final publisher article URL. Two strategies:
+//     stub URL and returns { publisherUrl, htmlBody }. Two strategies:
 //     1. HTTP redirect: if fetch() lands on a non-Google domain, return it.
-//     2. RSS body parse: if the response stays on google.com (e.g. the RSS
-//        endpoint returned feed XML rather than redirecting), read the body
-//        and extract the publisher <link> from the feed. Returns null on any
-//        error or if no publisher URL can be found. ---
+//     2. RSS/HTML body parse: if the response stays on google.com (e.g. the
+//        RSS endpoint returned feed XML or an HTML page rather than issuing a
+//        302 redirect), read the body and extract the publisher <link> from
+//        the feed. htmlBody is always populated when the response stays on
+//        google.com so the caller can run additional HTML extraction if needed.
+//     Returns { publisherUrl: null, htmlBody: null } on any error. ---
 async function discoverPublisherUrl(url) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8000);
@@ -784,21 +838,23 @@ async function discoverPublisherUrl(url) {
     });
     clearTimeout(timer);
     const finalUrl = resp.url;
-    if (!finalUrl) return null;
+    if (!finalUrl) return { publisherUrl: null, htmlBody: null };
     let parsed;
-    try { parsed = new URL(finalUrl); } catch (_) { return null; }
+    try { parsed = new URL(finalUrl); } catch (_) { return { publisherUrl: null, htmlBody: null }; }
     // If HTTP redirect landed on a non-Google domain, we're done.
-    if (!isGoogleDomain(parsed.hostname)) return finalUrl;
+    if (!isGoogleDomain(parsed.hostname)) return { publisherUrl: finalUrl, htmlBody: null };
     // Still on google.com — parse the response body as RSS/Atom to find the
     // publisher link (handles cases where the RSS endpoint returns feed XML
-    // instead of issuing a 302 redirect to the article).
+    // or an HTML page instead of issuing a 302 redirect to the article).
+    // Return the raw body too so the caller can run HTML extraction if the
+    // RSS link turns out to be an image/CDN URL.
     try {
-      const body = await resp.text();
-      return extractRssArticleLink(body);
-    } catch (_) { return null; }
+      const htmlBody = await resp.text();
+      return { publisherUrl: extractRssArticleLink(htmlBody), htmlBody };
+    } catch (_) { return { publisherUrl: null, htmlBody: null }; }
   } catch (_) {
     clearTimeout(timer);
-    return null;
+    return { publisherUrl: null, htmlBody: null };
   }
 }
 
@@ -824,6 +880,53 @@ function extractRssArticleLink(xml) {
       if (!isGoogleDomain(u.hostname)) return u.href;
     } catch (_) {}
   }
+  return null;
+}
+
+// --- extractArticleUrlFromHtml: scans an HTML document for the real article
+//     URL using three strategies in priority order:
+//       1. <link rel="canonical" href="…">
+//       2. <meta property="og:url" content="…">
+//       3. First href attribute that points to a non-Google, non-googleapis
+//          domain.
+//     Returns the first non-Google URL found, or null. ---
+function extractArticleUrlFromHtml(html) {
+  if (!html) return null;
+
+  // Strategy 1: canonical link tag (attribute order can vary)
+  const canonicalRe =
+    /<link\b[^>]*\brel\s*=\s*["']canonical["'][^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>|<link\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*\brel\s*=\s*["']canonical["'][^>]*>/gi;
+  let m;
+  while ((m = canonicalRe.exec(html)) !== null) {
+    const href = (m[1] || m[2] || "").trim();
+    if (!href) continue;
+    try {
+      const u = new URL(href);
+      if (!isGoogleDomain(u.hostname)) return u.href;
+    } catch (_) {}
+  }
+
+  // Strategy 2: og:url meta tag (attribute order can vary)
+  const ogRe =
+    /<meta\b[^>]*\bproperty\s*=\s*["']og:url["'][^>]*\bcontent\s*=\s*["']([^"']+)["'][^>]*>|<meta\b[^>]*\bcontent\s*=\s*["']([^"']+)["'][^>]*\bproperty\s*=\s*["']og:url["'][^>]*>/gi;
+  while ((m = ogRe.exec(html)) !== null) {
+    const content = (m[1] || m[2] || "").trim();
+    if (!content) continue;
+    try {
+      const u = new URL(content);
+      if (!isGoogleDomain(u.hostname)) return u.href;
+    } catch (_) {}
+  }
+
+  // Strategy 3: first absolute href not on a Google domain
+  const hrefRe = /\bhref\s*=\s*["'](https?:\/\/[^"'#\s]+)["']/gi;
+  while ((m = hrefRe.exec(html)) !== null) {
+    try {
+      const u = new URL(m[1].trim());
+      if (!isGoogleDomain(u.hostname)) return u.href;
+    } catch (_) {}
+  }
+
   return null;
 }
 
