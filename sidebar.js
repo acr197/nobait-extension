@@ -304,12 +304,19 @@
     setTimeout(() => {
       if (!modalEl.classList.contains("is-open")) {
         modalEl.classList.add("hidden");
-        // Reset body to loading state for the next open
+        // Reset body to fresh loading state for the next open
         modalBodyEl.innerHTML = "";
+        const contentEl = document.createElement("div");
+        contentEl.className = "sb-modal-content";
         const loading = document.createElement("div");
         loading.className = "sb-modal-loading";
         loading.innerHTML = '<div class="sb-spinner"></div><div class="sb-modal-loading-text">Analyzing article\u2026</div>';
-        modalBodyEl.appendChild(loading);
+        contentEl.appendChild(loading);
+        modalBodyEl.appendChild(contentEl);
+        const actionsEl = document.createElement("div");
+        actionsEl.className = "sb-modal-actions";
+        actionsEl.style.display = "none";
+        modalBodyEl.appendChild(actionsEl);
       }
     }, 220);
   }
@@ -390,12 +397,29 @@
   }
 
   function showModalLoading() {
-    modalBodyEl.innerHTML = "";
+    let contentEl = modalBodyEl.querySelector(".sb-modal-content");
+    if (!contentEl) {
+      // First call — set up the two-zone structure.
+      modalBodyEl.innerHTML = "";
+      contentEl = document.createElement("div");
+      contentEl.className = "sb-modal-content";
+      modalBodyEl.appendChild(contentEl);
+      const actionsEl = document.createElement("div");
+      actionsEl.className = "sb-modal-actions";
+      actionsEl.style.display = "none";
+      modalBodyEl.appendChild(actionsEl);
+    } else {
+      // Subsequent call — only clear the content zone; actions zone persists
+      // so any grayed-out button remains visible during loading.
+      contentEl.innerHTML = "";
+      const dbg = modalBodyEl.querySelector(".sb-debug-panel");
+      if (dbg) dbg.remove();
+    }
     const loading = document.createElement("div");
     loading.className = "sb-modal-loading";
     loading.innerHTML =
       '<div class="sb-spinner"></div><div class="sb-modal-loading-text">Analyzing article\u2026</div>';
-    modalBodyEl.appendChild(loading);
+    contentEl.appendChild(loading);
   }
 
   // --- renderSummary: displays the AI summary in the sidebar modal. Called
@@ -405,7 +429,20 @@
   //         web search / training data. We show an amber banner so the
   //         reader can tell which kind of answer they're looking at. ---
   function renderSummary(response, link, mode) {
-    modalBodyEl.innerHTML = "";
+    let contentEl = modalBodyEl.querySelector(".sb-modal-content");
+    let actionsEl = modalBodyEl.querySelector(".sb-modal-actions");
+    if (!contentEl) {
+      modalBodyEl.innerHTML = "";
+      contentEl = document.createElement("div");
+      contentEl.className = "sb-modal-content";
+      modalBodyEl.appendChild(contentEl);
+      actionsEl = document.createElement("div");
+      actionsEl.className = "sb-modal-actions";
+      actionsEl.style.display = "none";
+      modalBodyEl.appendChild(actionsEl);
+    } else {
+      contentEl.innerHTML = "";
+    }
 
     const wrap = document.createElement("div");
     wrap.className = "sb-modal-summary";
@@ -419,8 +456,7 @@
       wrap.appendChild(banner);
     }
 
-    // "Source: …" line — which fetcher (article / Jina / Wayback / …) produced
-    // the text behind this summary.
+    // "Source: …" line — which fetcher produced the text behind this summary.
     if (response.articleSourceLabel) {
       const srcLine = document.createElement("div");
       srcLine.className = "sb-modal-source";
@@ -433,33 +469,35 @@
     text.textContent = response.summary || "";
     wrap.appendChild(text);
 
-    // Action row: "More context" + "Alternate source". Only on short mode.
-    if (mode !== "detailed") {
-      const actions = document.createElement("div");
-      actions.className = "sb-modal-actions";
+    contentEl.appendChild(wrap);
+
+    // Populate the persistent actions bar. In short mode: "Dig Deeper" +
+    // "Alternate source". In detailed mode: leave as-is (button already grayed).
+    if (mode !== "detailed" && actionsEl) {
+      actionsEl.innerHTML = "";
+      actionsEl.style.display = "";
 
       const moreBtn = document.createElement("button");
       moreBtn.className = "sb-modal-more-btn";
       moreBtn.type = "button";
-      moreBtn.textContent = "More context";
+      moreBtn.textContent = "Dig Deeper";
       moreBtn.addEventListener("click", () => {
+        moreBtn.disabled = true;
         requestModalSummary(link, "detailed");
       });
-      actions.appendChild(moreBtn);
+      actionsEl.appendChild(moreBtn);
 
       const altBtn = document.createElement("button");
       altBtn.className = "sb-modal-alt-btn";
       altBtn.type = "button";
       altBtn.textContent = "Alternate source";
       altBtn.addEventListener("click", () => {
+        altBtn.disabled = true;
         requestModalAlternateSource(link);
       });
-      actions.appendChild(altBtn);
-
-      wrap.appendChild(actions);
+      actionsEl.appendChild(altBtn);
     }
 
-    modalBodyEl.appendChild(wrap);
     appendDebugPanel(response);
   }
 
@@ -552,7 +590,20 @@
   //     modal. Includes date, publisher, clickable title, summary, and
   //     buttons to go back to the original article or fetch yet another. ---
   function renderAlternateSource(response, link) {
-    modalBodyEl.innerHTML = "";
+    let contentEl = modalBodyEl.querySelector(".sb-modal-content");
+    let actionsEl = modalBodyEl.querySelector(".sb-modal-actions");
+    if (!contentEl) {
+      modalBodyEl.innerHTML = "";
+      contentEl = document.createElement("div");
+      contentEl.className = "sb-modal-content";
+      modalBodyEl.appendChild(contentEl);
+      actionsEl = document.createElement("div");
+      actionsEl.className = "sb-modal-actions";
+      actionsEl.style.display = "none";
+      modalBodyEl.appendChild(actionsEl);
+    } else {
+      contentEl.innerHTML = "";
+    }
 
     const wrap = document.createElement("div");
     wrap.className = "sb-modal-summary";
@@ -585,34 +636,53 @@
     text.textContent = response.summary || "";
     wrap.appendChild(text);
 
-    const actions = document.createElement("div");
-    actions.className = "sb-modal-actions";
+    contentEl.appendChild(wrap);
 
-    const backBtn = document.createElement("button");
-    backBtn.className = "sb-modal-more-btn";
-    backBtn.type = "button";
-    backBtn.textContent = "Original article";
-    backBtn.addEventListener("click", () => {
-      requestModalSummary(link, "short");
-    });
-    actions.appendChild(backBtn);
+    // Update the persistent actions bar with "Original article" + "Try another".
+    if (actionsEl) {
+      actionsEl.innerHTML = "";
+      actionsEl.style.display = "";
 
-    const anotherBtn = document.createElement("button");
-    anotherBtn.className = "sb-modal-alt-btn";
-    anotherBtn.type = "button";
-    anotherBtn.textContent = "Try another";
-    anotherBtn.addEventListener("click", () => {
-      requestModalAlternateSource(link);
-    });
-    actions.appendChild(anotherBtn);
+      const backBtn = document.createElement("button");
+      backBtn.className = "sb-modal-more-btn";
+      backBtn.type = "button";
+      backBtn.textContent = "Original article";
+      backBtn.addEventListener("click", () => {
+        backBtn.disabled = true;
+        requestModalSummary(link, "short");
+      });
+      actionsEl.appendChild(backBtn);
 
-    wrap.appendChild(actions);
-    modalBodyEl.appendChild(wrap);
+      const anotherBtn = document.createElement("button");
+      anotherBtn.className = "sb-modal-alt-btn";
+      anotherBtn.type = "button";
+      anotherBtn.textContent = "Try another";
+      anotherBtn.addEventListener("click", () => {
+        anotherBtn.disabled = true;
+        requestModalAlternateSource(link);
+      });
+      actionsEl.appendChild(anotherBtn);
+    }
+
     appendDebugPanel(response);
   }
 
   function renderError(errorType, message, headline, response) {
-    modalBodyEl.innerHTML = "";
+    let contentEl = modalBodyEl.querySelector(".sb-modal-content");
+    let actionsEl = modalBodyEl.querySelector(".sb-modal-actions");
+    if (!contentEl) {
+      modalBodyEl.innerHTML = "";
+      contentEl = document.createElement("div");
+      contentEl.className = "sb-modal-content";
+      modalBodyEl.appendChild(contentEl);
+    } else {
+      contentEl.innerHTML = "";
+    }
+    if (actionsEl) {
+      actionsEl.innerHTML = "";
+      actionsEl.style.display = "none";
+    }
+
     const wrap = document.createElement("div");
     wrap.className = "sb-modal-error";
 
@@ -636,7 +706,7 @@
     });
     wrap.appendChild(btn);
 
-    modalBodyEl.appendChild(wrap);
+    contentEl.appendChild(wrap);
     appendDebugPanel(response);
   }
 

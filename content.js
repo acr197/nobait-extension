@@ -636,6 +636,14 @@
     spinnerWrap.appendChild(loadingText);
 
     popup.appendChild(spinnerWrap);
+
+    // Persistent action buttons bar — lives outside the swappable content zone
+    // so buttons survive loading-state swaps (grayed-out buttons stay visible).
+    const actionsBar = document.createElement("div");
+    actionsBar.className = "nobait-actions";
+    actionsBar.style.display = "none";
+    popup.appendChild(actionsBar);
+
     shadow.appendChild(popup);
     document.body.appendChild(host);
     activePopupHost = host;
@@ -648,7 +656,7 @@
     });
 
     // Kick off the first (short) summary request.
-    requestSummary(popup, spinnerWrap, url, headline, "short");
+    requestSummary(popup, spinnerWrap, actionsBar, url, headline, "short");
   }
 
   // --- requestSummary: opens a port to the background service worker so the
@@ -656,20 +664,20 @@
   //     "Looking in the Wayback Machine…") before returning the final RESULT.
   //     Shared by the initial short request and the "More context" detailed
   //     re-request. ---
-  function requestSummary(popup, placeholder, url, headline, mode) {
+  function requestSummary(popup, placeholder, actionsBar, url, headline, mode) {
     runPortRequest(
       { type: "SUMMARIZE", url, headline, mode },
       placeholder,
       (response) => {
         if (!activePopupHost) return;
         if (!response) {
-          renderError(popup, placeholder, "fetch_failed", "No response from extension.", headline, null);
+          renderError(popup, placeholder, "fetch_failed", "No response from extension.", headline, null, actionsBar);
           return;
         }
         if (response.ok) {
-          renderSummary(popup, placeholder, response, url, headline, mode);
+          renderSummary(popup, placeholder, response, url, headline, mode, actionsBar);
         } else {
-          renderError(popup, placeholder, response.error, response.message, headline, response);
+          renderError(popup, placeholder, response.error, response.message, headline, response, actionsBar);
         }
       },
       (err) => {
@@ -685,7 +693,7 @@
             detail: (err && err.message) || String(err),
             data: null,
           }],
-        });
+        }, actionsBar);
       });
   }
 
@@ -710,7 +718,7 @@
   //       - source:"knowledge" → the fetch failed and the AI answered from
   //         web search / training data. We show a clear amber banner so the
   //         reader can tell which kind of answer they're looking at. ---
-  function renderSummary(popup, oldEl, response, url, headline, mode) {
+  function renderSummary(popup, oldEl, response, url, headline, mode, actionsBar) {
     if (!activePopupHost) return;
     renderDebugPanel(popup, response);
 
@@ -743,26 +751,29 @@
     text.textContent = response.summary || "";
     body.appendChild(text);
 
-    // Action row: "More context" + "Alternate source" buttons. Only shown
-    // in short mode (after detailed expansion the user has all the info we
-    // can fetch from this article and would just want a fresh source).
-    if (mode !== "detailed") {
-      const actions = document.createElement("div");
-      actions.className = "nobait-actions";
+    swapContent(popup, oldEl, body);
+
+    // Populate the persistent actions bar. In short mode: "Dig Deeper" +
+    // "Alternate source". In detailed mode: leave buttons as-is ("Dig Deeper"
+    // is already grayed out from the click that triggered this render).
+    if (mode !== "detailed" && actionsBar) {
+      actionsBar.innerHTML = "";
+      actionsBar.style.display = "";
 
       const moreBtn = document.createElement("button");
       moreBtn.className = "nobait-more-btn";
       moreBtn.type = "button";
-      moreBtn.textContent = "More context";
+      moreBtn.textContent = "Dig Deeper";
       moreBtn.addEventListener("click", (e) => {
         e.stopPropagation();
+        moreBtn.disabled = true;
         const loadingEl = buildLoadingEl();
         if (body.parentNode === popup) {
           popup.replaceChild(loadingEl, body);
         }
-        requestSummary(popup, loadingEl, url, headline, "detailed");
+        requestSummary(popup, loadingEl, actionsBar, url, headline, "detailed");
       });
-      actions.appendChild(moreBtn);
+      actionsBar.appendChild(moreBtn);
 
       const altBtn = document.createElement("button");
       altBtn.className = "nobait-alt-btn";
@@ -770,40 +781,37 @@
       altBtn.textContent = "Alternate source";
       altBtn.addEventListener("click", (e) => {
         e.stopPropagation();
+        altBtn.disabled = true;
         const loadingEl = buildLoadingEl();
         loadingEl.querySelector(".nobait-loading-text").textContent =
           "Finding another source\u2026";
         if (body.parentNode === popup) {
           popup.replaceChild(loadingEl, body);
         }
-        requestAlternateSource(popup, loadingEl, url, headline);
+        requestAlternateSource(popup, loadingEl, actionsBar, url, headline);
       });
-      actions.appendChild(altBtn);
-
-      body.appendChild(actions);
+      actionsBar.appendChild(altBtn);
     }
-
-    swapContent(popup, oldEl, body);
   }
 
   // --- requestAlternateSource: sends an ALTERNATE_SOURCE message to the
   //     background script to find and summarize a different publisher's
   //     coverage of the same headline. Routes the response to
   //     renderAlternateSource (or renderError on failure). ---
-  function requestAlternateSource(popup, placeholder, url, headline) {
+  function requestAlternateSource(popup, placeholder, actionsBar, url, headline) {
     runPortRequest(
       { type: "ALTERNATE_SOURCE", url, headline },
       placeholder,
       (response) => {
         if (!activePopupHost) return;
         if (!response) {
-          renderError(popup, placeholder, "fetch_failed", "No response from extension.", headline, null);
+          renderError(popup, placeholder, "fetch_failed", "No response from extension.", headline, null, actionsBar);
           return;
         }
         if (response.ok) {
-          renderAlternateSource(popup, placeholder, response, url, headline);
+          renderAlternateSource(popup, placeholder, response, url, headline, actionsBar);
         } else {
-          renderError(popup, placeholder, response.error, response.message, headline, response);
+          renderError(popup, placeholder, response.error, response.message, headline, response, actionsBar);
         }
       },
       (err) => {
@@ -819,7 +827,7 @@
             detail: (err && err.message) || String(err),
             data: null,
           }],
-        });
+        }, actionsBar);
       });
   }
 
@@ -877,7 +885,7 @@
   // --- renderAlternateSource: displays the alternate-source result in the
   //     popup. Layout: status label, then a meta line with date · publisher,
   //     then the alternate article title (clickable), then the summary. ---
-  function renderAlternateSource(popup, oldEl, response, originalUrl, originalHeadline) {
+  function renderAlternateSource(popup, oldEl, response, originalUrl, originalHeadline, actionsBar) {
     if (!activePopupHost) return;
     renderDebugPanel(popup, response);
 
@@ -913,43 +921,45 @@
     summary.textContent = response.summary || "";
     body.appendChild(summary);
 
-    // Let the user fetch yet another alternate or go back to the original.
-    const actions = document.createElement("div");
-    actions.className = "nobait-actions";
-
-    const backBtn = document.createElement("button");
-    backBtn.className = "nobait-more-btn";
-    backBtn.type = "button";
-    backBtn.textContent = "Original article";
-    backBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const loadingEl = buildLoadingEl();
-      if (body.parentNode === popup) {
-        popup.replaceChild(loadingEl, body);
-      }
-      requestSummary(popup, loadingEl, originalUrl, originalHeadline, "short");
-    });
-    actions.appendChild(backBtn);
-
-    const anotherBtn = document.createElement("button");
-    anotherBtn.className = "nobait-alt-btn";
-    anotherBtn.type = "button";
-    anotherBtn.textContent = "Try another";
-    anotherBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const loadingEl = buildLoadingEl();
-      loadingEl.querySelector(".nobait-loading-text").textContent =
-        "Finding another source\u2026";
-      if (body.parentNode === popup) {
-        popup.replaceChild(loadingEl, body);
-      }
-      requestAlternateSource(popup, loadingEl, originalUrl, originalHeadline);
-    });
-    actions.appendChild(anotherBtn);
-
-    body.appendChild(actions);
-
     swapContent(popup, oldEl, body);
+
+    // Update the persistent actions bar with "Original article" + "Try another".
+    if (actionsBar) {
+      actionsBar.innerHTML = "";
+      actionsBar.style.display = "";
+
+      const backBtn = document.createElement("button");
+      backBtn.className = "nobait-more-btn";
+      backBtn.type = "button";
+      backBtn.textContent = "Original article";
+      backBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        backBtn.disabled = true;
+        const loadingEl = buildLoadingEl();
+        if (body.parentNode === popup) {
+          popup.replaceChild(loadingEl, body);
+        }
+        requestSummary(popup, loadingEl, actionsBar, originalUrl, originalHeadline, "short");
+      });
+      actionsBar.appendChild(backBtn);
+
+      const anotherBtn = document.createElement("button");
+      anotherBtn.className = "nobait-alt-btn";
+      anotherBtn.type = "button";
+      anotherBtn.textContent = "Try another";
+      anotherBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        anotherBtn.disabled = true;
+        const loadingEl = buildLoadingEl();
+        loadingEl.querySelector(".nobait-loading-text").textContent =
+          "Finding another source\u2026";
+        if (body.parentNode === popup) {
+          popup.replaceChild(loadingEl, body);
+        }
+        requestAlternateSource(popup, loadingEl, actionsBar, originalUrl, originalHeadline);
+      });
+      actionsBar.appendChild(anotherBtn);
+    }
   }
 
   // --- renderError: shown whenever we can't return a real summary — either
@@ -958,9 +968,13 @@
   //     fallback button so they have a path forward. The optional `response`
   //     argument carries the full background-script payload (incl. debug log)
   //     so the diagnostic panel can render under the error message. ---
-  function renderError(popup, spinnerWrap, errorType, message, headline, response) {
+  function renderError(popup, spinnerWrap, errorType, message, headline, response, actionsBar) {
     if (!activePopupHost) return;
     renderDebugPanel(popup, response);
+    if (actionsBar) {
+      actionsBar.innerHTML = "";
+      actionsBar.style.display = "none";
+    }
 
     const body = document.createElement("div");
     body.className = "nobait-body nobait-error-body";
@@ -1361,7 +1375,7 @@
       .nobait-actions {
         display: flex;
         gap: 8px;
-        margin-top: 12px;
+        padding: 0 16px 14px;
         flex-wrap: wrap;
       }
       .nobait-more-btn,
