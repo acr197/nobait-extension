@@ -18,9 +18,11 @@ if (typeof browser !== "undefined" && browser.sidebarAction && browser.action) {
 }
 
 // --- Configuration ---
+// The Cloudflare Worker proxy handles ALL AI calls: it holds the OpenAI key
+// in Cloudflare secrets and picks the model (gpt-5 by default). The extension
+// itself must never hold an API key or call api.openai.com directly — all
+// AI traffic flows through this /summarize endpoint.
 const PROXY_URL = "https://nobait-proxy.acr197.workers.dev/summarize";
-// OpenAI API key for the gpt-4o-search-preview web-search fallback (direct API call).
-const OPENAI_API_KEY = "";
 const FETCH_TIMEOUT_MS = 12000;
 const AI_TIMEOUT_MS = 20000;
 const MAX_CONTENT_LENGTH = 9000;
@@ -335,16 +337,19 @@ async function handleSummarize(url, headline, mode, sendProgress) {
     }
   }
 
-  // If this is a Google News URL that couldn't be resolved to a publisher URL,
-  // skip all URL-dependent fallbacks — they would only fetch the GNews redirect
-  // stub, not the real article. Jump straight to search → openai_search → ai_knowledge.
-  const skipUrlFallbacks = !!googleNewsRss && realUrl === url;
+  // For a Google News URL whose publisher URL couldn't be resolved, realUrl
+  // still points at the GNews stub. Every fallback below still runs a real
+  // network request — Jina's headless browser in particular can often
+  // follow the JS redirect that our own fetch can't, so we don't want to
+  // short-circuit and starve the pipeline of attempts.
+  const gnewsUnresolved = !!googleNewsRss && realUrl === url;
 
   // Standard path: fetch the requested URL directly.
-  // Skipped for unresolved Google News stubs (skipUrlFallbacks) because
-  // fetching news.google.com directly never yields article text.
-  if (!articleText && !skipUrlFallbacks) {
-    debug.log("direct_fetch", "info", "attempting direct fetch", { url });
+  if (!articleText) {
+    debug.log("direct_fetch", "info", "attempting direct fetch", {
+      url,
+      note: gnewsUnresolved ? "GNews publisher URL unresolved; fetching stub directly" : undefined,
+    });
     progress("Reading the article\u2026");
     try {
       const meta = {};
@@ -365,16 +370,14 @@ async function handleSummarize(url, headline, mode, sendProgress) {
         contentPreview: err.contentPreview || undefined,
       });
     }
-  } else if (!articleText && skipUrlFallbacks) {
-    debug.log("direct_fetch", "skip", "skipped -- no resolved publisher URL");
   }
 
   // Fallback #1: server-side Reader API (Jina). Catches JS-rendered SPAs
   // (Tom's Guide, most modern news sites) whose direct HTML is a near-empty
   // skeleton, and sites whose bot protection blocks our direct fetch.
-  // For Google News, realUrl is already the resolved publisher URL.
-  // Skipped for unresolved Google News stubs (skipUrlFallbacks).
-  if (!articleText && !skipUrlFallbacks) {
+  // For Google News, realUrl is either the resolved publisher URL or the
+  // raw GNews URL (Jina's headless browser can still follow the redirect).
+  if (!articleText) {
     debug.log("jina_reader", "info", "attempting Jina Reader API", { url: realUrl });
     progress("Trying a reader service\u2026");
     try {
@@ -397,15 +400,12 @@ async function handleSummarize(url, headline, mode, sendProgress) {
         errorType: captured.type,
       });
     }
-  } else if (!articleText && skipUrlFallbacks) {
-    debug.log("jina_reader", "skip", "skipped -- no resolved publisher URL");
   }
 
   // Fallback #2: Wayback Machine. When direct fetch and Jina both fail
   // (paywall, anti-bot, JS SPA that doesn't render for headless fetchers),
   // archive.org usually has a static snapshot that's trivially readable.
-  // Skipped for unresolved Google News stubs (skipUrlFallbacks).
-  if (!articleText && !skipUrlFallbacks) {
+  if (!articleText) {
     debug.log("wayback", "info", "attempting Wayback Machine", { url: realUrl });
     progress("Looking in the Wayback Machine\u2026");
     try {
@@ -425,15 +425,13 @@ async function handleSummarize(url, headline, mode, sendProgress) {
         errorType: captured.type,
       });
     }
-  } else if (!articleText && skipUrlFallbacks) {
-    debug.log("wayback", "skip", "skipped -- no resolved publisher URL");
   }
 
   // Fallback #3: Archive.today (archive.ph). Often succeeds on paywalled or
   // Cloudflare-protected sites that Wayback doesn't cover. Separate from
   // Wayback because the two services have largely non-overlapping snapshot
-  // coverage. Skipped for unresolved Google News stubs (skipUrlFallbacks).
-  if (!articleText && !skipUrlFallbacks) {
+  // coverage.
+  if (!articleText) {
     debug.log("archive_today", "info", "attempting Archive.today", { url: realUrl });
     progress("Checking Archive.today\u2026");
     try {
@@ -453,8 +451,6 @@ async function handleSummarize(url, headline, mode, sendProgress) {
         errorType: captured.type,
       });
     }
-  } else if (!articleText && skipUrlFallbacks) {
-    debug.log("archive_today", "skip", "skipped -- no resolved publisher URL");
   }
 
   // Fallback #4: search-based retrieval. This is the same trick Claude.ai
@@ -463,10 +459,11 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   // publisher's coverage of the same story), but the content is still
   // real reporting rather than an AI guess. This rescues JS-rendered SPAs
   // that Jina can't render and sites without archive snapshots.
-  // When skipUrlFallbacks is true, pass null so the search query uses the
-  // headline alone (no Google News URL to confuse the publisher scoping).
+  // When the original URL is a Google News stub we never resolved, pass
+  // null for the search scope so the headline alone drives the query
+  // (including "news.google.com" as a publisher would confuse the ranker).
   if (!articleText) {
-    const searchUrl = skipUrlFallbacks ? null : realUrl;
+    const searchUrl = gnewsUnresolved ? null : realUrl;
     debug.log("search", "info", "attempting search-based retrieval", {
       headline,
       originalUrl: searchUrl,
@@ -492,21 +489,22 @@ async function handleSummarize(url, headline, mode, sendProgress) {
     }
   }
 
-  // Fallback #5: OpenAI web search (gpt-4o-search-preview). Runs a live web
-  // search specifically for the article headline + publisher, so the AI
-  // reports real article facts rather than guessing from training data.
-  // Uses the OpenAI Chat Completions API directly (gpt-4o-search-preview).
-  // When skipUrlFallbacks is true, pass null so we don't include the
-  // Google News URL in the search prompt.
+  // Fallback #5: OpenAI-backed web search via the Cloudflare Worker proxy.
+  // Sends the article headline (plus publisher, if known) to the Worker's
+  // /summarize endpoint with { text: headline }. The Worker holds the OpenAI
+  // key in Cloudflare secrets and performs the live web search — the
+  // extension never talks to api.openai.com directly.
+  // When the original URL is an unresolved Google News stub, pass null so
+  // the publisher context sent to the proxy isn't "news.google.com".
   if (!articleText) {
-    const openaiUrl = skipUrlFallbacks ? null : realUrl;
-    debug.log("openai_search", "info", "attempting OpenAI web search", {
+    const openaiUrl = gnewsUnresolved ? null : realUrl;
+    debug.log("openai_search", "info", "attempting web search via proxy Worker", {
       headline,
       url: openaiUrl,
     });
     progress("Searching the web with AI\u2026");
     try {
-      const searchSummary = await callOpenAIWebSearch(headline, openaiUrl);
+      const searchSummary = await callProxyWebSearch(headline, openaiUrl);
       if (searchSummary && searchSummary.length >= 100) {
         debug.log("openai_search", "ok", `got ${searchSummary.length} chars from web search`, {
           length: searchSummary.length,
@@ -520,16 +518,16 @@ async function handleSummarize(url, headline, mode, sendProgress) {
           articleSourceLabel: "OpenAI web search",
           contentStatus: "from_search",
           contentStatusMessage:
-            "Article couldn't be fetched directly — answer is from an OpenAI web search.",
+            "Article couldn't be fetched directly — answer is from an AI web search.",
           debug: debug.entries,
         };
       } else {
-        debug.log("openai_search", "fail", "web search returned no usable content");
+        debug.log("openai_search", "fail", "web search returned no usable content", {
+          length: searchSummary ? searchSummary.length : 0,
+        });
       }
     } catch (err) {
-      const msg = (err && err.message) || "OpenAI web search failed";
-      const hint = !OPENAI_API_KEY ? " (OPENAI_API_KEY is empty — set it in background.js)" : "";
-      debug.log("openai_search", "fail", msg + hint);
+      debug.log("openai_search", "fail", (err && err.message) || "proxy web search failed");
     }
   }
 
@@ -537,13 +535,13 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   // into Claude.ai / ChatGPT. The AI uses web search (if available) or its
   // training knowledge to answer. We flag the response with source:"knowledge"
   // so the popup can show the user that the answer is NOT from the article.
-  // When skipUrlFallbacks is true, pass null so we don't include the
-  // Google News URL in the prompt.
+  // When the original URL is an unresolved Google News stub, pass null so
+  // the prompt doesn't include "news.google.com" as the publisher.
   if (!articleText) {
     debug.log("ai_knowledge", "info", "all fetch paths failed, asking AI from knowledge");
     progress("Asking AI from its own knowledge\u2026");
     try {
-      const knowledgeUrl = skipUrlFallbacks ? null : realUrl;
+      const knowledgeUrl = gnewsUnresolved ? null : realUrl;
       const summary = await callAISearch(headline, knowledgeUrl, mode);
       debug.log("ai_knowledge", "ok", `AI returned ${summary.length} chars`, {
         length: summary.length,
@@ -2456,80 +2454,80 @@ ${content}
 Response:`;
 }
 
-// --- callOpenAIWebSearch: calls the OpenAI Chat Completions API directly with
-//     gpt-4o-search-preview (live web search enabled). This runs after all
-//     fetch paths have failed. Falls back to gpt-4o if the search-preview
-//     model is unavailable. Returns null / throws on failure so the caller
-//     can fall through to ai_knowledge. ---
-async function callOpenAIWebSearch(headline, url) {
+// --- callProxyWebSearch: asks the Cloudflare Worker proxy to do a live web
+//     search for the headline. The Worker holds the OpenAI key in Cloudflare
+//     secrets and picks the model (gpt-5 by default); we just POST the
+//     headline as the `text` field and read `summary` off the response.
+//     Runs after every direct/archive/search fetch has failed. Returns the
+//     summary string (or null / throws on failure so the caller can fall
+//     through to ai_knowledge). ---
+async function callProxyWebSearch(headline, url) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
   const publisher = url ? getPublisherFromUrl(url) : "";
-  const userMessage = publisher
-    ? `Search for this article and answer the question its headline is asking: ${headline}. Source: ${publisher}.`
-    : `Search for this article and answer the question its headline is asking: ${headline}.`;
-
-  const callApi = async (model) => fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: "user", content: userMessage }],
-    }),
-    signal: controller.signal,
-  });
-
-  let response;
-  try {
-    response = await callApi("gpt-4o-search-preview");
-    // If search-preview model is unavailable (region/tier restriction), fall back to gpt-4o.
-    if (response.status === 404 || response.status === 400) {
-      response = await callApi("gpt-4o");
-    }
-  } catch (err) {
-    clearTimeout(timer);
-    if (err.name === "AbortError") throw new Error("OpenAI search request timed out.");
-    throw new Error("Could not reach the OpenAI API.");
-  }
-
-  clearTimeout(timer);
-
-  if (!response.ok) {
-    throw new Error(`OpenAI API returned HTTP ${response.status}.`);
-  }
-
-  const data = await response.json();
-  const content = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-  return content || null;
-}
-
-// --- callAISearch: final-resort AI call used when every fetch path failed.
-//     Sends the headline + publisher to the proxy and asks the model to
-//     answer as if the user had pasted the headline + publisher into
-//     Claude.ai / ChatGPT. The model uses web search (when available) or
-//     its training knowledge. The popup surfaces a banner making it clear
-//     the answer did NOT come from the fetched article. ---
-async function callAISearch(headline, url, mode) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
-
-  const prompt = buildSearchPrompt(headline, url, mode);
+  // Include the publisher as plain context in the text field so the model
+  // can pick the right article when multiple outlets cover the same story.
+  const text = publisher ? `${headline} (${publisher})` : headline;
 
   let response;
   try {
     response = await fetch(PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: prompt }),
+      body: JSON.stringify({ text }),
       signal: controller.signal,
     });
   } catch (err) {
     clearTimeout(timer);
-    if (err.name === "AbortError") {
+    if (err && err.name === "AbortError") throw new Error("Proxy web search timed out.");
+    throw new Error("Could not reach the AI proxy.");
+  }
+
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    throw new Error(`AI proxy returned HTTP ${response.status}.`);
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch (_) {
+    throw new Error("AI proxy returned invalid JSON.");
+  }
+  const summary = data && typeof data.summary === "string" ? data.summary.trim() : "";
+  return summary || null;
+}
+
+// --- callAISearch: final-resort AI call used when every fetch path failed.
+//     Routes through the Cloudflare Worker proxy at PROXY_URL: we POST
+//     `{ text: <headline> }` (with the publisher appended in parentheses
+//     when known) to /summarize, and the Worker's gpt-5 backend answers
+//     using web search / training knowledge. The extension never holds an
+//     OpenAI key — the Worker owns that. The popup surfaces a banner so
+//     the user knows the answer did NOT come from a fetched article. ---
+async function callAISearch(headline, url, mode) {
+  // `mode` is no longer used here because the Worker picks its own answer
+  // length; it's kept in the signature so callers don't need to change.
+  void mode;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+
+  const publisher = url ? getPublisherFromUrl(url) : "";
+  const text = publisher ? `${headline} (${publisher})` : headline;
+
+  let response;
+  try {
+    response = await fetch(PROXY_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err && err.name === "AbortError") {
       throw new Error("AI request timed out.");
     }
     throw new Error("Could not reach the AI service.");
@@ -2541,12 +2539,18 @@ async function callAISearch(headline, url, mode) {
     throw new Error(`AI service returned an error (HTTP ${response.status}).`);
   }
 
-  const data = await response.json();
-  if (!data.summary) {
+  let data;
+  try {
+    data = await response.json();
+  } catch (_) {
+    throw new Error("AI service returned invalid JSON.");
+  }
+  const summary = data && typeof data.summary === "string" ? data.summary.trim() : "";
+  if (!summary) {
     throw new Error("AI returned an empty response.");
   }
 
-  return data.summary;
+  return summary;
 }
 
 // --- getPublisherFromUrl: extracts a human-readable publisher label from a
@@ -2559,55 +2563,6 @@ function getPublisherFromUrl(url) {
   } catch (_) {
     return "";
   }
-}
-
-// --- buildSearchPrompt: mirrors buildPrompt's rules (same answer-style
-//     cases) but uses training knowledge / web search instead of a fetched
-//     article. This is the ai_knowledge last-resort path. It NEVER allows
-//     refusal — if the model can't find the specific article, it must still
-//     give the best answer it can from context. ---
-function buildSearchPrompt(headline, url, mode) {
-  const isDetailed = mode === "detailed";
-  const publisher = url ? getPublisherFromUrl(url) : "";
-  const publisherLine = publisher ? `Publisher: ${publisher}\n` : "";
-
-  const RULES = `HARD CONSTRAINTS:
-- Always attempt a specific, substantive answer. NEVER say "I don't have specific information", "I cannot access", "details are not available", "specific details are not provided", or any variant of refusing to answer. Even if you cannot confirm the exact article, use your training knowledge to give the most probable answer — then qualify if needed ("likely", "as of [date]", "based on available reporting"). Label your response as approximate rather than refusing.
-- When the headline names a specific analyst, firm, or institution (e.g. "Piper Sandler", "Goldman Sachs", "Morgan Stanley"), use whatever you know about their published research, stock picks, price targets, or public statements to name the specific stock, company, or recommendation they were referring to. Do not give only a category answer ("a cloud company") when you can name the specific one.
-- NEVER fabricate numbers, dates, or quotes you aren't confident about. If genuinely uncertain about a specific, give your best inference and note the uncertainty briefly.
-- Never tell the reader to "read the article", "visit the site", "check the link", or anything similar.
-- No editorializing. No opinions. No "according to my training data" or similar meta-commentary — just answer.`;
-
-  if (isDetailed) {
-    return `You are NoBait. The extension could not fetch this news article directly. Give the most specific, useful answer you can from your training knowledge. Always name names — if the headline references a company, person, stock, or place that you can identify, identify it.
-
-Write a 4-6 sentence detailed answer giving: (1) the specific answer to what the headline was teasing (name the company/person/place/number), (2) concrete facts you are confident about, (3) meaningful context and background, (4) any caveats or unknowns. If the headline teases a ranked list, enumerate up to 10 items as a numbered list. If there are more than 10, add "That's the most this summary can list." after the 10th.
-
-${RULES}
-
-Headline: "${headline}"
-${publisherLine}
-Response:`;
-  }
-
-  return `You are NoBait. The extension could not fetch this news article directly. Give the most specific, useful answer you can from your training knowledge. Always name names — if the headline references a company, person, stock, or place that you can identify, identify it.
-
-${RULES}
-
-ANSWER STYLE — follow whichever case fits:
-- Analyst/firm recommendation headline ("says Piper Sandler", "says Goldman", "says JPMorgan" etc.): name the specific stock, company, or asset the analyst was recommending, along with any price target or rating you know about. Do not give only a category like "a cloud company".
-- Yes/No question headline: start with "Yes" or "No", then one short clarifying phrase with the key specific. Do not write a paragraph.
-- Headline teases a single name, place, price, rank, number, or short noun: answer with JUST that noun or 2-3 words. Do not pad it into a full sentence.
-- Headline teases a ranked or numbered list ("The 20 greatest X, ranked", "Top 10 Y"): return a numbered list of up to 10 items you are confident about, one per line, with a short identifying detail each. Add "That's the most this summary can list." after the 10th if there are more.
-- Named person headline ("Who is X?", "X appointed as…"): give a 1-2 sentence factual description of who the person is and their relevance.
-- Location headline ("Where is X?", "The city that…"): name the location and give a brief identifying detail.
-- Otherwise: answer in at most 2-3 tight factual sentences with concrete specifics (exact names, numbers, outcomes). If only partial information is known, state what IS known and note what is uncertain in one phrase.
-
-Never restate the headline.
-
-Headline: "${headline}"
-${publisherLine}
-Response:`;
 }
 
 // --- createError: builds an Error with an errorType property ---
