@@ -553,6 +553,15 @@ body {
   margin-bottom: 4px;
 }
 
+.sb-modal-source {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--brand);
+  margin-bottom: 6px;
+}
+
 .sb-modal-actions {
   display: flex;
   gap: 8px;

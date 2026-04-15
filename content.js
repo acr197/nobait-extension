@@ -651,12 +651,16 @@
     requestSummary(popup, spinnerWrap, url, headline, "short");
   }
 
-  // --- requestSummary: sends a SUMMARIZE message to background and routes
-  //     the response to renderSummary / renderError. Shared by the initial
-  //     short request and the "More context" detailed re-request. ---
+  // --- requestSummary: opens a port to the background service worker so the
+  //     SUMMARIZE request can stream PROGRESS updates ("Reading the article…",
+  //     "Looking in the Wayback Machine…") before returning the final RESULT.
+  //     Shared by the initial short request and the "More context" detailed
+  //     re-request. ---
   function requestSummary(popup, placeholder, url, headline, mode) {
-    Promise.resolve(api.runtime.sendMessage({ type: "SUMMARIZE", url, headline, mode }))
-      .then((response) => {
+    runPortRequest(
+      { type: "SUMMARIZE", url, headline, mode },
+      placeholder,
+      (response) => {
         if (!activePopupHost) return;
         if (!response) {
           renderError(popup, placeholder, "fetch_failed", "No response from extension.", headline, null);
@@ -667,8 +671,8 @@
         } else {
           renderError(popup, placeholder, response.error, response.message, headline, response);
         }
-      })
-      .catch((err) => {
+      },
+      (err) => {
         if (!activePopupHost) return;
         renderError(popup, placeholder, "fetch_failed", "Extension error. Try again.", headline, {
           ok: false,
@@ -724,6 +728,16 @@
       body.appendChild(banner);
     }
 
+    // "Source: …" line so the user can see exactly which fetcher won the
+    // race (direct fetch, Jina reader, Wayback, Archive.today, a search
+    // result, or AI knowledge).
+    if (response.articleSourceLabel) {
+      const srcLine = document.createElement("div");
+      srcLine.className = "nobait-source";
+      srcLine.textContent = "Source: " + response.articleSourceLabel;
+      body.appendChild(srcLine);
+    }
+
     const text = document.createElement("div");
     text.className = "nobait-summary";
     text.textContent = response.summary || "";
@@ -777,10 +791,10 @@
   //     coverage of the same headline. Routes the response to
   //     renderAlternateSource (or renderError on failure). ---
   function requestAlternateSource(popup, placeholder, url, headline) {
-    Promise.resolve(
-      api.runtime.sendMessage({ type: "ALTERNATE_SOURCE", url, headline })
-    )
-      .then((response) => {
+    runPortRequest(
+      { type: "ALTERNATE_SOURCE", url, headline },
+      placeholder,
+      (response) => {
         if (!activePopupHost) return;
         if (!response) {
           renderError(popup, placeholder, "fetch_failed", "No response from extension.", headline, null);
@@ -791,8 +805,8 @@
         } else {
           renderError(popup, placeholder, response.error, response.message, headline, response);
         }
-      })
-      .catch((err) => {
+      },
+      (err) => {
         if (!activePopupHost) return;
         renderError(popup, placeholder, "fetch_failed", "Extension error. Try again.", headline, {
           ok: false,
@@ -807,6 +821,57 @@
           }],
         });
       });
+  }
+
+  // --- runPortRequest: opens a chrome.runtime.connect port to background.js,
+  //     sends the request, streams PROGRESS text into the `placeholder` node's
+  //     .nobait-loading-text element, and invokes onResult with the final
+  //     RESULT response (or onError if the port errors / disconnects without
+  //     returning a RESULT). Falls back to runtime.sendMessage if the browser
+  //     port setup fails — legacy path, single "Analyzing article…" spinner. ---
+  function runPortRequest(request, placeholder, onResult, onError) {
+    let port;
+    try {
+      port = api.runtime.connect({ name: "nobait-summarize" });
+    } catch (err) {
+      onError(err);
+      return;
+    }
+    if (!port) {
+      // Fallback: legacy one-shot request/response with no progress stream.
+      Promise.resolve(api.runtime.sendMessage(request))
+        .then((response) => onResult(response))
+        .catch((err) => onError(err));
+      return;
+    }
+    let settled = false;
+    const loadingText =
+      placeholder && placeholder.querySelector
+        ? placeholder.querySelector(".nobait-loading-text")
+        : null;
+    port.onMessage.addListener((msg) => {
+      if (!msg || settled) return;
+      if (msg.type === "PROGRESS") {
+        if (loadingText && msg.text) loadingText.textContent = msg.text;
+      } else if (msg.type === "RESULT") {
+        settled = true;
+        try { port.disconnect(); } catch (_) {}
+        onResult(msg.response);
+      }
+    });
+    port.onDisconnect.addListener(() => {
+      if (settled) return;
+      settled = true;
+      const err = api.runtime.lastError || new Error("port disconnected");
+      onError(err);
+    });
+    try {
+      port.postMessage(request);
+    } catch (err) {
+      settled = true;
+      try { port.disconnect(); } catch (_) {}
+      onError(err);
+    }
   }
 
   // --- renderAlternateSource: displays the alternate-source result in the
@@ -1272,6 +1337,14 @@
         font-weight: 600;
         color: #b45309;
         line-height: 1.4;
+        margin-bottom: 8px;
+      }
+      .nobait-source {
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: #6c47ff;
         margin-bottom: 8px;
       }
       .nobait-status-label {

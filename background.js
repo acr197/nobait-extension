@@ -50,7 +50,9 @@ const MAX_SEARCH_CANDIDATES = 4;
 
 // --- Message listener: routes SUMMARIZE requests from the content script
 //     and the sidebar. Returns a Promise so the same handler works in Chrome
-//     (MV3) and Firefox. ---
+//     (MV3) and Firefox. This is the legacy request/response path; the new
+//     port-based path (onConnect below) also carries interactive progress
+//     updates back to the UI. Both are kept so older callers still work. ---
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg) return;
 
@@ -94,6 +96,77 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
+// --- Port listener: progressive SUMMARIZE / ALTERNATE_SOURCE. Lets the popup
+//     and sidebar show a live status line ("Reading the article…", "Looking
+//     in the Wayback Machine…", etc.) as each pipeline stage runs, instead
+//     of a single "Analyzing article…" spinner that hides which stage the
+//     request is stuck on. Protocol:
+//       client → { type:"SUMMARIZE"|"ALTERNATE_SOURCE", url, headline, mode }
+//       server → { type:"PROGRESS", text } …many times…
+//       server → { type:"RESULT", response } once at the end
+//       server disconnects the port when done. ---
+api.runtime.onConnect.addListener((port) => {
+  if (!port || port.name !== "nobait-summarize") return;
+  let disconnected = false;
+  port.onDisconnect.addListener(() => { disconnected = true; });
+  port.onMessage.addListener(async (msg) => {
+    if (!msg) return;
+    const sendProgress = (text) => {
+      if (disconnected || !text) return;
+      try { port.postMessage({ type: "PROGRESS", text }); } catch (_) {}
+    };
+    const finish = (response) => {
+      if (disconnected) return;
+      try { port.postMessage({ type: "RESULT", response }); } catch (_) {}
+      try { port.disconnect(); } catch (_) {}
+    };
+    try {
+      if (msg.type === "SUMMARIZE") {
+        const mode = msg.mode === "detailed" ? "detailed" : "short";
+        const response = await handleSummarize(msg.url, msg.headline, mode, sendProgress);
+        finish(response);
+      } else if (msg.type === "ALTERNATE_SOURCE") {
+        const response = await handleAlternateSource(msg.url, msg.headline, sendProgress);
+        finish(response);
+      }
+    } catch (err) {
+      finish({
+        ok: false,
+        error: "uncaught",
+        message: (err && err.message) || "An unexpected error occurred.",
+        debug: [{
+          t: 0,
+          stage: "uncaught",
+          status: "fail",
+          detail: (err && err.message) || String(err),
+          data: null,
+        }],
+      });
+    }
+  });
+});
+
+// --- ARTICLE_SOURCE_LABELS: human-friendly names for each internal fetcher.
+//     Shown at the top of the final popup so the user can tell whether the
+//     summary came from the article itself, an archive snapshot, a search
+//     result, or AI knowledge. Keyed by the internal `articleSource` string
+//     set in handleSummarize / handleAlternateSource. ---
+const ARTICLE_SOURCE_LABELS = {
+  "direct_fetch": "the article",
+  "direct_fetch(google_news_resolved)": "the article (resolved from Google News)",
+  "jina_reader": "Jina Reader",
+  "wayback": "the Wayback Machine",
+  "archive_today": "Archive.today",
+  "search_result": "a search result",
+  "knowledge": "AI knowledge",
+};
+function labelForArticleSource(src) {
+  if (!src) return null;
+  if (ARTICLE_SOURCE_LABELS[src]) return ARTICLE_SOURCE_LABELS[src];
+  // Fallback: pretty-print unknown sources (e.g. "some_new_fetcher" → "some new fetcher").
+  return String(src).replace(/_/g, " ");
+}
+
 // --- handleSummarize: orchestrates fetch -> extract -> AI pipeline.
 //     Returns ok:true with a summary in two modes:
 //       1. Article fetched + AI summarized → summary grounded in article text
@@ -107,13 +180,15 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 //     the popup renders it as a diagnostic panel under the summary so the
 //     user can see exactly which fallback ran, which stage failed, and copy
 //     the entries back into Claude Code for investigation. ---
-async function handleSummarize(url, headline, mode) {
+async function handleSummarize(url, headline, mode, sendProgress) {
+  const progress = typeof sendProgress === "function" ? sendProgress : () => {};
   const debug = createDebugLog();
   debug.log("start", "info", "begin summarize", {
     url,
     headline,
     mode,
   });
+  progress("Starting\u2026");
 
   let articleText = null;
   let articleSource = null; // label for the fetcher that succeeded
@@ -129,6 +204,7 @@ async function handleSummarize(url, headline, mode) {
 
   if (googleNewsRss) {
     debug.log("google_news", "info", "Google News stub detected, resolving publisher URL");
+    progress("Resolving the Google News link\u2026");
 
     let publisherUrl = null;
     let htmlBodyForFallback = null;
@@ -169,6 +245,7 @@ async function handleSummarize(url, headline, mode) {
     if (publisherUrl) {
       realUrl = publisherUrl;
       debug.log("direct_fetch", "info", "fetching resolved publisher URL", { url: publisherUrl });
+      progress("Reading the article\u2026");
       try {
         articleText = await fetchArticle(publisherUrl);
         articleSource = "direct_fetch(google_news_resolved)";
@@ -196,6 +273,7 @@ async function handleSummarize(url, headline, mode) {
   // still land on the publisher article via server-side 302.
   if (!articleText) {
     debug.log("direct_fetch", "info", "attempting direct fetch", { url });
+    progress("Reading the article\u2026");
     try {
       articleText = await fetchArticle(url);
       articleSource = "direct_fetch";
@@ -219,6 +297,7 @@ async function handleSummarize(url, headline, mode) {
   // For Google News, realUrl is already the resolved publisher URL.
   if (!articleText) {
     debug.log("jina_reader", "info", "attempting Jina Reader API", { url: realUrl });
+    progress("Trying a reader service\u2026");
     try {
       articleText = await fetchViaJinaReader(realUrl);
       if (articleText) {
@@ -246,6 +325,7 @@ async function handleSummarize(url, headline, mode) {
   // archive.org usually has a static snapshot that's trivially readable.
   if (!articleText) {
     debug.log("wayback", "info", "attempting Wayback Machine", { url: realUrl });
+    progress("Looking in the Wayback Machine\u2026");
     try {
       articleText = await fetchViaWayback(realUrl);
       if (articleText) {
@@ -271,6 +351,7 @@ async function handleSummarize(url, headline, mode) {
   // coverage.
   if (!articleText) {
     debug.log("archive_today", "info", "attempting Archive.today", { url: realUrl });
+    progress("Checking Archive.today\u2026");
     try {
       articleText = await fetchViaArchiveToday(realUrl);
       if (articleText) {
@@ -301,6 +382,7 @@ async function handleSummarize(url, headline, mode) {
       headline,
       originalUrl: realUrl,
     });
+    progress("Searching the web for this story\u2026");
     try {
       articleText = await fetchViaSearchResults(headline, realUrl);
       if (articleText) {
@@ -326,6 +408,7 @@ async function handleSummarize(url, headline, mode) {
   // so the popup can show the user that the answer is NOT from the article.
   if (!articleText) {
     debug.log("ai_knowledge", "info", "all fetch paths failed, asking AI from knowledge");
+    progress("Asking AI from its own knowledge\u2026");
     try {
       const summary = await callAISearch(headline, realUrl, mode);
       debug.log("ai_knowledge", "ok", `AI returned ${summary.length} chars`, {
@@ -336,6 +419,8 @@ async function handleSummarize(url, headline, mode) {
         ok: true,
         summary,
         source: "knowledge",
+        articleSource: "knowledge",
+        articleSourceLabel: labelForArticleSource("knowledge"),
         contentStatus: "from_knowledge",
         contentStatusMessage:
           "Article couldn't be fetched — this answer is from AI knowledge.",
@@ -361,6 +446,7 @@ async function handleSummarize(url, headline, mode) {
     contentLength: articleText.length,
     mode,
   });
+  progress("Summarizing\u2026");
   try {
     const summary = await callAI(headline, articleText, mode);
     debug.log("ai_summarize", "ok", `AI returned ${summary.length} chars`, {
@@ -371,6 +457,8 @@ async function handleSummarize(url, headline, mode) {
       ok: true,
       summary,
       source: "article",
+      articleSource,
+      articleSourceLabel: labelForArticleSource(articleSource),
       contentStatus: "ok",
       contentStatusMessage: null,
       debug: debug.entries,
@@ -431,12 +519,14 @@ function previewText(text) {
 //       3. Race the top candidates through the standard fetch pipeline.
 //       4. Extract title, published date, and article text from the winner.
 //       5. Summarize via callAI in short mode. ---
-async function handleAlternateSource(originalUrl, headline) {
+async function handleAlternateSource(originalUrl, headline, sendProgress) {
+  const progress = typeof sendProgress === "function" ? sendProgress : () => {};
   const debug = createDebugLog();
   debug.log("alt_start", "info", "begin alternate source lookup", {
     originalUrl,
     headline,
   });
+  progress("Searching for an alternate source\u2026");
 
   if (!headline) {
     debug.log("alt_start", "fail", "no headline provided");
@@ -481,6 +571,8 @@ async function handleAlternateSource(originalUrl, headline) {
   let lastError = null;
   for (const candidate of candidates) {
     debug.log("alt_fetch", "info", "trying candidate", { url: candidate });
+    const candidatePublisher = getPublisherFromUrl(candidate);
+    progress(candidatePublisher ? `Trying ${candidatePublisher}\u2026` : "Trying an alternate source\u2026");
     try {
       const article = await fetchAlternateArticle(candidate);
       if (!article || !article.text) {
@@ -494,16 +586,20 @@ async function handleAlternateSource(originalUrl, headline) {
         preview: previewText(article.text),
       });
       debug.log("ai_summarize", "info", "calling AI on alternate article");
+      progress("Summarizing\u2026");
       const summary = await callAI(article.title || headline, article.text, "short");
       debug.log("ai_summarize", "ok", `AI returned ${summary.length} chars`);
       debug.log("done", "ok", "returning alternate summary");
+      const publisher = getPublisherFromUrl(candidate);
       return {
         ok: true,
         title: article.title || headline,
-        publisher: getPublisherFromUrl(candidate),
+        publisher,
         date: article.date || null,
         url: candidate,
         summary,
+        articleSource: "alternate_source",
+        articleSourceLabel: publisher ? publisher : "an alternate source",
         debug: debug.entries,
       };
     } catch (err) {
@@ -714,29 +810,34 @@ function formatDate(raw) {
   }
 }
 
-// --- isGoogleDomain: returns true for google.com and Google-owned CDN/asset
-//     domains that will never host publisher articles. ---
+// --- isGoogleDomain: returns true for google.com and Google-owned CDN / asset /
+//     analytics / ad domains that will never host publisher articles. The list
+//     covers the infrastructure Google News preconnects to in its stub HTML
+//     pages — those preconnect <link> tags used to slip through resolution as
+//     "publisher URLs". ---
 function isGoogleDomain(hostname) {
   const h = hostname.toLowerCase();
-  return /(?:^|\.)(?:google\.com|googleusercontent\.com|gstatic\.com|ggpht\.com|googleapis\.com)$/.test(h);
+  return /(?:^|\.)(?:google\.com|google-analytics\.com|googleusercontent\.com|gstatic\.com|ggpht\.com|googleapis\.com|googletagmanager\.com|googlesyndication\.com|googleadservices\.com|doubleclick\.net|youtube\.com|ytimg\.com|g\.co|gmail\.com|googlevideo\.com)$/.test(h);
 }
 
 // --- isValidPublisherUrl: returns false for URLs that are clearly not article
-//     pages — googleusercontent.com thumbnails/favicons, image resize CDN
-//     URLs (=w16, =w32, …), and bare image file paths. We check this after
-//     every Google News resolution attempt so image URLs extracted by mistake
-//     from base64 article IDs or HTML/RSS bodies never reach the fetch
-//     pipeline. ---
+//     pages — Google-owned infra (analytics, ads, CDNs), image-resize CDN URLs
+//     (=w16, =w32, …), bare image/asset/script/stylesheet file paths, and
+//     paths that look like tracking pixels. We check this after every Google
+//     News resolution attempt so non-article URLs never reach the fetch
+//     pipeline and end up getting summarized as if they were the article. ---
 function isValidPublisherUrl(url) {
   try {
     const u = new URL(url);
     const h = u.hostname.toLowerCase();
-    // Reject all *.googleusercontent.com (thumbnails, favicons, profile pics…)
-    if (/(?:^|\.)googleusercontent\.com$/.test(h)) return false;
-    // Reject image-resize CDN parameters like =w16, =w32, =w256
+    // Reject any Google-owned domain (analytics, ads, CDNs, etc.).
+    if (isGoogleDomain(h)) return false;
+    // Reject image-resize CDN parameters like =w16, =w32, =w256.
     if (/=w\d+/.test(u.href)) return false;
-    // Reject bare image file extensions
-    if (/\.(png|jpg|jpeg|ico|gif|webp)(\?.*)?$/i.test(u.pathname)) return false;
+    // Reject bare asset file extensions (images, scripts, styles, fonts…).
+    if (/\.(png|jpe?g|ico|gif|webp|svg|bmp|avif|js|mjs|css|json|xml|woff2?|ttf|otf|eot|map)$/i.test(u.pathname)) return false;
+    // Reject obvious tracking / pixel / tag paths.
+    if (/^\/(ads?|analytics|pixel|beacon|tag|tracking|collect|gtm)(\/|$)/i.test(u.pathname)) return false;
     return true;
   } catch (_) {
     return false;
@@ -858,9 +959,33 @@ async function discoverPublisherUrl(url) {
   }
 }
 
-// --- extractRssArticleLink: scans RSS 2.0 / Atom feed XML for the first
-//     publisher article URL (any <link> text content or href attribute that
-//     points to a non-google.com domain). ---
+// --- NON_ARTICLE_LINK_RELS: <link rel="…"> values that never point at the
+//     article body — preconnect / preload / stylesheet / icon / manifest /
+//     search etc. These show up liberally in Google News' stub HTML pages
+//     (preconnect to google-analytics, doubleclick, gstatic, …) and used to
+//     slip through as the resolved publisher URL. ---
+const NON_ARTICLE_LINK_RELS = new Set([
+  "preconnect", "preload", "prefetch", "dns-prefetch", "modulepreload",
+  "stylesheet", "icon", "apple-touch-icon", "apple-touch-icon-precomposed",
+  "mask-icon", "shortcut", "shortcut icon", "manifest", "search",
+  "alternate stylesheet", "pingback", "profile", "license", "author",
+]);
+
+function linkRelIsContent(relAttr) {
+  if (!relAttr) return true; // no rel → treat as plain content link
+  const tokens = relAttr.toLowerCase().trim().split(/\s+/);
+  // If ANY token marks this as non-content asset, skip it.
+  for (const t of tokens) {
+    if (NON_ARTICLE_LINK_RELS.has(t)) return false;
+  }
+  return true;
+}
+
+// --- extractRssArticleLink: scans RSS 2.0 / Atom feed XML (or Google News'
+//     HTML stub page when the RSS endpoint returns HTML) for the first
+//     publisher article URL. We *also* pass each candidate through
+//     isValidPublisherUrl so analytics/ad/asset URLs embedded as
+//     <link rel="preconnect"> or similar never surface as "the article". ---
 function extractRssArticleLink(xml) {
   if (!xml) return null;
   // RSS 2.0: <link>https://publisher.com/path</link>
@@ -869,15 +994,23 @@ function extractRssArticleLink(xml) {
   while ((m = rssRe.exec(xml)) !== null) {
     try {
       const u = new URL(m[1].trim());
-      if (!isGoogleDomain(u.hostname)) return u.href;
+      if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) return u.href;
     } catch (_) {}
   }
   // Atom / Google RSS extension: <link href="https://publisher.com/..." />
-  const atomRe = /<link[^>]+href\s*=\s*["'](https?:\/\/[^"']+)["'][^>]*>/gi;
+  // Skip <link rel="preconnect|preload|stylesheet|icon|…"> which are assets,
+  // not article pointers.
+  const atomRe = /<link\b([^>]*)\bhref\s*=\s*["'](https?:\/\/[^"']+)["']([^>]*)>/gi;
   while ((m = atomRe.exec(xml)) !== null) {
+    const attrsBefore = m[1] || "";
+    const attrsAfter = m[3] || "";
+    const relMatch =
+      /\brel\s*=\s*["']([^"']+)["']/i.exec(attrsBefore) ||
+      /\brel\s*=\s*["']([^"']+)["']/i.exec(attrsAfter);
+    if (!linkRelIsContent(relMatch && relMatch[1])) continue;
     try {
-      const u = new URL(m[1].trim());
-      if (!isGoogleDomain(u.hostname)) return u.href;
+      const u = new URL(m[2].trim());
+      if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) return u.href;
     } catch (_) {}
   }
   return null;
@@ -902,7 +1035,7 @@ function extractArticleUrlFromHtml(html) {
     if (!href) continue;
     try {
       const u = new URL(href);
-      if (!isGoogleDomain(u.hostname)) return u.href;
+      if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) return u.href;
     } catch (_) {}
   }
 
@@ -914,16 +1047,41 @@ function extractArticleUrlFromHtml(html) {
     if (!content) continue;
     try {
       const u = new URL(content);
-      if (!isGoogleDomain(u.hostname)) return u.href;
+      if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) return u.href;
     } catch (_) {}
   }
 
-  // Strategy 3: first absolute href not on a Google domain
-  const hrefRe = /\bhref\s*=\s*["'](https?:\/\/[^"'#\s]+)["']/gi;
-  while ((m = hrefRe.exec(html)) !== null) {
+  // Strategy 2b: meta http-equiv="refresh" content="0; url=…" redirect target.
+  //     Google News sometimes returns an HTML stub whose whole purpose is this
+  //     meta-refresh. The url= payload is the real publisher article.
+  const metaRefreshRe =
+    /<meta\b[^>]*\bhttp-equiv\s*=\s*["']refresh["'][^>]*\bcontent\s*=\s*["'][^"']*url\s*=\s*([^"']+)["']/gi;
+  while ((m = metaRefreshRe.exec(html)) !== null) {
+    const target = (m[1] || "").trim().replace(/^['"]|['"]$/g, "");
+    if (!target) continue;
     try {
-      const u = new URL(m[1].trim());
-      if (!isGoogleDomain(u.hostname)) return u.href;
+      const u = new URL(target);
+      if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) return u.href;
+    } catch (_) {}
+  }
+
+  // Strategy 3: first absolute href not on a Google domain. Skip <link> tags
+  //     whose rel marks them as assets (preconnect, preload, stylesheet, …)
+  //     or whose URL is clearly non-article (analytics/ads/scripts).
+  const tagRe = /<(a|link)\b([^>]*)\bhref\s*=\s*["'](https?:\/\/[^"'#\s]+)["']([^>]*)>/gi;
+  while ((m = tagRe.exec(html)) !== null) {
+    const tag = m[1].toLowerCase();
+    const attrsBefore = m[2] || "";
+    const attrsAfter = m[4] || "";
+    if (tag === "link") {
+      const relMatch =
+        /\brel\s*=\s*["']([^"']+)["']/i.exec(attrsBefore) ||
+        /\brel\s*=\s*["']([^"']+)["']/i.exec(attrsAfter);
+      if (!linkRelIsContent(relMatch && relMatch[1])) continue;
+    }
+    try {
+      const u = new URL(m[3].trim());
+      if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) return u.href;
     } catch (_) {}
   }
 
