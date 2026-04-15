@@ -350,49 +350,43 @@
 
   // --- requestModalSummary: shared path for the initial short summary and
   //     the "More context" detailed re-request. Uses activeRequestId to
-  //     drop stale responses if the user closes or reopens the modal. ---
-  async function requestModalSummary(link, mode) {
+  //     drop stale responses if the user closes or reopens the modal, and a
+  //     port-based connection to background.js so per-stage progress text
+  //     ("Reading the article…", "Looking in the Wayback Machine…") flows
+  //     back into the spinner label. ---
+  function requestModalSummary(link, mode) {
     const requestId = ++activeRequestId;
     showModalLoading();
-
-    let response;
-    try {
-      response = await Promise.resolve(
-        api.runtime.sendMessage({
-          type: "SUMMARIZE",
-          url: link.url,
-          headline: link.headline,
-          mode,
-        })
-      );
-    } catch (err) {
-      if (requestId !== activeRequestId) return;
-      renderError("ai_error", "Extension error. Try again.", link.headline, {
-        ok: false,
-        error: "ai_error",
-        message: "Extension error. Try again.",
-        debug: [{
-          t: 0,
-          stage: "sendMessage",
-          status: "fail",
-          detail: (err && err.message) || String(err),
-          data: null,
-        }],
-      });
-      return;
-    }
-
-    if (requestId !== activeRequestId) return;
-
-    if (!response) {
-      renderError("ai_error", "No response from extension.", link.headline, null);
-      return;
-    }
-    if (response.ok) {
-      renderSummary(response, link, mode);
-    } else {
-      renderError(response.error, response.message, link.headline, response);
-    }
+    runPortRequest(
+      { type: "SUMMARIZE", url: link.url, headline: link.headline, mode },
+      (response) => {
+        if (requestId !== activeRequestId) return;
+        if (!response) {
+          renderError("ai_error", "No response from extension.", link.headline, null);
+          return;
+        }
+        if (response.ok) {
+          renderSummary(response, link, mode);
+        } else {
+          renderError(response.error, response.message, link.headline, response);
+        }
+      },
+      (err) => {
+        if (requestId !== activeRequestId) return;
+        renderError("ai_error", "Extension error. Try again.", link.headline, {
+          ok: false,
+          error: "ai_error",
+          message: "Extension error. Try again.",
+          debug: [{
+            t: 0,
+            stage: "sendMessage",
+            status: "fail",
+            detail: (err && err.message) || String(err),
+            data: null,
+          }],
+        });
+      }
+    );
   }
 
   function showModalLoading() {
@@ -423,6 +417,15 @@
         response.contentStatusMessage ||
         "Article couldn't be fetched — answer is from AI knowledge.";
       wrap.appendChild(banner);
+    }
+
+    // "Source: …" line — which fetcher (article / Jina / Wayback / …) produced
+    // the text behind this summary.
+    if (response.articleSourceLabel) {
+      const srcLine = document.createElement("div");
+      srcLine.className = "sb-modal-source";
+      srcLine.textContent = "Source: " + response.articleSourceLabel;
+      wrap.appendChild(srcLine);
     }
 
     const text = document.createElement("div");
@@ -463,48 +466,85 @@
   // --- requestModalAlternateSource: asks the background to find a different
   //     publisher's coverage of the headline and renders the result. Tracks
   //     activeRequestId so closing the modal cancels the in-flight request. ---
-  async function requestModalAlternateSource(link) {
+  function requestModalAlternateSource(link) {
     const requestId = ++activeRequestId;
     showModalLoading();
     const loading = modalBodyEl.querySelector(".sb-modal-loading-text");
     if (loading) loading.textContent = "Finding another source\u2026";
+    runPortRequest(
+      { type: "ALTERNATE_SOURCE", url: link.url, headline: link.headline },
+      (response) => {
+        if (requestId !== activeRequestId) return;
+        if (!response) {
+          renderError("alt_error", "No response from extension.", link.headline, null);
+          return;
+        }
+        if (response.ok) {
+          renderAlternateSource(response, link);
+        } else {
+          renderError(response.error, response.message, link.headline, response);
+        }
+      },
+      (err) => {
+        if (requestId !== activeRequestId) return;
+        renderError("alt_error", "Extension error. Try again.", link.headline, {
+          ok: false,
+          error: "alt_error",
+          message: "Extension error. Try again.",
+          debug: [{
+            t: 0,
+            stage: "sendMessage",
+            status: "fail",
+            detail: (err && err.message) || String(err),
+            data: null,
+          }],
+        });
+      }
+    );
+  }
 
-    let response;
+  // --- runPortRequest: opens a chrome.runtime.connect port to background.js
+  //     so PROGRESS messages can stream into the modal spinner label while
+  //     the SUMMARIZE / ALTERNATE_SOURCE pipeline runs. Falls back to a
+  //     one-shot runtime.sendMessage if the port can't be opened. ---
+  function runPortRequest(request, onResult, onError) {
+    let port;
     try {
-      response = await Promise.resolve(
-        api.runtime.sendMessage({
-          type: "ALTERNATE_SOURCE",
-          url: link.url,
-          headline: link.headline,
-        })
-      );
+      port = api.runtime.connect({ name: "nobait-summarize" });
     } catch (err) {
-      if (requestId !== activeRequestId) return;
-      renderError("alt_error", "Extension error. Try again.", link.headline, {
-        ok: false,
-        error: "alt_error",
-        message: "Extension error. Try again.",
-        debug: [{
-          t: 0,
-          stage: "sendMessage",
-          status: "fail",
-          detail: (err && err.message) || String(err),
-          data: null,
-        }],
-      });
+      onError(err);
       return;
     }
-
-    if (requestId !== activeRequestId) return;
-
-    if (!response) {
-      renderError("alt_error", "No response from extension.", link.headline, null);
+    if (!port) {
+      Promise.resolve(api.runtime.sendMessage(request))
+        .then((response) => onResult(response))
+        .catch((err) => onError(err));
       return;
     }
-    if (response.ok) {
-      renderAlternateSource(response, link);
-    } else {
-      renderError(response.error, response.message, link.headline, response);
+    let settled = false;
+    port.onMessage.addListener((msg) => {
+      if (!msg || settled) return;
+      if (msg.type === "PROGRESS") {
+        const loadingEl = modalBodyEl.querySelector(".sb-modal-loading-text");
+        if (loadingEl && msg.text) loadingEl.textContent = msg.text;
+      } else if (msg.type === "RESULT") {
+        settled = true;
+        try { port.disconnect(); } catch (_) {}
+        onResult(msg.response);
+      }
+    });
+    port.onDisconnect.addListener(() => {
+      if (settled) return;
+      settled = true;
+      const err = (api.runtime && api.runtime.lastError) || new Error("port disconnected");
+      onError(err);
+    });
+    try {
+      port.postMessage(request);
+    } catch (err) {
+      settled = true;
+      try { port.disconnect(); } catch (_) {}
+      onError(err);
     }
   }
 
