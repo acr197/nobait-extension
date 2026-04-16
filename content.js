@@ -8,8 +8,8 @@
   const api = (typeof browser !== "undefined") ? browser : chrome;
 
   // --- Configuration ---
-  const LONG_PRESS_MS = 800;
-  const MOVE_THRESHOLD = 10;
+  const LONG_PRESS_MS = 500;
+  const MOVE_THRESHOLD = 5;
   const ANCHOR_TRAVERSAL_DEPTH = 10;
   const STORAGE_KEY = "triggerSettings";
 
@@ -53,7 +53,8 @@
   let startY = 0;
   let activePopupHost = null;
   let longPressTriggered = false;
-  let modifierHandledViaPointerUp = false;
+  let modifierHandledViaMouseUp = false;
+  let resolveRequestCounter = 0;
 
   // --- Trigger enable flags (loaded from storage) ---
   let enableLongClick = true;
@@ -118,10 +119,9 @@
   });
 
   // --- Event listeners ---
-  document.addEventListener("pointerdown", onPointerDown, true);
-  document.addEventListener("pointermove", onPointerMove, true);
-  document.addEventListener("pointerup", onPointerUp, true);
-  document.addEventListener("pointercancel", onPointerCancel, true);
+  document.addEventListener("mousedown", onMouseDown, true);
+  document.addEventListener("mousemove", onMouseMove, true);
+  document.addEventListener("mouseup", onMouseUp, true);
   document.addEventListener("click", onClickCapture, true);
 
   // =========================================================================
@@ -160,8 +160,8 @@
   // TRIGGER DETECTION
   // =========================================================================
 
-  // --- onPointerDown: starts the long-press timer on primary button ---
-  function onPointerDown(e) {
+  // --- onMouseDown: starts the long-press timer on primary button ---
+  function onMouseDown(e) {
     if (e.button !== 0) return;
     cancelPress();
 
@@ -182,8 +182,8 @@
     }, LONG_PRESS_MS);
   }
 
-  // --- onPointerMove: cancels long-press if the cursor drifts too far ---
-  function onPointerMove(e) {
+  // --- onMouseMove: cancels long-press if the cursor drifts too far ---
+  function onMouseMove(e) {
     if (!pressTimer) return;
     const dx = e.clientX - startX;
     const dy = e.clientY - startY;
@@ -192,15 +192,15 @@
     }
   }
 
-  // --- onPointerUp: cancels long-press if released before threshold,
-  //     and handles modifier-click triggers via pointerup (works on sites
+  // --- onMouseUp: cancels long-press if released before threshold,
+  //     and handles modifier-click triggers via mouseup (works on sites
   //     like Google News that intercept/eat click events) ---
-  function onPointerUp(e) {
+  function onMouseUp(e) {
     if (pressTimer) {
       cancelPress();
     }
 
-    // Handle shift+click and ctrl+click via pointerup so it works even when
+    // Handle shift+click and ctrl+click via mouseup so it works even when
     // the site eats the subsequent click event (e.g. Google News)
     if (e.button === 0 && !longPressTriggered) {
       const wantShift = e.shiftKey && !e.ctrlKey && enableShiftClick;
@@ -210,7 +210,7 @@
         if (anchor) {
           const href = resolveHref(anchor);
           if (href) {
-            modifierHandledViaPointerUp = true;
+            modifierHandledViaMouseUp = true;
             triggerPopup(anchor, href, e.clientX, e.clientY);
             return;
           }
@@ -223,14 +223,10 @@
     // from being silently eaten
     setTimeout(() => {
       longPressTriggered = false;
-      modifierHandledViaPointerUp = false;
+      modifierHandledViaMouseUp = false;
     }, 300);
   }
 
-  // --- onPointerCancel: cleanup on pointer interruption ---
-  function onPointerCancel() {
-    cancelPress();
-  }
 
   // --- onClickCapture: suppresses clicks after triggers, closes popup on outside click ---
   function onClickCapture(e) {
@@ -242,9 +238,9 @@
       return;
     }
 
-    // Suppress the click that fires after a modifier-click handled via pointerup
-    if (modifierHandledViaPointerUp) {
-      modifierHandledViaPointerUp = false;
+    // Suppress the click that fires after a modifier-click handled via mouseup
+    if (modifierHandledViaMouseUp) {
+      modifierHandledViaMouseUp = false;
       e.preventDefault();
       e.stopImmediatePropagation();
       return;
@@ -259,14 +255,12 @@
     }
   }
 
-  // --- triggerPopup: validates the URL, sets suppress flag, and opens the popup ---
+  // --- triggerPopup: validates the URL, resolves any redirect via the
+  //     background service worker (nobaitv2 strategy), then opens the popup ---
   function triggerPopup(anchor, href, x, y) {
     if (isBlockedUrl(href)) return;
 
     longPressTriggered = true;
-
-    // Try to unwrap Google News redirect URLs
-    const finalHref = unwrapGoogleNewsUrl(anchor, href);
 
     const headline = extractHeadline(anchor);
     if (!headline) {
@@ -274,7 +268,20 @@
       return;
     }
 
-    showPopup(finalHref, headline, x, y);
+    // Send resolve-url to the background service worker (tab-navigation +
+    // HTTP-redirect strategy from nobaitv2). showPopup is called with the
+    // resolved publisher URL so every downstream step gets the real article URL.
+    const reqId = "req-" + (++resolveRequestCounter) + "-" + Date.now();
+    api.runtime.sendMessage(
+      { type: "resolve-url", url: href, requestId: reqId },
+      (response) => {
+        let resolvedHref = href;
+        if (!api.runtime.lastError && response && response.success && response.resolvedUrl) {
+          resolvedHref = response.resolvedUrl;
+        }
+        showPopup(resolvedHref, headline, x, y);
+      }
+    );
   }
 
   // --- cancelPress: clears the long-press timer ---
