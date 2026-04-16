@@ -102,6 +102,27 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return responsePromise;
   }
+
+  // "resolve-url" — asked by content.js (nobaitv2 strategy) before SUMMARIZE
+  if (msg.type === "resolve-url") {
+    const originalUrl = msg.url;
+    const requestId = msg.requestId || "unknown";
+    resolveUrl(originalUrl, requestId)
+      .then((result) => {
+        try { sendResponse(result); } catch (_) {}
+      })
+      .catch((error) => {
+        try {
+          sendResponse({
+            success: false,
+            error: error.message,
+            originalUrl,
+            requestId,
+          });
+        } catch (_) {}
+      });
+    return true; // keep channel open for async sendResponse
+  }
 });
 
 // --- Port listener: progressive SUMMARIZE / ALTERNATE_SOURCE. Lets the popup
@@ -154,6 +175,223 @@ api.runtime.onConnect.addListener((port) => {
   });
 });
 
+// ── URL resolver (transplanted verbatim from nobaitv2) ───────────────────────
+// Strategies: (1) background tab navigation — follows JS redirects; (2) HTTP
+// HEAD/GET redirect following; (3) HTML meta-refresh / canonical / JS pattern
+// parsing. resolveUrl() orchestrates the pipeline and is called at the top of
+// handleSummarize so every downstream step receives the real publisher URL.
+
+const RESOLVE_FETCH_TIMEOUT_MS = 8000;
+const RESOLVE_TAB_HARD_TIMEOUT_MS = 12000;
+const RESOLVE_TAB_SETTLE_DELAY_MS = 1500;
+
+async function resolveViaTab(originalUrl, requestId) {
+  return new Promise((resolve) => {
+    let finalUrl = originalUrl;
+    let resolved = false;
+    let tabId = null;
+    let settleTimer = null;
+
+    const finish = () => {
+      if (resolved) return;
+      resolved = true;
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      chrome.tabs.onRemoved.removeListener(onRemoved);
+      if (settleTimer) clearTimeout(settleTimer);
+      if (tabId !== null) {
+        chrome.tabs.remove(tabId).catch(() => {});
+      }
+      resolve(finalUrl);
+    };
+
+    const onUpdated = (id, changeInfo, tab) => {
+      if (id !== tabId) return;
+      if (
+        tab.url &&
+        tab.url !== "about:blank" &&
+        !tab.url.startsWith("chrome://") &&
+        !tab.url.startsWith("chrome-error://")
+      ) {
+        finalUrl = tab.url;
+      }
+      if (changeInfo.url && changeInfo.url !== originalUrl) {
+        finalUrl = changeInfo.url;
+        if (settleTimer) clearTimeout(settleTimer);
+        settleTimer = null;
+      }
+      if (changeInfo.status === "complete") {
+        if (settleTimer) clearTimeout(settleTimer);
+        const delay = finalUrl !== originalUrl ? 500 : RESOLVE_TAB_SETTLE_DELAY_MS;
+        settleTimer = setTimeout(finish, delay);
+      }
+    };
+
+    const onRemoved = (id) => {
+      if (id === tabId) finish();
+    };
+
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.onRemoved.addListener(onRemoved);
+
+    chrome.tabs.create({ url: originalUrl, active: false }, (tab) => {
+      if (chrome.runtime.lastError) {
+        resolved = true;
+        resolve(null);
+        return;
+      }
+      tabId = tab.id;
+    });
+
+    setTimeout(finish, RESOLVE_TAB_HARD_TIMEOUT_MS);
+  });
+}
+
+async function resolveViaFetch(originalUrl, requestId) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), RESOLVE_FETCH_TIMEOUT_MS);
+
+  try {
+    const headResp = await fetch(originalUrl, {
+      method: "HEAD",
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (headResp.redirected && headResp.url !== originalUrl) {
+      return { url: headResp.url, method: "http-redirect", status: headResp.status };
+    }
+
+    const getController = new AbortController();
+    const getTimeout = setTimeout(() => getController.abort(), RESOLVE_FETCH_TIMEOUT_MS);
+    const getResp = await fetch(originalUrl, {
+      method: "GET",
+      redirect: "follow",
+      signal: getController.signal,
+    });
+    clearTimeout(getTimeout);
+
+    if (getResp.url !== originalUrl) {
+      return { url: getResp.url, method: "http-redirect-get", status: getResp.status };
+    }
+
+    const html = await getResp.text();
+    const htmlResult = extractRedirectFromHtml(html, originalUrl);
+    if (htmlResult) {
+      return { url: htmlResult.url, method: htmlResult.method, status: getResp.status };
+    }
+
+    return null;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    return null;
+  }
+}
+
+function extractRedirectFromHtml(html, originalUrl) {
+  let originalOrigin;
+  try {
+    originalOrigin = new URL(originalUrl).origin;
+  } catch {
+    return null;
+  }
+
+  const metaRefreshPatterns = [
+    /<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*?url=["']?([^"'\s;>]+)/i,
+    /<meta[^>]+content=["'][^"']*?url=["']?([^"'\s;>]+)["']?[^>]+http-equiv=["']refresh["']/i,
+  ];
+  for (const pattern of metaRefreshPatterns) {
+    const m = html.match(pattern);
+    if (m && m[1] && m[1] !== originalUrl) {
+      return { url: m[1], method: "meta-refresh" };
+    }
+  }
+
+  const canonicalPatterns = [
+    /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i,
+    /<link[^>]+href=["']([^"']+)["'][^>]+rel=["']canonical["']/i,
+  ];
+  for (const pattern of canonicalPatterns) {
+    const m = html.match(pattern);
+    if (m && m[1]) {
+      try {
+        if (new URL(m[1]).origin !== originalOrigin) {
+          return { url: m[1], method: "canonical" };
+        }
+      } catch {}
+    }
+  }
+
+  const ogUrlPatterns = [
+    /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:url["']/i,
+  ];
+  for (const pattern of ogUrlPatterns) {
+    const m = html.match(pattern);
+    if (m && m[1]) {
+      try {
+        if (new URL(m[1]).origin !== originalOrigin) {
+          return { url: m[1], method: "og:url" };
+        }
+      } catch {}
+    }
+  }
+
+  const jsRedirectPatterns = [
+    /window\.location(?:\.href)?\s*=\s*["']([^"']+)["']/i,
+    /window\.location\.replace\(\s*["']([^"']+)["']\s*\)/i,
+    /document\.location(?:\.href)?\s*=\s*["']([^"']+)["']/i,
+  ];
+  for (const pattern of jsRedirectPatterns) {
+    const m = html.match(pattern);
+    if (m && m[1] && m[1] !== originalUrl && m[1].startsWith("http")) {
+      return { url: m[1], method: "js-redirect" };
+    }
+  }
+
+  return null;
+}
+
+async function resolveUrl(originalUrl, requestId) {
+  const tabResult = await resolveViaTab(originalUrl, requestId);
+
+  if (tabResult && tabResult !== originalUrl) {
+    return {
+      success: true,
+      resolvedUrl: tabResult,
+      originalUrl,
+      status: 200,
+      redirected: true,
+      method: "tab-navigation",
+      requestId,
+    };
+  }
+
+  const fetchResult = await resolveViaFetch(originalUrl, requestId);
+
+  if (fetchResult) {
+    return {
+      success: true,
+      resolvedUrl: fetchResult.url,
+      originalUrl,
+      status: fetchResult.status,
+      redirected: true,
+      method: fetchResult.method,
+      requestId,
+    };
+  }
+
+  return {
+    success: true,
+    resolvedUrl: originalUrl,
+    originalUrl,
+    status: 200,
+    redirected: false,
+    method: "none",
+    requestId,
+  };
+}
+
 // --- ARTICLE_SOURCE_LABELS: human-friendly names for each internal fetcher.
 //     Shown at the top of the final popup so the user can tell whether the
 //     summary came from the article itself, an archive snapshot, a search
@@ -161,7 +399,6 @@ api.runtime.onConnect.addListener((port) => {
 //     set in handleSummarize / handleAlternateSource. ---
 const ARTICLE_SOURCE_LABELS = {
   "direct_fetch": "the article",
-  "direct_fetch(google_news_resolved)": "the article (resolved from Google News)",
   "jina_reader": "Jina Reader",
   "wayback": "the Wayback Machine",
   "archive_today": "Archive.today",
@@ -203,74 +440,26 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   let articleSource = null; // label for the fetcher that succeeded
   let fetchError = null;
 
-  // Google News URLs: /articles/ and /read/ pages are JS-redirect stubs whose
-  // rendered HTML contains no valid outbound URL — scraping the stub always
-  // fails and burns time before the full fallback chain (Jina, Wayback, …).
-  // Instead, resolve the publisher URL via Google's batchexecute API using the
-  // data-n-a-sg / data-n-a-ts values embedded in the articles page. When the
-  // API succeeds, fetch the publisher article directly and skip Jina/Wayback/
-  // archive.today entirely (those services rarely index stub pages anyway).
-  let realUrl = url;
-  const articleId = extractGoogleNewsArticleId(url);
-  // true when batchexecute returned a publisher URL — used below to skip the
-  // archive-service fallbacks whose redirects the stub page can't satisfy.
-  let batchexecuteResolved = false;
+  // Resolve any redirect (including Google News → publisher) via the
+  // nobaitv2 tab-navigation + HTTP-redirect strategy before the pipeline.
+  const resolveResult = await resolveUrl(url, "summarize-" + Date.now());
+  let realUrl = resolveResult.resolvedUrl;
+  debug.log("url_resolve", resolveResult.redirected ? "ok" : "info",
+    resolveResult.redirected ? "URL resolved to publisher" : "no redirect detected",
+    { original: url, resolved: realUrl, method: resolveResult.method });
 
-  if (articleId) {
-    debug.log("google_news", "info", "Google News stub detected, resolving via batchexecute", { articleId });
-    progress("Resolving the Google News link\u2026");
-
-    const publisherUrl = await resolveGoogleNewsViaBatchexecute(articleId, debug);
-
-    if (publisherUrl) {
-      batchexecuteResolved = true;
-      realUrl = publisherUrl;
-      debug.log("direct_fetch", "info", "fetching resolved publisher URL", { url: publisherUrl });
-      progress("Reading the article\u2026");
-      try {
-        const meta = {};
-        articleText = await fetchArticle(publisherUrl, { meta });
-        articleSource = "direct_fetch(google_news_resolved)";
-        fetchError = null;
-        debug.log("direct_fetch", "ok", `got ${articleText.length} chars`, {
-          length: articleText.length,
-          finalUrl: meta.finalUrl || publisherUrl,
-          preview: previewText(articleText),
-        });
-      } catch (err) {
-        fetchError = captureFetchError(err);
-        debug.log("direct_fetch", "fail", fetchError.message, {
-          errorType: fetchError.type,
-        });
-      }
-    } else {
-      debug.log("google_news", "fail", "could not resolve publisher URL", {
-        errorType: "fetch_failed",
-      });
-    }
-  }
-
-  // For a Google News URL whose publisher URL couldn't be resolved, realUrl
-  // still points at the GNews stub. The standard fetch path below will try it
-  // directly; the search fallbacks suppress "news.google.com" as publisher
-  // context so the ranker isn't confused by the aggregator domain.
-  const gnewsUnresolved = !!articleId && realUrl === url;
-
-  // Standard path: fetch the requested URL directly.
+  // Standard path: fetch the resolved URL directly.
   if (!articleText) {
-    debug.log("direct_fetch", "info", "attempting direct fetch", {
-      url,
-      note: gnewsUnresolved ? "GNews publisher URL unresolved; fetching stub directly" : undefined,
-    });
+    debug.log("direct_fetch", "info", "attempting direct fetch", { url: realUrl });
     progress("Reading the article\u2026");
     try {
       const meta = {};
-      articleText = await fetchArticle(url, { meta });
+      articleText = await fetchArticle(realUrl, { meta });
       articleSource = "direct_fetch";
       fetchError = null;
       debug.log("direct_fetch", "ok", `got ${articleText.length} chars`, {
         length: articleText.length,
-        finalUrl: meta.finalUrl || url,
+        finalUrl: meta.finalUrl || realUrl,
         redirected: meta.httpRedirected || false,
         preview: previewText(articleText),
       });
@@ -287,10 +476,7 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   // Fallback #1: server-side Reader API (Jina). Catches JS-rendered SPAs
   // (Tom's Guide, most modern news sites) whose direct HTML is a near-empty
   // skeleton, and sites whose bot protection blocks our direct fetch.
-  // Skip for Google News articles where batchexecute already resolved the
-  // publisher URL — archive services don't index stubs and Jina can't follow
-  // the JS redirect any better than direct fetch on the real publisher URL.
-  if (!articleText && !batchexecuteResolved) {
+  if (!articleText) {
     debug.log("jina_reader", "info", "attempting Jina Reader API", { url: realUrl });
     progress("Trying a reader service\u2026");
     try {
@@ -318,8 +504,7 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   // Fallback #2: Wayback Machine. When direct fetch and Jina both fail
   // (paywall, anti-bot, JS SPA that doesn't render for headless fetchers),
   // archive.org usually has a static snapshot that's trivially readable.
-  // Skip for Google News articles resolved via batchexecute (see Fallback #1).
-  if (!articleText && !batchexecuteResolved) {
+  if (!articleText) {
     debug.log("wayback", "info", "attempting Wayback Machine", { url: realUrl });
     progress("Looking in the Wayback Machine\u2026");
     try {
@@ -344,8 +529,8 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   // Fallback #3: Archive.today (archive.ph). Often succeeds on paywalled or
   // Cloudflare-protected sites that Wayback doesn't cover. Separate from
   // Wayback because the two services have largely non-overlapping snapshot
-  // coverage. Skip for Google News articles resolved via batchexecute.
-  if (!articleText && !batchexecuteResolved) {
+  // coverage.
+  if (!articleText) {
     debug.log("archive_today", "info", "attempting Archive.today", { url: realUrl });
     progress("Checking Archive.today\u2026");
     try {
@@ -373,11 +558,8 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   // publisher's coverage of the same story), but the content is still
   // real reporting rather than an AI guess. This rescues JS-rendered SPAs
   // that Jina can't render and sites without archive snapshots.
-  // When the original URL is a Google News stub we never resolved, pass
-  // null for the search scope so the headline alone drives the query
-  // (including "news.google.com" as a publisher would confuse the ranker).
   if (!articleText) {
-    const searchUrl = gnewsUnresolved ? null : realUrl;
+    const searchUrl = realUrl;
     debug.log("search", "info", "attempting search-based retrieval", {
       headline,
       originalUrl: searchUrl,
@@ -426,10 +608,8 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   // /summarize endpoint with { text: headline }. The Worker holds the OpenAI
   // key in Cloudflare secrets and performs the live web search — the
   // extension never talks to api.openai.com directly.
-  // When the original URL is an unresolved Google News stub, pass null so
-  // the publisher context sent to the proxy isn't "news.google.com".
   if (!articleText) {
-    const openaiUrl = gnewsUnresolved ? null : realUrl;
+    const openaiUrl = realUrl;
     debug.log("openai_search", "info", "attempting web search via proxy Worker", {
       headline,
       url: openaiUrl,
@@ -467,13 +647,11 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   // into Claude.ai / ChatGPT. The AI uses web search (if available) or its
   // training knowledge to answer. We flag the response with source:"knowledge"
   // so the popup can show the user that the answer is NOT from the article.
-  // When the original URL is an unresolved Google News stub, pass null so
-  // the prompt doesn't include "news.google.com" as the publisher.
   if (!articleText) {
     debug.log("ai_knowledge", "info", "all fetch paths failed, asking AI from knowledge");
     progress("Asking AI from its own knowledge\u2026");
     try {
-      const knowledgeUrl = gnewsUnresolved ? null : realUrl;
+      const knowledgeUrl = realUrl;
       const summary = await callAISearch(headline, knowledgeUrl, mode);
       debug.log("ai_knowledge", "ok", `AI returned ${summary.length} chars`, {
         length: summary.length,
@@ -877,173 +1055,6 @@ function formatDate(raw) {
     return d.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
   } catch (_) {
     return d.toISOString().substring(0, 10);
-  }
-}
-
-// --- isGoogleDomain: returns true for google.com and Google-owned CDN / asset /
-//     analytics / ad domains that will never host publisher articles. The list
-//     covers the infrastructure Google News preconnects to in its stub HTML
-//     pages — those preconnect <link> tags used to slip through resolution as
-//     "publisher URLs". ---
-function isGoogleDomain(hostname) {
-  const h = hostname.toLowerCase();
-  return /(?:^|\.)(?:google\.com|google-analytics\.com|googleusercontent\.com|gstatic\.com|ggpht\.com|googleapis\.com|googletagmanager\.com|googlesyndication\.com|googleadservices\.com|doubleclick\.net|youtube\.com|ytimg\.com|g\.co|gmail\.com|googlevideo\.com)$/.test(h);
-}
-
-// --- isValidPublisherUrl: returns false for URLs that are clearly not article
-//     pages — Google-owned infra (analytics, ads, CDNs), image-resize CDN URLs
-//     (=w16, =w32, …), bare image/asset/script/stylesheet file paths, and
-//     paths that look like tracking pixels. We check this after every Google
-//     News resolution attempt so non-article URLs never reach the fetch
-//     pipeline and end up getting summarized as if they were the article. ---
-function isValidPublisherUrl(url) {
-  try {
-    const u = new URL(url);
-    const h = u.hostname.toLowerCase();
-    // Reject any Google-owned domain (analytics, ads, CDNs, etc.).
-    if (isGoogleDomain(h)) return false;
-    // Reject image-resize CDN parameters like =w16, =w32, =w256.
-    if (/=w\d+/.test(u.href)) return false;
-    // Reject bare asset file extensions (images, scripts, styles, fonts…).
-    if (/\.(png|jpe?g|ico|gif|webp|svg|bmp|avif|js|mjs|css|json|xml|woff2?|ttf|otf|eot|map)$/i.test(u.pathname)) return false;
-    // Reject obvious tracking / pixel / tag paths.
-    if (/^\/(ads?|analytics|pixel|beacon|tag|tracking|collect|gtm)(\/|$)/i.test(u.pathname)) return false;
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-// --- extractGoogleNewsArticleId: returns the encoded article ID segment (the
-//     CBMi… token) from a news.google.com /articles/, /rss/articles/, or
-//     /read/ URL. Returns null for any non-Google-News URL. ---
-function extractGoogleNewsArticleId(url) {
-  try {
-    const u = new URL(url);
-    const host = u.hostname.toLowerCase();
-    if (host !== "news.google.com" && !host.endsWith(".news.google.com")) return null;
-    const m = u.pathname.match(/\/(?:rss\/articles|articles|read)\/([A-Za-z0-9_-]{10,})/);
-    return m ? m[1] : null;
-  } catch (_) {
-    return null;
-  }
-}
-
-// --- resolveGoogleNewsViaBatchexecute: resolves a Google News article ID to
-//     the real publisher URL using Google's batchexecute API.
-//
-//     Step 1 — GET news.google.com/articles/{articleId}: extracts the signing
-//     parameters data-n-a-sg (signature) and data-n-a-ts (timestamp) from the
-//     c-wiz > div element in the page HTML.
-//
-//     Step 2 — POST to /_/DotsSplashUi/data/batchexecute: sends a garturlreq
-//     payload built from the article ID, timestamp, and signature. Parses the
-//     JSON-like response for the first https:// URL that is not on a Google
-//     domain.
-//
-//     Returns the publisher URL string on success, or null on any failure. ---
-async function resolveGoogleNewsViaBatchexecute(articleId, debug) {
-  // --- Step 1: fetch the article stub page and extract signing params ---
-  let sg, ts;
-  {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
-    try {
-      const resp = await fetch(`https://news.google.com/articles/${articleId}`, {
-        signal: controller.signal,
-        headers: {
-          "User-Agent": BROWSER_UA,
-          "Accept": "text/html,application/xhtml+xml,application/xml,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9",
-        },
-      });
-      clearTimeout(timer);
-      if (!resp.ok) {
-        debug.log("google_news", "info", "batchexecute step1 bad status", { status: resp.status });
-        return null;
-      }
-      const html = await resp.text();
-      const sgMatch = html.match(/data-n-a-sg\s*=\s*["']([^"']+)["']/);
-      const tsMatch = html.match(/data-n-a-ts\s*=\s*["']([^"']+)["']/);
-      if (!sgMatch || !tsMatch) {
-        debug.log("google_news", "info", "batchexecute step1: signing params not found in HTML");
-        return null;
-      }
-      sg = sgMatch[1];
-      ts = tsMatch[1];
-      debug.log("google_news", "info", "batchexecute step1 ok", { ts, sg: sg.substring(0, 20) + (sg.length > 20 ? "…" : "") });
-    } catch (err) {
-      clearTimeout(timer);
-      debug.log("google_news", "info", "batchexecute step1 error", { error: err.message });
-      return null;
-    }
-  }
-
-  // --- Step 2: POST batchexecute to get the real article URL ---
-  // Build the inner garturlreq string via template literal interpolation so
-  // the quotes are literal characters that JSON.stringify then escapes once.
-  // Using JSON.stringify on a nested JS object would double-escape the inner
-  // quotes and produce a payload Google rejects with 400.
-  const innerString =
-    `["garturlreq",` +
-    `[["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,null,null,null,0,1],` +
-    `"X","X",1,[1,1,1],1,1,null,0,0,null,0],` +
-    `"${articleId}",${parseInt(ts, 10)},"${sg}"]`;
-  const freqParam = JSON.stringify([[["Fbv4je", innerString]]]);
-
-  {
-    // Log the raw (unencoded) f.req value so failures are diagnosable even if
-    // the encoding itself is correct.
-    debug.log("google_news", "info", "batchexecute step2 freqParam", {
-      freqParam: freqParam.substring(0, 200) + (freqParam.length > 200 ? "\u2026" : ""),
-    });
-    const postBody = "f.req=" + encodeURIComponent(freqParam);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
-    try {
-      const resp = await fetch(
-        "https://news.google.com/_/DotsSplashUi/data/batchexecute",
-        {
-          method: "POST",
-          signal: controller.signal,
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-            "User-Agent": BROWSER_UA,
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-          },
-          body: postBody,
-        },
-      );
-      clearTimeout(timer);
-      if (!resp.ok) {
-        debug.log("google_news", "info", "batchexecute step2 bad status", { status: resp.status });
-        return null;
-      }
-      const text = await resp.text();
-      // The response is a JSON-like envelope — scan it for the first
-      // https:// URL that does not belong to a Google-owned domain.
-      for (const m of text.matchAll(/https:\/\/[^\s"'\\,\]\[)>]+/g)) {
-        const raw = m[0]
-          .replace(/\\u003d/gi, "=")
-          .replace(/\\u0026/gi, "&")
-          .replace(/\\u002f/gi, "/")
-          .replace(/[\\]+$/, ""); // strip trailing escape artefacts
-        try {
-          const u = new URL(raw);
-          if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) {
-            debug.log("google_news", "ok", "batchexecute resolved publisher URL", { publisherUrl: u.href });
-            return u.href;
-          }
-        } catch (_) {}
-      }
-      debug.log("google_news", "info", "batchexecute step2: no non-google URL found in response");
-      return null;
-    } catch (err) {
-      clearTimeout(timer);
-      debug.log("google_news", "info", "batchexecute step2 error", { error: err.message });
-      return null;
-    }
   }
 }
 
