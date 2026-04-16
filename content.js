@@ -255,8 +255,8 @@
     }
   }
 
-  // --- triggerPopup: validates the URL, resolves any redirect via the
-  //     background service worker (nobaitv2 strategy), then opens the popup ---
+  // --- triggerPopup: validates the URL, resolves Google News redirects,
+  //     then opens the popup ---
   function triggerPopup(anchor, href, x, y) {
     if (isBlockedUrl(href)) return;
 
@@ -268,9 +268,27 @@
       return;
     }
 
-    // Send resolve-url to the background service worker (tab-navigation +
-    // HTTP-redirect strategy from nobaitv2). showPopup is called with the
-    // resolved publisher URL so every downstream step gets the real article URL.
+    // Only Google News URLs need background resolution (they use JS redirects).
+    // Direct publisher URLs go straight to showPopup with no tab opened.
+    let isGNewsUrl = false;
+    try {
+      const host = new URL(href).hostname.toLowerCase();
+      isGNewsUrl = host === "news.google.com" || host.endsWith(".news.google.com");
+    } catch (_) {}
+
+    if (!isGNewsUrl) {
+      showPopup(href, headline, x, y);
+      return;
+    }
+
+    // Google News URL — try quick DOM extraction first (instant, no background hop).
+    const domResolved = unwrapGoogleNewsUrl(anchor, href);
+    if (domResolved !== href) {
+      showPopup(domResolved, headline, x, y);
+      return;
+    }
+
+    // Google News URL that needs the background resolver (tab-navigation strategy).
     const reqId = "req-" + (++resolveRequestCounter) + "-" + Date.now();
     api.runtime.sendMessage(
       { type: "resolve-url", url: href, requestId: reqId },
