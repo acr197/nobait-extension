@@ -403,6 +403,24 @@ async function handleSummarize(url, headline, mode, sendProgress) {
     }
   }
 
+  // Thin-content guard: if the extracted text is under 800 chars it is almost
+  // certainly a JS-render placeholder, paywall stub, or navigation shell —
+  // not the real article. Calling the AI with stub content produces answers
+  // like "The article doesn't list…" even when the real page is a full
+  // listicle. Clear articleText so Fallbacks #5 and #6 (AI web search / AI
+  // knowledge) run instead. The ai_summarize log already records contentLength
+  // so the raw number is visible in the debug trace for every call.
+  if (articleText && articleText.length < 800) {
+    debug.log("ai_summarize", "info", "content too thin for AI, treating as fetch failure", {
+      contentLength: articleText.length,
+      articleSource,
+    });
+    if (!fetchError) {
+      fetchError = { type: "fetch_failed", message: `Content too short (${articleText.length} chars) \u2014 likely a stub or paywall interstitial.` };
+    }
+    articleText = null;
+  }
+
   // Fallback #5: OpenAI-backed web search via the Cloudflare Worker proxy.
   // Sends the article headline (plus publisher, if known) to the Worker's
   // /summarize endpoint with { text: headline }. The Worker holds the OpenAI
@@ -691,10 +709,10 @@ async function findAlternateCandidates(headline, originalUrl) {
   const seen = new Set();
   const filtered = [];
 
-  for (const candidate of candidates) {
-    // Check blocked hosts first so their shared canonical key (e.g. all
-    // bing.com/ck/a redirect URLs → "bing.com/ck/a") never enters `seen`
-    // and doesn't cause subsequent valid publisher URLs to be deduplicated.
+  for (let candidate of candidates) {
+    // Resolve Bing tracking redirects to the real publisher URL first.
+    const bingDecoded = decodeBingRedirect(candidate);
+    if (bingDecoded) candidate = bingDecoded;
     if (isBlockedSearchHost(candidate)) continue;
     const key = canonicalizeForCompare(candidate);
     if (!key || seen.has(key)) continue;
@@ -962,28 +980,24 @@ async function resolveGoogleNewsViaBatchexecute(articleId, debug) {
   }
 
   // --- Step 2: POST batchexecute to get the real article URL ---
-  // Inner payload is a JSON-stringified garturlreq array; the timestamp comes
-  // from the page as a string but the API expects it as a number.
-  const innerPayload = JSON.stringify([
-    "garturlreq",
-    [
-      ["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,null,null,null,0,1],
-      "X","X",1,[1,1,1],1,1,null,0,0,null,0,
-    ],
-    articleId,
-    parseInt(ts, 10),
-    sg,
-  ]);
-  const freqParam = JSON.stringify([[["Fbv4je", innerPayload]]]);
+  // Build the inner garturlreq string via template literal interpolation so
+  // the quotes are literal characters that JSON.stringify then escapes once.
+  // Using JSON.stringify on a nested JS object would double-escape the inner
+  // quotes and produce a payload Google rejects with 400.
+  const innerString =
+    `["garturlreq",` +
+    `[["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,null,null,null,0,1],` +
+    `"X","X",1,[1,1,1],1,1,null,0,0,null,0],` +
+    `"${articleId}",${parseInt(ts, 10)},"${sg}"]`;
+  const freqParam = JSON.stringify([[["Fbv4je", innerString]]]);
 
   {
-    // Build the body as a plain string using encodeURIComponent — this is
-    // required by the batchexecute endpoint. URLSearchParams encodes spaces
-    // as "+" which can cause a 400 when the signature contains whitespace.
-    const postBody = "f.req=" + encodeURIComponent(freqParam);
-    debug.log("google_news", "info", "batchexecute step2 sending", {
-      bodyPreview: postBody.substring(0, 120) + (postBody.length > 120 ? "…" : ""),
+    // Log the raw (unencoded) f.req value so failures are diagnosable even if
+    // the encoding itself is correct.
+    debug.log("google_news", "info", "batchexecute step2 freqParam", {
+      freqParam: freqParam.substring(0, 200) + (freqParam.length > 200 ? "\u2026" : ""),
     });
+    const postBody = "f.req=" + encodeURIComponent(freqParam);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 8000);
     try {
@@ -1467,13 +1481,14 @@ async function fetchViaSearchResults(headline, originalUrl, onDebug) {
   const originalKey = canonicalizeForCompare(originalUrl);
   const filtered = [];
   const rejected = [];
-  for (const candidate of candidates) {
-    // Reject blocked hosts (bing.com/ck/a redirects, news.google.com, social
-    // media, etc.) BEFORE touching `seen`. All bing.com/ck/a redirect URLs
-    // share the canonical key "bing.com/ck/a"; adding one to `seen` before
-    // checking isBlockedSearchHost causes every subsequent candidate with that
-    // same key to be labeled "duplicate/invalid" instead of "blocked host",
-    // which then poisons the dedupe set for any real publisher URLs that follow.
+  for (let candidate of candidates) {
+    // Resolve Bing tracking redirects (bing.com/ck/a?...&u=a1<base64>...)
+    // to the real publisher URL before any filtering or deduplication.
+    // Without this, all Bing redirect URLs canonicalize to "bing.com/ck/a",
+    // the first one pollutes `seen`, and every subsequent one is falsely
+    // labeled "duplicate/invalid".
+    const bingDecoded = decodeBingRedirect(candidate);
+    if (bingDecoded) candidate = bingDecoded;
     if (isBlockedSearchHost(candidate)) { rejected.push({ url: candidate, reason: "blocked host" }); continue; }
     const key = canonicalizeForCompare(candidate);
     if (!key || seen.has(key)) { rejected.push({ url: candidate, reason: "duplicate/invalid" }); continue; }
@@ -1607,6 +1622,30 @@ function decodeDuckDuckGoRedirect(href) {
       return u.searchParams.get("uddg");
     }
     return u.href;
+  } catch (_) {
+    return null;
+  }
+}
+
+// --- decodeBingRedirect: if `url` is a bing.com/ck/a tracking redirect,
+//     extracts the real target URL from the `u` query parameter (which is
+//     "a1" + base64url-encoded target). Returns the decoded URL on success,
+//     or null if the URL is not a Bing redirect or cannot be decoded. ---
+function decodeBingRedirect(url) {
+  try {
+    const u = new URL(url);
+    if (!u.hostname.endsWith("bing.com")) return null;
+    if (!u.pathname.startsWith("/ck/a")) return null;
+    const uParam = u.searchParams.get("u");
+    if (!uParam || !uParam.startsWith("a1")) return null;
+    // Strip the "a1" sentinel prefix before base64url-decoding.
+    const b64 = uParam.slice(2).replace(/-/g, "+").replace(/_/g, "/");
+    const decoded = atob(b64);
+    const target = new URL(decoded);
+    if (target.protocol === "https:" || target.protocol === "http:") {
+      return target.href;
+    }
+    return null;
   } catch (_) {
     return null;
   }
