@@ -353,20 +353,32 @@ function extractRedirectFromHtml(html, originalUrl) {
 }
 
 async function resolveUrl(originalUrl, requestId) {
-  const tabResult = await resolveViaTab(originalUrl, requestId);
+  // Tab navigation follows JavaScript redirects. Only Google News article
+  // pages use JS redirects — all other domains use plain HTTP redirects or
+  // no redirect at all. Skipping the tab for non-GNews URLs avoids opening
+  // a visible background tab and eliminates the 5-12 s settle latency.
+  let isGNewsUrl = false;
+  try {
+    const host = new URL(originalUrl).hostname.toLowerCase();
+    isGNewsUrl = host === "news.google.com" || host.endsWith(".news.google.com");
+  } catch (_) {}
 
-  if (tabResult && tabResult !== originalUrl) {
-    return {
-      success: true,
-      resolvedUrl: tabResult,
-      originalUrl,
-      status: 200,
-      redirected: true,
-      method: "tab-navigation",
-      requestId,
-    };
+  if (isGNewsUrl) {
+    const tabResult = await resolveViaTab(originalUrl, requestId);
+    if (tabResult && tabResult !== originalUrl) {
+      return {
+        success: true,
+        resolvedUrl: tabResult,
+        originalUrl,
+        status: 200,
+        redirected: true,
+        method: "tab-navigation",
+        requestId,
+      };
+    }
   }
 
+  // HTTP redirect following — fast HEAD/GET, no tab opened.
   const fetchResult = await resolveViaFetch(originalUrl, requestId);
 
   if (fetchResult) {
