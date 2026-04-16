@@ -25,10 +25,14 @@
 const WORKER_VERSION = "1.0.1";
 const DEFAULT_MODEL = "gpt-5";
 const OPENAI_URL = "https://api.openai.com/v1/responses";
-// Conservative upstream timeout so a slow model response doesn't hold the
-// extension's AI_TIMEOUT_MS (20 s) hostage. 45 s gives gpt-5 room for
-// web-search reasoning while still failing well before the extension gives up.
-const UPSTREAM_TIMEOUT_MS = 45000;
+// Cloudflare Workers have a hard 30-second wall-clock limit. The upstream
+// call to OpenAI must complete (or be aborted) with enough headroom for the
+// Worker to write its response before the runtime kills the isolate.
+// 12 s gives gpt-5 adequate time for short-form responses while keeping the
+// total Worker execution well inside the 30-second budget.
+// The extension's AI_TIMEOUT_MS (15 s) is intentionally longer so it waits
+// for the Worker to respond rather than racing it to an abort.
+const UPSTREAM_TIMEOUT_MS = 12000;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
