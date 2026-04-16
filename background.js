@@ -303,11 +303,13 @@ async function resolveUrl(originalUrl, requestId) {
     const u = new URL(originalUrl);
     const host = u.hostname.toLowerCase();
     if (host === "news.google.com" || host.endsWith(".news.google.com")) {
-      const rssUrl = originalUrl.replace(
-        /\/(?:articles|read)\//,
-        "/rss/articles/"
-      );
-      if (rssUrl !== originalUrl) urlToFetch = rssUrl;
+      // Only rewrite /articles/... and /read/... paths.
+      // /rss/articles/... is already the right form and must not be rewritten
+      // (rewriting it would produce /rss/rss/articles/... → rss/unsupported).
+      if (u.pathname.startsWith("/articles/") || u.pathname.startsWith("/read/")) {
+        urlToFetch = u.href.replace(/\/(articles|read)\//, "/rss/articles/");
+      }
+      // else: already /rss/articles/ or unknown path — use as-is
     }
   } catch (_) {}
 
