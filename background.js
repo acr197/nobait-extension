@@ -692,11 +692,14 @@ async function findAlternateCandidates(headline, originalUrl) {
   const filtered = [];
 
   for (const candidate of candidates) {
+    // Check blocked hosts first so their shared canonical key (e.g. all
+    // bing.com/ck/a redirect URLs → "bing.com/ck/a") never enters `seen`
+    // and doesn't cause subsequent valid publisher URLs to be deduplicated.
+    if (isBlockedSearchHost(candidate)) continue;
     const key = canonicalizeForCompare(candidate);
     if (!key || seen.has(key)) continue;
     seen.add(key);
     if (key === originalKey) continue;
-    if (isBlockedSearchHost(candidate)) continue;
     // Skip same publisher — we want a different outlet's coverage.
     const candidatePublisher = getPublisherFromUrl(candidate);
     if (candidatePublisher && originalPublisher && candidatePublisher === originalPublisher) continue;
@@ -950,7 +953,7 @@ async function resolveGoogleNewsViaBatchexecute(articleId, debug) {
       }
       sg = sgMatch[1];
       ts = tsMatch[1];
-      debug.log("google_news", "info", "batchexecute step1 ok", { ts });
+      debug.log("google_news", "info", "batchexecute step1 ok", { ts, sg: sg.substring(0, 20) + (sg.length > 20 ? "…" : "") });
     } catch (err) {
       clearTimeout(timer);
       debug.log("google_news", "info", "batchexecute step1 error", { error: err.message });
@@ -974,6 +977,13 @@ async function resolveGoogleNewsViaBatchexecute(articleId, debug) {
   const freqParam = JSON.stringify([[["Fbv4je", innerPayload]]]);
 
   {
+    // Build the body as a plain string using encodeURIComponent — this is
+    // required by the batchexecute endpoint. URLSearchParams encodes spaces
+    // as "+" which can cause a 400 when the signature contains whitespace.
+    const postBody = "f.req=" + encodeURIComponent(freqParam);
+    debug.log("google_news", "info", "batchexecute step2 sending", {
+      bodyPreview: postBody.substring(0, 120) + (postBody.length > 120 ? "…" : ""),
+    });
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 8000);
     try {
@@ -988,7 +998,7 @@ async function resolveGoogleNewsViaBatchexecute(articleId, debug) {
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
           },
-          body: new URLSearchParams({ "f.req": freqParam }),
+          body: postBody,
         },
       );
       clearTimeout(timer);
@@ -1458,11 +1468,17 @@ async function fetchViaSearchResults(headline, originalUrl, onDebug) {
   const filtered = [];
   const rejected = [];
   for (const candidate of candidates) {
+    // Reject blocked hosts (bing.com/ck/a redirects, news.google.com, social
+    // media, etc.) BEFORE touching `seen`. All bing.com/ck/a redirect URLs
+    // share the canonical key "bing.com/ck/a"; adding one to `seen` before
+    // checking isBlockedSearchHost causes every subsequent candidate with that
+    // same key to be labeled "duplicate/invalid" instead of "blocked host",
+    // which then poisons the dedupe set for any real publisher URLs that follow.
+    if (isBlockedSearchHost(candidate)) { rejected.push({ url: candidate, reason: "blocked host" }); continue; }
     const key = canonicalizeForCompare(candidate);
     if (!key || seen.has(key)) { rejected.push({ url: candidate, reason: "duplicate/invalid" }); continue; }
     seen.add(key);
     if (originalKey && key === originalKey) { rejected.push({ url: candidate, reason: "same as original" }); continue; }
-    if (isBlockedSearchHost(candidate)) { rejected.push({ url: candidate, reason: "blocked host" }); continue; }
     filtered.push(candidate);
     if (filtered.length >= MAX_SEARCH_CANDIDATES) break;
   }
