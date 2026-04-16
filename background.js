@@ -24,7 +24,11 @@ if (typeof browser !== "undefined" && browser.sidebarAction && browser.action) {
 // AI traffic flows through this /summarize endpoint.
 const PROXY_URL = "https://nobait-proxy.acr197.workers.dev/summarize";
 const FETCH_TIMEOUT_MS = 12000;
-const AI_TIMEOUT_MS = 20000;
+// Cloudflare Workers have a hard 30-second wall-clock limit per request.
+// The Worker calls OpenAI internally, so the extension must give up well
+// before 30 s to leave the Worker time to respond before it is killed.
+// 15 s keeps the total round-trip comfortably inside the Worker budget.
+const AI_TIMEOUT_MS = 15000;
 const MAX_CONTENT_LENGTH = 9000;
 const MIN_CONTENT_LENGTH = 140;
 const BROWSER_UA =
@@ -199,118 +203,27 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   let articleSource = null; // label for the fetcher that succeeded
   let fetchError = null;
 
-  // Google News URLs: /articles/ and /read/ pages are JS-redirect stubs that
-  // don't contain article text themselves. Resolve the real publisher URL first
-  // (via base64 decode, HTTP redirect follow, or RSS feed parsing), then fetch
-  // the publisher article directly. This avoids ever extracting text from the
-  // Google News stub page and ensures Jina/Wayback get the publisher URL too.
+  // Google News URLs: /articles/ and /read/ pages are JS-redirect stubs whose
+  // rendered HTML contains no valid outbound URL — scraping the stub always
+  // fails and burns time before the full fallback chain (Jina, Wayback, …).
+  // Instead, resolve the publisher URL via Google's batchexecute API using the
+  // data-n-a-sg / data-n-a-ts values embedded in the articles page. When the
+  // API succeeds, fetch the publisher article directly and skip Jina/Wayback/
+  // archive.today entirely (those services rarely index stub pages anyway).
   let realUrl = url;
-  const googleNewsRss = buildGoogleNewsRssUrl(url);
+  const articleId = extractGoogleNewsArticleId(url);
+  // true when batchexecute returned a publisher URL — used below to skip the
+  // archive-service fallbacks whose redirects the stub page can't satisfy.
+  let batchexecuteResolved = false;
 
-  if (googleNewsRss) {
-    debug.log("google_news", "info", "Google News stub detected, resolving publisher URL");
+  if (articleId) {
+    debug.log("google_news", "info", "Google News stub detected, resolving via batchexecute", { articleId });
     progress("Resolving the Google News link\u2026");
 
-    let publisherUrl = null;
-    let htmlBodyForFallback = null;
-
-    // --- Attempt 1: base64 decode (no network call) ---
-    const decoded = decodeGoogleNewsUrl(url);
-    if (decoded && isValidPublisherUrl(decoded)) {
-      publisherUrl = decoded;
-      debug.log("google_news", "ok", "decoded from base64 article id", { publisherUrl });
-    } else {
-      if (decoded) {
-        debug.log("google_news", "info", "decoded URL failed validation (image/CDN URL), skipping", { invalidUrl: decoded });
-      }
-
-      // --- Attempt 2: follow HTTP redirect / parse RSS body ---
-      const { publisherUrl: discovered, htmlBody } = await discoverPublisherUrl(googleNewsRss);
-      htmlBodyForFallback = htmlBody;
-      debug.log("google_news", "info", "RSS fetch result", {
-        publisherFound: !!discovered,
-        discoveredUrl: discovered || null,
-        htmlBodyLength: htmlBody ? htmlBody.length : null,
-      });
-
-      if (discovered && isValidPublisherUrl(discovered)) {
-        publisherUrl = discovered;
-        debug.log("google_news", "ok", "resolved via RSS redirect", { publisherUrl });
-      } else {
-        if (discovered) {
-          debug.log("google_news", "info", "resolved URL failed validation (image/CDN URL), trying HTML extraction", { invalidUrl: discovered });
-        }
-
-        // --- Attempt 3: extract canonical / og:url / first external href ---
-        if (htmlBodyForFallback) {
-          const extracted = extractArticleUrlFromHtml(htmlBodyForFallback);
-          if (extracted && isValidPublisherUrl(extracted)) {
-            publisherUrl = extracted;
-            debug.log("google_news", "ok", "extracted publisher URL from RSS HTML body", { publisherUrl });
-          } else {
-            debug.log("google_news", "info", "HTML extraction found no valid URL", {
-              extractedUrl: extracted || null,
-              htmlPreview: htmlBodyForFallback.substring(0, 300),
-            });
-          }
-        } else {
-          debug.log("google_news", "info", "no HTML body from RSS fetch (possible network failure or non-HTML response)");
-        }
-      }
-
-      // --- Attempt 4: retry RSS URL without localization query parameters.
-      //     Google sometimes returns a JS-redirect HTML stub instead of a 302
-      //     when locale params are present; stripping them may yield a clean redirect. ---
-      if (!publisherUrl && googleNewsRss.includes("?")) {
-        const cleanRss = googleNewsRss.split("?")[0];
-        debug.log("google_news", "info", "retrying RSS URL without query params", { url: cleanRss });
-        const { publisherUrl: clean, htmlBody: cleanHtml } = await discoverPublisherUrl(cleanRss);
-        if (clean && isValidPublisherUrl(clean)) {
-          publisherUrl = clean;
-          debug.log("google_news", "ok", "resolved via clean RSS URL (no query params)", { publisherUrl });
-        } else if (cleanHtml) {
-          const extracted = extractArticleUrlFromHtml(cleanHtml);
-          if (extracted && isValidPublisherUrl(extracted)) {
-            publisherUrl = extracted;
-            debug.log("google_news", "ok", "extracted publisher URL from clean RSS HTML", { publisherUrl });
-          } else {
-            debug.log("google_news", "info", "clean RSS HTML extraction also found no valid URL", {
-              extractedUrl: extracted || null,
-            });
-          }
-        }
-      }
-
-      // --- Attempt 5: fetch the non-RSS /articles/ path directly.
-      //     The /rss/articles/ and /articles/ server paths sometimes behave
-      //     differently — one may HTTP-302 cleanly where the other returns HTML. ---
-      if (!publisherUrl) {
-        const articleUrl = googleNewsRss
-          .replace(/\/rss\/articles\//, "/articles/")
-          .split("?")[0];
-        if (articleUrl !== googleNewsRss) {
-          debug.log("google_news", "info", "retrying as /articles/ path (non-RSS)", { url: articleUrl });
-          const { publisherUrl: direct, htmlBody: directHtml } = await discoverPublisherUrl(articleUrl);
-          if (direct && isValidPublisherUrl(direct)) {
-            publisherUrl = direct;
-            debug.log("google_news", "ok", "resolved via /articles/ path", { publisherUrl });
-          } else if (directHtml) {
-            const extracted = extractArticleUrlFromHtml(directHtml);
-            if (extracted && isValidPublisherUrl(extracted)) {
-              publisherUrl = extracted;
-              debug.log("google_news", "ok", "extracted publisher URL from /articles/ HTML", { publisherUrl });
-            } else {
-              debug.log("google_news", "info", "/articles/ HTML extraction found no valid URL", {
-                extractedUrl: extracted || null,
-                htmlPreview: directHtml.substring(0, 300),
-              });
-            }
-          }
-        }
-      }
-    }
+    const publisherUrl = await resolveGoogleNewsViaBatchexecute(articleId, debug);
 
     if (publisherUrl) {
+      batchexecuteResolved = true;
       realUrl = publisherUrl;
       debug.log("direct_fetch", "info", "fetching resolved publisher URL", { url: publisherUrl });
       progress("Reading the article\u2026");
@@ -338,11 +251,10 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   }
 
   // For a Google News URL whose publisher URL couldn't be resolved, realUrl
-  // still points at the GNews stub. Every fallback below still runs a real
-  // network request — Jina's headless browser in particular can often
-  // follow the JS redirect that our own fetch can't, so we don't want to
-  // short-circuit and starve the pipeline of attempts.
-  const gnewsUnresolved = !!googleNewsRss && realUrl === url;
+  // still points at the GNews stub. The standard fetch path below will try it
+  // directly; the search fallbacks suppress "news.google.com" as publisher
+  // context so the ranker isn't confused by the aggregator domain.
+  const gnewsUnresolved = !!articleId && realUrl === url;
 
   // Standard path: fetch the requested URL directly.
   if (!articleText) {
@@ -375,9 +287,10 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   // Fallback #1: server-side Reader API (Jina). Catches JS-rendered SPAs
   // (Tom's Guide, most modern news sites) whose direct HTML is a near-empty
   // skeleton, and sites whose bot protection blocks our direct fetch.
-  // For Google News, realUrl is either the resolved publisher URL or the
-  // raw GNews URL (Jina's headless browser can still follow the redirect).
-  if (!articleText) {
+  // Skip for Google News articles where batchexecute already resolved the
+  // publisher URL — archive services don't index stubs and Jina can't follow
+  // the JS redirect any better than direct fetch on the real publisher URL.
+  if (!articleText && !batchexecuteResolved) {
     debug.log("jina_reader", "info", "attempting Jina Reader API", { url: realUrl });
     progress("Trying a reader service\u2026");
     try {
@@ -405,7 +318,8 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   // Fallback #2: Wayback Machine. When direct fetch and Jina both fail
   // (paywall, anti-bot, JS SPA that doesn't render for headless fetchers),
   // archive.org usually has a static snapshot that's trivially readable.
-  if (!articleText) {
+  // Skip for Google News articles resolved via batchexecute (see Fallback #1).
+  if (!articleText && !batchexecuteResolved) {
     debug.log("wayback", "info", "attempting Wayback Machine", { url: realUrl });
     progress("Looking in the Wayback Machine\u2026");
     try {
@@ -430,8 +344,8 @@ async function handleSummarize(url, headline, mode, sendProgress) {
   // Fallback #3: Archive.today (archive.ph). Often succeeds on paywalled or
   // Cloudflare-protected sites that Wayback doesn't cover. Separate from
   // Wayback because the two services have largely non-overlapping snapshot
-  // coverage.
-  if (!articleText) {
+  // coverage. Skip for Google News articles resolved via batchexecute.
+  if (!articleText && !batchexecuteResolved) {
     debug.log("archive_today", "info", "attempting Archive.today", { url: realUrl });
     progress("Checking Archive.today\u2026");
     try {
@@ -979,24 +893,133 @@ function isValidPublisherUrl(url) {
   }
 }
 
-// --- buildGoogleNewsRssUrl: converts a news.google.com article/read URL to
-//     its /rss/articles/ equivalent (which 302s to the publisher). Returns
-//     null if the URL isn't a Google News redirect stub. ---
-function buildGoogleNewsRssUrl(url) {
+// --- extractGoogleNewsArticleId: returns the encoded article ID segment (the
+//     CBMi… token) from a news.google.com /articles/, /rss/articles/, or
+//     /read/ URL. Returns null for any non-Google-News URL. ---
+function extractGoogleNewsArticleId(url) {
   try {
     const u = new URL(url);
     const host = u.hostname.toLowerCase();
     if (host !== "news.google.com" && !host.endsWith(".news.google.com")) return null;
-    if (u.pathname.startsWith("/rss/articles/")) return u.href;
-    if (u.pathname.startsWith("/read/") || u.pathname.startsWith("/articles/")) {
-      return u.href.replace(
-        /news\.google\.com\/(read|articles)\//,
-        "news.google.com/rss/articles/"
-      );
-    }
-    return null;
+    const m = u.pathname.match(/\/(?:rss\/articles|articles|read)\/([A-Za-z0-9_-]{10,})/);
+    return m ? m[1] : null;
   } catch (_) {
     return null;
+  }
+}
+
+// --- resolveGoogleNewsViaBatchexecute: resolves a Google News article ID to
+//     the real publisher URL using Google's batchexecute API.
+//
+//     Step 1 — GET news.google.com/articles/{articleId}: extracts the signing
+//     parameters data-n-a-sg (signature) and data-n-a-ts (timestamp) from the
+//     c-wiz > div element in the page HTML.
+//
+//     Step 2 — POST to /_/DotsSplashUi/data/batchexecute: sends a garturlreq
+//     payload built from the article ID, timestamp, and signature. Parses the
+//     JSON-like response for the first https:// URL that is not on a Google
+//     domain.
+//
+//     Returns the publisher URL string on success, or null on any failure. ---
+async function resolveGoogleNewsViaBatchexecute(articleId, debug) {
+  // --- Step 1: fetch the article stub page and extract signing params ---
+  let sg, ts;
+  {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const resp = await fetch(`https://news.google.com/articles/${articleId}`, {
+        signal: controller.signal,
+        headers: {
+          "User-Agent": BROWSER_UA,
+          "Accept": "text/html,application/xhtml+xml,application/xml,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+      });
+      clearTimeout(timer);
+      if (!resp.ok) {
+        debug.log("google_news", "info", "batchexecute step1 bad status", { status: resp.status });
+        return null;
+      }
+      const html = await resp.text();
+      const sgMatch = html.match(/data-n-a-sg\s*=\s*["']([^"']+)["']/);
+      const tsMatch = html.match(/data-n-a-ts\s*=\s*["']([^"']+)["']/);
+      if (!sgMatch || !tsMatch) {
+        debug.log("google_news", "info", "batchexecute step1: signing params not found in HTML");
+        return null;
+      }
+      sg = sgMatch[1];
+      ts = tsMatch[1];
+      debug.log("google_news", "info", "batchexecute step1 ok", { ts });
+    } catch (err) {
+      clearTimeout(timer);
+      debug.log("google_news", "info", "batchexecute step1 error", { error: err.message });
+      return null;
+    }
+  }
+
+  // --- Step 2: POST batchexecute to get the real article URL ---
+  // Inner payload is a JSON-stringified garturlreq array; the timestamp comes
+  // from the page as a string but the API expects it as a number.
+  const innerPayload = JSON.stringify([
+    "garturlreq",
+    [
+      ["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,null,null,null,0,1],
+      "X","X",1,[1,1,1],1,1,null,0,0,null,0,
+    ],
+    articleId,
+    parseInt(ts, 10),
+    sg,
+  ]);
+  const freqParam = JSON.stringify([[["Fbv4je", innerPayload]]]);
+
+  {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const resp = await fetch(
+        "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+        {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "User-Agent": BROWSER_UA,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+          },
+          body: new URLSearchParams({ "f.req": freqParam }),
+        },
+      );
+      clearTimeout(timer);
+      if (!resp.ok) {
+        debug.log("google_news", "info", "batchexecute step2 bad status", { status: resp.status });
+        return null;
+      }
+      const text = await resp.text();
+      // The response is a JSON-like envelope — scan it for the first
+      // https:// URL that does not belong to a Google-owned domain.
+      for (const m of text.matchAll(/https:\/\/[^\s"'\\,\]\[)>]+/g)) {
+        const raw = m[0]
+          .replace(/\\u003d/gi, "=")
+          .replace(/\\u0026/gi, "&")
+          .replace(/\\u002f/gi, "/")
+          .replace(/[\\]+$/, ""); // strip trailing escape artefacts
+        try {
+          const u = new URL(raw);
+          if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) {
+            debug.log("google_news", "ok", "batchexecute resolved publisher URL", { publisherUrl: u.href });
+            return u.href;
+          }
+        } catch (_) {}
+      }
+      debug.log("google_news", "info", "batchexecute step2: no non-google URL found in response");
+      return null;
+    } catch (err) {
+      clearTimeout(timer);
+      debug.log("google_news", "info", "batchexecute step2 error", { error: err.message });
+      return null;
+    }
   }
 }
 
@@ -1009,218 +1032,6 @@ function captureFetchError(err) {
   // Normalize trailing period for consistent formatting inside the prompt.
   if (!/[.!?]$/.test(message)) message += ".";
   return { type, message };
-}
-
-// --- decodeGoogleNewsUrl: tries to extract the real article URL from the
-//     base64-encoded article ID in Google News redirect URLs ---
-function decodeGoogleNewsUrl(url) {
-  try {
-    const u = new URL(url);
-    // Extract the article ID from paths like /read/CBMi... or /articles/CBMi...
-    const match = u.pathname.match(/\/(read|articles)\/(CB[A-Za-z0-9_-]+)/);
-    if (!match) return null;
-
-    const articleId = match[2];
-
-    // Base64url → standard base64
-    let b64 = articleId.replace(/-/g, "+").replace(/_/g, "/");
-    while (b64.length % 4) b64 += "=";
-
-    // Decode to binary string
-    const bytes = atob(b64);
-
-    // Scan for "http" in the decoded bytes and extract the URL
-    const httpIdx = bytes.indexOf("http");
-    if (httpIdx < 0) return null;
-
-    let end = httpIdx;
-    while (end < bytes.length) {
-      const c = bytes.charCodeAt(end);
-      // Stop at control chars or non-ASCII (URL chars are all printable ASCII)
-      if (c < 32 || c > 126) break;
-      end++;
-    }
-
-    const candidate = bytes.substring(httpIdx, end);
-    const decoded = new URL(candidate);
-    if (decoded.protocol === "http:" || decoded.protocol === "https:") {
-      return decoded.href;
-    }
-  } catch (_) { /* decoding failed */ }
-  return null;
-}
-
-// --- discoverPublisherUrl: follows the redirect chain of a Google News RSS
-//     stub URL and returns { publisherUrl, htmlBody }. Two strategies:
-//     1. HTTP redirect: if fetch() lands on a non-Google domain, return it.
-//     2. RSS/HTML body parse: if the response stays on google.com (e.g. the
-//        RSS endpoint returned feed XML or an HTML page rather than issuing a
-//        302 redirect), read the body and extract the publisher <link> from
-//        the feed. htmlBody is always populated when the response stays on
-//        google.com so the caller can run additional HTML extraction if needed.
-//     Returns { publisherUrl: null, htmlBody: null } on any error. ---
-async function discoverPublisherUrl(url) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
-  try {
-    const resp = await fetch(url, {
-      signal: controller.signal,
-      redirect: "follow",
-      headers: {
-        "User-Agent": BROWSER_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml,application/rss+xml,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
-    clearTimeout(timer);
-    const finalUrl = resp.url;
-    if (!finalUrl) return { publisherUrl: null, htmlBody: null };
-    let parsed;
-    try { parsed = new URL(finalUrl); } catch (_) { return { publisherUrl: null, htmlBody: null }; }
-    // If HTTP redirect landed on a non-Google domain, we're done.
-    if (!isGoogleDomain(parsed.hostname)) return { publisherUrl: finalUrl, htmlBody: null };
-    // Still on google.com — parse the response body as RSS/Atom to find the
-    // publisher link (handles cases where the RSS endpoint returns feed XML
-    // or an HTML page instead of issuing a 302 redirect to the article).
-    // Return the raw body too so the caller can run HTML extraction if the
-    // RSS link turns out to be an image/CDN URL.
-    try {
-      const htmlBody = await resp.text();
-      return { publisherUrl: extractRssArticleLink(htmlBody), htmlBody };
-    } catch (_) { return { publisherUrl: null, htmlBody: null }; }
-  } catch (_) {
-    clearTimeout(timer);
-    return { publisherUrl: null, htmlBody: null };
-  }
-}
-
-// --- NON_ARTICLE_LINK_RELS: <link rel="…"> values that never point at the
-//     article body — preconnect / preload / stylesheet / icon / manifest /
-//     search etc. These show up liberally in Google News' stub HTML pages
-//     (preconnect to google-analytics, doubleclick, gstatic, …) and used to
-//     slip through as the resolved publisher URL. ---
-const NON_ARTICLE_LINK_RELS = new Set([
-  "preconnect", "preload", "prefetch", "dns-prefetch", "modulepreload",
-  "stylesheet", "icon", "apple-touch-icon", "apple-touch-icon-precomposed",
-  "mask-icon", "shortcut", "shortcut icon", "manifest", "search",
-  "alternate stylesheet", "pingback", "profile", "license", "author",
-]);
-
-function linkRelIsContent(relAttr) {
-  if (!relAttr) return true; // no rel → treat as plain content link
-  const tokens = relAttr.toLowerCase().trim().split(/\s+/);
-  // If ANY token marks this as non-content asset, skip it.
-  for (const t of tokens) {
-    if (NON_ARTICLE_LINK_RELS.has(t)) return false;
-  }
-  return true;
-}
-
-// --- extractRssArticleLink: scans RSS 2.0 / Atom feed XML (or Google News'
-//     HTML stub page when the RSS endpoint returns HTML) for the first
-//     publisher article URL. We *also* pass each candidate through
-//     isValidPublisherUrl so analytics/ad/asset URLs embedded as
-//     <link rel="preconnect"> or similar never surface as "the article". ---
-function extractRssArticleLink(xml) {
-  if (!xml) return null;
-  // RSS 2.0: <link>https://publisher.com/path</link>
-  const rssRe = /<link[^>]*>(https?:\/\/[^\s<]+)<\/link>/gi;
-  let m;
-  while ((m = rssRe.exec(xml)) !== null) {
-    try {
-      const u = new URL(m[1].trim());
-      if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) return u.href;
-    } catch (_) {}
-  }
-  // Atom / Google RSS extension: <link href="https://publisher.com/..." />
-  // Skip <link rel="preconnect|preload|stylesheet|icon|…"> which are assets,
-  // not article pointers.
-  const atomRe = /<link\b([^>]*)\bhref\s*=\s*["'](https?:\/\/[^"']+)["']([^>]*)>/gi;
-  while ((m = atomRe.exec(xml)) !== null) {
-    const attrsBefore = m[1] || "";
-    const attrsAfter = m[3] || "";
-    const relMatch =
-      /\brel\s*=\s*["']([^"']+)["']/i.exec(attrsBefore) ||
-      /\brel\s*=\s*["']([^"']+)["']/i.exec(attrsAfter);
-    if (!linkRelIsContent(relMatch && relMatch[1])) continue;
-    try {
-      const u = new URL(m[2].trim());
-      if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) return u.href;
-    } catch (_) {}
-  }
-  return null;
-}
-
-// --- extractArticleUrlFromHtml: scans an HTML document for the real article
-//     URL using three strategies in priority order:
-//       1. <link rel="canonical" href="…">
-//       2. <meta property="og:url" content="…">
-//       3. First href attribute that points to a non-Google, non-googleapis
-//          domain.
-//     Returns the first non-Google URL found, or null. ---
-function extractArticleUrlFromHtml(html) {
-  if (!html) return null;
-
-  // Strategy 1: canonical link tag (attribute order can vary)
-  const canonicalRe =
-    /<link\b[^>]*\brel\s*=\s*["']canonical["'][^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>|<link\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*\brel\s*=\s*["']canonical["'][^>]*>/gi;
-  let m;
-  while ((m = canonicalRe.exec(html)) !== null) {
-    const href = (m[1] || m[2] || "").trim();
-    if (!href) continue;
-    try {
-      const u = new URL(href);
-      if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) return u.href;
-    } catch (_) {}
-  }
-
-  // Strategy 2: og:url meta tag (attribute order can vary)
-  const ogRe =
-    /<meta\b[^>]*\bproperty\s*=\s*["']og:url["'][^>]*\bcontent\s*=\s*["']([^"']+)["'][^>]*>|<meta\b[^>]*\bcontent\s*=\s*["']([^"']+)["'][^>]*\bproperty\s*=\s*["']og:url["'][^>]*>/gi;
-  while ((m = ogRe.exec(html)) !== null) {
-    const content = (m[1] || m[2] || "").trim();
-    if (!content) continue;
-    try {
-      const u = new URL(content);
-      if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) return u.href;
-    } catch (_) {}
-  }
-
-  // Strategy 2b: meta http-equiv="refresh" content="0; url=…" redirect target.
-  //     Google News sometimes returns an HTML stub whose whole purpose is this
-  //     meta-refresh. The url= payload is the real publisher article.
-  const metaRefreshRe =
-    /<meta\b[^>]*\bhttp-equiv\s*=\s*["']refresh["'][^>]*\bcontent\s*=\s*["'][^"']*url\s*=\s*([^"']+)["']/gi;
-  while ((m = metaRefreshRe.exec(html)) !== null) {
-    const target = (m[1] || "").trim().replace(/^['"]|['"]$/g, "");
-    if (!target) continue;
-    try {
-      const u = new URL(target);
-      if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) return u.href;
-    } catch (_) {}
-  }
-
-  // Strategy 3: first absolute href not on a Google domain. Skip <link> tags
-  //     whose rel marks them as assets (preconnect, preload, stylesheet, …)
-  //     or whose URL is clearly non-article (analytics/ads/scripts).
-  const tagRe = /<(a|link)\b([^>]*)\bhref\s*=\s*["'](https?:\/\/[^"'#\s]+)["']([^>]*)>/gi;
-  while ((m = tagRe.exec(html)) !== null) {
-    const tag = m[1].toLowerCase();
-    const attrsBefore = m[2] || "";
-    const attrsAfter = m[4] || "";
-    if (tag === "link") {
-      const relMatch =
-        /\brel\s*=\s*["']([^"']+)["']/i.exec(attrsBefore) ||
-        /\brel\s*=\s*["']([^"']+)["']/i.exec(attrsAfter);
-      if (!linkRelIsContent(relMatch && relMatch[1])) continue;
-    }
-    try {
-      const u = new URL(m[3].trim());
-      if (!isGoogleDomain(u.hostname) && isValidPublisherUrl(u.href)) return u.href;
-    } catch (_) {}
-  }
-
-  return null;
 }
 
 // --- Googlebot UA: many sites (esp. paywalled / SPA) serve clean static HTML
