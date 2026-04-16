@@ -1,51 +1,158 @@
 // background.js — Service worker for NoBait v2
-// Resolves redirect chains via URL decoding, HTTP redirects, and HTML parsing
+// Resolves redirect chains via tab navigation (follows JS redirects),
+// HTTP redirects, and HTML parsing fallbacks.
 
 const FETCH_TIMEOUT_MS = 8000;
+const TAB_HARD_TIMEOUT_MS = 12000;
+const TAB_SETTLE_DELAY_MS = 1500;
 
-// ── Google News URL decoder ──────────────────────────────────────────
+// ── Strategy 1: Tab-based navigation (follows JS redirects) ─────────
+// Opens the URL in a hidden background tab, lets the browser execute
+// JavaScript, and captures the final URL after all redirects complete.
 
-function tryDecodeGoogleNewsUrl(url) {
+async function resolveViaTab(originalUrl, requestId) {
+  return new Promise((resolve) => {
+    let finalUrl = originalUrl;
+    let resolved = false;
+    let tabId = null;
+    let settleTimer = null;
+
+    const finish = () => {
+      if (resolved) return;
+      resolved = true;
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      chrome.tabs.onRemoved.removeListener(onRemoved);
+      if (settleTimer) clearTimeout(settleTimer);
+      if (tabId !== null) {
+        chrome.tabs.remove(tabId).catch(() => {});
+      }
+      console.log(
+        `[NoBait BG] requestId=${requestId} | Tab resolved: ${finalUrl}`
+      );
+      resolve(finalUrl);
+    };
+
+    const onUpdated = (id, changeInfo, tab) => {
+      if (id !== tabId) return;
+
+      // Track latest URL (skip blank/chrome pages)
+      if (
+        tab.url &&
+        tab.url !== "about:blank" &&
+        !tab.url.startsWith("chrome://") &&
+        !tab.url.startsWith("chrome-error://")
+      ) {
+        finalUrl = tab.url;
+      }
+
+      // When a URL change is detected (JS navigation started)
+      if (changeInfo.url && changeInfo.url !== originalUrl) {
+        finalUrl = changeInfo.url;
+        // Reset settle timer — wait for this new page to finish loading
+        if (settleTimer) clearTimeout(settleTimer);
+        settleTimer = null;
+      }
+
+      // When page finishes loading
+      if (changeInfo.status === "complete") {
+        if (settleTimer) clearTimeout(settleTimer);
+        // If URL already changed from original, settle quickly
+        const delay =
+          finalUrl !== originalUrl ? 500 : TAB_SETTLE_DELAY_MS;
+        settleTimer = setTimeout(finish, delay);
+      }
+    };
+
+    const onRemoved = (id) => {
+      if (id === tabId) finish();
+    };
+
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.onRemoved.addListener(onRemoved);
+
+    chrome.tabs.create({ url: originalUrl, active: false }, (tab) => {
+      if (chrome.runtime.lastError) {
+        console.error(
+          `[NoBait BG] requestId=${requestId} | Tab creation failed: ` +
+            chrome.runtime.lastError.message
+        );
+        resolved = true;
+        resolve(null); // Signal failure so we fall through to fetch strategies
+        return;
+      }
+      tabId = tab.id;
+      console.log(
+        `[NoBait BG] requestId=${requestId} | Opened background tab ${tabId} for: ${originalUrl}`
+      );
+    });
+
+    // Hard timeout
+    setTimeout(finish, TAB_HARD_TIMEOUT_MS);
+  });
+}
+
+// ── Strategy 2: HTTP redirect (HEAD then GET) ────────────────────────
+
+async function resolveViaFetch(originalUrl, requestId) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
   try {
-    const urlObj = new URL(url);
-    if (!urlObj.hostname.includes("news.google.com")) return null;
+    // Try HEAD first (fast, small response)
+    const headResp = await fetch(originalUrl, {
+      method: "HEAD",
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
 
-    // Extract article ID from various Google News URL formats
-    const match = urlObj.pathname.match(
-      /\/(?:read|rss\/articles|articles)\/(CB[A-Za-z0-9_-]+)/
-    );
-    if (!match) return null;
-
-    const articleId = match[1];
-    // Base64url → standard base64
-    const base64 = articleId.replace(/-/g, "+").replace(/_/g, "/");
-    const padding = "=".repeat((4 - (base64.length % 4)) % 4);
-    const binaryStr = atob(base64 + padding);
-
-    // The protobuf-encoded bytes contain the article URL as a plain string.
-    // Extract it by scanning the decoded bytes for HTTP URLs.
-    const bytes = new Uint8Array([...binaryStr].map((c) => c.charCodeAt(0)));
-    const decoded = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-
-    // Find the first https:// URL in the decoded data
-    const urlMatch = decoded.match(/https?:\/\/[^\s\x00-\x1f\x7f-\x9f]+/);
-    if (urlMatch) {
-      // Remove trailing non-URL characters that might have leaked from protobuf
-      let found = urlMatch[0].replace(/[^\x20-\x7e]+$/, "");
-      return found;
+    if (headResp.redirected && headResp.url !== originalUrl) {
+      return { url: headResp.url, method: "http-redirect", status: headResp.status };
     }
 
-    return null;
-  } catch (e) {
-    console.warn("[NoBait BG] Google News URL decode failed:", e.message);
+    // HEAD didn't redirect — try GET (some servers only redirect GET)
+    const getController = new AbortController();
+    const getTimeout = setTimeout(() => getController.abort(), FETCH_TIMEOUT_MS);
+
+    const getResp = await fetch(originalUrl, {
+      method: "GET",
+      redirect: "follow",
+      signal: getController.signal,
+    });
+    clearTimeout(getTimeout);
+
+    if (getResp.url !== originalUrl) {
+      return { url: getResp.url, method: "http-redirect-get", status: getResp.status };
+    }
+
+    // Parse HTML for client-side redirect indicators
+    const html = await getResp.text();
+    const htmlResult = extractRedirectFromHtml(html, originalUrl);
+    if (htmlResult) {
+      return { url: htmlResult.url, method: htmlResult.method, status: getResp.status };
+    }
+
+    return null; // No redirect found
+  } catch (error) {
+    clearTimeout(timeoutId);
+    console.warn(
+      `[NoBait BG] requestId=${requestId} | Fetch failed: ${error.name}: ${error.message}`
+    );
     return null;
   }
 }
 
-// ── HTML-based redirect extraction ───────────────────────────────────
+// ── HTML redirect extraction ─────────────────────────────────────────
 
 function extractRedirectFromHtml(html, originalUrl) {
-  // 1. Meta refresh tag
+  let originalOrigin;
+  try {
+    originalOrigin = new URL(originalUrl).origin;
+  } catch {
+    return null;
+  }
+
+  // 1. Meta refresh tag (works regardless of origin)
   const metaRefreshPatterns = [
     /<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*?url=["']?([^"'\s;>]+)/i,
     /<meta[^>]+content=["'][^"']*?url=["']?([^"'\s;>]+)["']?[^>]+http-equiv=["']refresh["']/i,
@@ -57,27 +164,35 @@ function extractRedirectFromHtml(html, originalUrl) {
     }
   }
 
-  // 2. Canonical link
+  // 2. Canonical link (only if pointing to a DIFFERENT origin)
   const canonicalPatterns = [
     /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i,
     /<link[^>]+href=["']([^"']+)["'][^>]+rel=["']canonical["']/i,
   ];
   for (const pattern of canonicalPatterns) {
     const m = html.match(pattern);
-    if (m && m[1] && m[1] !== originalUrl) {
-      return { url: m[1], method: "canonical" };
+    if (m && m[1]) {
+      try {
+        if (new URL(m[1]).origin !== originalOrigin) {
+          return { url: m[1], method: "canonical" };
+        }
+      } catch {}
     }
   }
 
-  // 3. og:url meta tag
+  // 3. og:url meta tag (only if pointing to a DIFFERENT origin)
   const ogUrlPatterns = [
     /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i,
     /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:url["']/i,
   ];
   for (const pattern of ogUrlPatterns) {
     const m = html.match(pattern);
-    if (m && m[1] && m[1] !== originalUrl) {
-      return { url: m[1], method: "og:url" };
+    if (m && m[1]) {
+      try {
+        if (new URL(m[1]).origin !== originalOrigin) {
+          return { url: m[1], method: "og:url" };
+        }
+      } catch {}
     }
   }
 
@@ -97,172 +212,72 @@ function extractRedirectFromHtml(html, originalUrl) {
   return null;
 }
 
-// ── Main resolver ────────────────────────────────────────────────────
+// ── Main resolver pipeline ───────────────────────────────────────────
 
 async function resolveUrl(originalUrl, requestId) {
-  // ── Strategy 1: Direct URL decoding (Google News, etc.) ──────────
-  const decodedUrl = tryDecodeGoogleNewsUrl(originalUrl);
-  if (decodedUrl) {
+  console.log(
+    `[NoBait BG] requestId=${requestId} | Starting resolution for: ${originalUrl}`
+  );
+
+  // ── Strategy 1: Tab navigation (most reliable — follows JS redirects) ──
+  const tabResult = await resolveViaTab(originalUrl, requestId);
+
+  if (tabResult && tabResult !== originalUrl) {
     console.log(
-      `[NoBait BG] requestId=${requestId} | Decoded URL from article ID\n` +
+      `[NoBait BG] requestId=${requestId} | Tab navigation resolved\n` +
         `  original : ${originalUrl}\n` +
-        `  decoded  : ${decodedUrl}\n` +
-        `  method   : url-decode`
+        `  resolved : ${tabResult}\n` +
+        `  method   : tab-navigation`
     );
     return {
       success: true,
-      resolvedUrl: decodedUrl,
+      resolvedUrl: tabResult,
       originalUrl,
       status: 200,
       redirected: true,
-      method: "url-decode",
+      method: "tab-navigation",
       requestId,
     };
   }
 
-  // ── Strategy 2: HTTP-level redirect (HEAD request) ───────────────
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => {
-    controller.abort();
-    console.warn(
-      `[NoBait BG] requestId=${requestId} | HEAD fetch aborted after ${FETCH_TIMEOUT_MS}ms`
-    );
-  }, FETCH_TIMEOUT_MS);
+  // ── Strategy 2: HTTP fetch + HTML parsing (fallback) ──────────────────
+  console.log(
+    `[NoBait BG] requestId=${requestId} | Tab didn't redirect, trying fetch…`
+  );
 
-  try {
-    const headResponse = await fetch(originalUrl, {
-      method: "HEAD",
-      redirect: "follow",
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
+  const fetchResult = await resolveViaFetch(originalUrl, requestId);
 
-    if (headResponse.redirected && headResponse.url !== originalUrl) {
-      console.log(
-        `[NoBait BG] requestId=${requestId} | HTTP redirect resolved\n` +
-          `  original : ${originalUrl}\n` +
-          `  resolved : ${headResponse.url}\n` +
-          `  status   : ${headResponse.status}`
-      );
-      return {
-        success: true,
-        resolvedUrl: headResponse.url,
-        originalUrl,
-        status: headResponse.status,
-        redirected: true,
-        method: "http-redirect",
-        requestId,
-      };
-    }
-
-    // ── Strategy 3: Parse HTML for client-side redirects ───────────
+  if (fetchResult) {
     console.log(
-      `[NoBait BG] requestId=${requestId} | No HTTP redirect, trying HTML parsing…`
-    );
-
-    const getController = new AbortController();
-    const getTimeoutId = setTimeout(() => {
-      getController.abort();
-    }, FETCH_TIMEOUT_MS);
-
-    try {
-      const getResponse = await fetch(originalUrl, {
-        method: "GET",
-        redirect: "follow",
-        signal: getController.signal,
-      });
-      clearTimeout(getTimeoutId);
-
-      // Check if GET itself resolved to a different URL
-      if (getResponse.url !== originalUrl) {
-        console.log(
-          `[NoBait BG] requestId=${requestId} | GET redirect resolved\n` +
-            `  original : ${originalUrl}\n` +
-            `  resolved : ${getResponse.url}`
-        );
-        return {
-          success: true,
-          resolvedUrl: getResponse.url,
-          originalUrl,
-          status: getResponse.status,
-          redirected: true,
-          method: "http-redirect-get",
-          requestId,
-        };
-      }
-
-      const html = await getResponse.text();
-      const htmlRedirect = extractRedirectFromHtml(html, originalUrl);
-
-      if (htmlRedirect) {
-        console.log(
-          `[NoBait BG] requestId=${requestId} | HTML redirect found\n` +
-            `  original : ${originalUrl}\n` +
-            `  resolved : ${htmlRedirect.url}\n` +
-            `  method   : ${htmlRedirect.method}`
-        );
-        return {
-          success: true,
-          resolvedUrl: htmlRedirect.url,
-          originalUrl,
-          status: getResponse.status,
-          redirected: true,
-          method: htmlRedirect.method,
-          requestId,
-        };
-      }
-
-      // No redirect found at all
-      console.log(
-        `[NoBait BG] requestId=${requestId} | No redirect detected\n` +
-          `  original : ${originalUrl}\n` +
-          `  status   : ${headResponse.status}`
-      );
-      return {
-        success: true,
-        resolvedUrl: originalUrl,
-        originalUrl,
-        status: headResponse.status,
-        redirected: false,
-        method: "none",
-        requestId,
-      };
-    } catch (getError) {
-      clearTimeout(getTimeoutId);
-      // GET failed but HEAD succeeded — return HEAD result
-      console.warn(
-        `[NoBait BG] requestId=${requestId} | GET fallback failed: ${getError.message}`
-      );
-      return {
-        success: true,
-        resolvedUrl: originalUrl,
-        originalUrl,
-        status: headResponse.status,
-        redirected: false,
-        method: "none",
-        requestId,
-      };
-    }
-  } catch (error) {
-    clearTimeout(timeoutId);
-    const reason =
-      error.name === "AbortError"
-        ? `Fetch timed out after ${FETCH_TIMEOUT_MS}ms`
-        : error.message;
-    console.error(
-      `[NoBait BG] requestId=${requestId} | Fetch FAILED\n` +
-        `  error: ${error.name}: ${error.message}\n` +
-        `  stack: ${error.stack || "N/A"}`
+      `[NoBait BG] requestId=${requestId} | Fetch resolved\n` +
+        `  original : ${originalUrl}\n` +
+        `  resolved : ${fetchResult.url}\n` +
+        `  method   : ${fetchResult.method}`
     );
     return {
-      success: false,
-      error: reason,
-      errorName: error.name,
-      errorStack: error.stack || "N/A",
+      success: true,
+      resolvedUrl: fetchResult.url,
       originalUrl,
+      status: fetchResult.status,
+      redirected: true,
+      method: fetchResult.method,
       requestId,
     };
   }
+
+  // ── No redirect found ─────────────────────────────────────────────────
+  console.log(
+    `[NoBait BG] requestId=${requestId} | No redirect detected for: ${originalUrl}`
+  );
+  return {
+    success: true,
+    resolvedUrl: originalUrl,
+    originalUrl,
+    status: 200,
+    redirected: false,
+    method: "none",
+    requestId,
+  };
 }
 
 // ── Message listener ─────────────────────────────────────────────────
@@ -298,5 +313,5 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 console.log(
-  "[NoBait BG] Service worker loaded — strategies: url-decode, http-redirect, html-parse"
+  "[NoBait BG] Service worker loaded — strategies: tab-navigation, http-redirect, html-parse"
 );

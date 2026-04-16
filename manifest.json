@@ -3,7 +3,7 @@
   "name": "NoBait v2 - Link Redirect Resolver",
   "version": "0.1.0",
   "description": "Hold-click any link to resolve its final destination URL after redirects.",
-  "permissions": ["activeTab"],
+  "permissions": ["activeTab", "tabs"],
   "background": {
     "service_worker": "background.js"
   },
