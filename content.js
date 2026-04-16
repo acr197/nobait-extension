@@ -109,7 +109,10 @@
     if (!tooltipEl) return;
 
     const same = debugInfo.originalUrl === resolvedUrl;
-    const label = same ? "Final URL (no redirect)" : "Resolved URL";
+    const methodHint = debugInfo.method && debugInfo.method !== "none"
+      ? ` (via ${debugInfo.method})`
+      : "";
+    const label = same ? "Final URL (no redirect)" : `Resolved URL${methodHint}`;
 
     tooltipEl.innerHTML =
       `<div id="nobait-tooltip-label">${label}</div>` +
@@ -166,6 +169,7 @@
       `resolvedUrl : ${info.resolvedUrl || "N/A"}`,
       `status      : ${info.status || "N/A"}`,
       `redirected  : ${info.redirected !== undefined ? info.redirected : "N/A"}`,
+      `method      : ${info.method || "N/A"}`,
       `success     : ${info.success !== undefined ? info.success : "N/A"}`,
       `error       : ${info.error || "none"}`,
       `errorName   : ${info.errorName || "none"}`,
@@ -341,6 +345,7 @@
             resolvedUrl: response.resolvedUrl,
             status: response.status,
             redirected: response.redirected,
+            method: response.method,
             success: true,
           });
         } else {
