@@ -182,69 +182,10 @@ api.runtime.onConnect.addListener((port) => {
 // handleSummarize so every downstream step receives the real publisher URL.
 
 const RESOLVE_FETCH_TIMEOUT_MS = 8000;
-const RESOLVE_TAB_HARD_TIMEOUT_MS = 12000;
-const RESOLVE_TAB_SETTLE_DELAY_MS = 1500;
 
-async function resolveViaTab(originalUrl, requestId) {
-  return new Promise((resolve) => {
-    let finalUrl = originalUrl;
-    let resolved = false;
-    let tabId = null;
-    let settleTimer = null;
-
-    const finish = () => {
-      if (resolved) return;
-      resolved = true;
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-      chrome.tabs.onRemoved.removeListener(onRemoved);
-      if (settleTimer) clearTimeout(settleTimer);
-      if (tabId !== null) {
-        chrome.tabs.remove(tabId).catch(() => {});
-      }
-      resolve(finalUrl);
-    };
-
-    const onUpdated = (id, changeInfo, tab) => {
-      if (id !== tabId) return;
-      if (
-        tab.url &&
-        tab.url !== "about:blank" &&
-        !tab.url.startsWith("chrome://") &&
-        !tab.url.startsWith("chrome-error://")
-      ) {
-        finalUrl = tab.url;
-      }
-      if (changeInfo.url && changeInfo.url !== originalUrl) {
-        finalUrl = changeInfo.url;
-        if (settleTimer) clearTimeout(settleTimer);
-        settleTimer = null;
-      }
-      if (changeInfo.status === "complete") {
-        if (settleTimer) clearTimeout(settleTimer);
-        const delay = finalUrl !== originalUrl ? 500 : RESOLVE_TAB_SETTLE_DELAY_MS;
-        settleTimer = setTimeout(finish, delay);
-      }
-    };
-
-    const onRemoved = (id) => {
-      if (id === tabId) finish();
-    };
-
-    chrome.tabs.onUpdated.addListener(onUpdated);
-    chrome.tabs.onRemoved.addListener(onRemoved);
-
-    chrome.tabs.create({ url: originalUrl, active: false }, (tab) => {
-      if (chrome.runtime.lastError) {
-        resolved = true;
-        resolve(null);
-        return;
-      }
-      tabId = tab.id;
-    });
-
-    setTimeout(finish, RESOLVE_TAB_HARD_TIMEOUT_MS);
-  });
-}
+// resolveViaTab() removed — Google News /articles/ and /read/ paths are
+// resolved by converting to /rss/articles/ which returns a real HTTP 301/302
+// that fetch() follows natively. No tab is ever opened.
 
 async function resolveViaFetch(originalUrl, requestId) {
   const controller = new AbortController();
@@ -353,35 +294,28 @@ function extractRedirectFromHtml(html, originalUrl) {
 }
 
 async function resolveUrl(originalUrl, requestId) {
-  // Tab navigation follows JavaScript redirects. Only Google News article
-  // pages use JS redirects — all other domains use plain HTTP redirects or
-  // no redirect at all. Skipping the tab for non-GNews URLs avoids opening
-  // a visible background tab and eliminates the 5-12 s settle latency.
-  let isGNewsUrl = false;
+  // Google News /articles/{id} and /read/{id} pages use JavaScript redirects
+  // that fetch() cannot follow. However, the /rss/articles/{id} variant of the
+  // same URL returns a real HTTP 301/302 redirect to the publisher article,
+  // which fetch() follows natively — no tab is ever opened.
+  let urlToFetch = originalUrl;
   try {
-    const host = new URL(originalUrl).hostname.toLowerCase();
-    isGNewsUrl = host === "news.google.com" || host.endsWith(".news.google.com");
+    const u = new URL(originalUrl);
+    const host = u.hostname.toLowerCase();
+    if (host === "news.google.com" || host.endsWith(".news.google.com")) {
+      const rssUrl = originalUrl.replace(
+        /\/(?:articles|read)\//,
+        "/rss/articles/"
+      );
+      if (rssUrl !== originalUrl) urlToFetch = rssUrl;
+    }
   } catch (_) {}
 
-  if (isGNewsUrl) {
-    const tabResult = await resolveViaTab(originalUrl, requestId);
-    if (tabResult && tabResult !== originalUrl) {
-      return {
-        success: true,
-        resolvedUrl: tabResult,
-        originalUrl,
-        status: 200,
-        redirected: true,
-        method: "tab-navigation",
-        requestId,
-      };
-    }
-  }
+  // HTTP redirect following — HEAD then GET, parses meta-refresh/canonical as
+  // fallback. Never opens a tab.
+  const fetchResult = await resolveViaFetch(urlToFetch, requestId);
 
-  // HTTP redirect following — fast HEAD/GET, no tab opened.
-  const fetchResult = await resolveViaFetch(originalUrl, requestId);
-
-  if (fetchResult) {
+  if (fetchResult && fetchResult.url !== originalUrl) {
     return {
       success: true,
       resolvedUrl: fetchResult.url,
