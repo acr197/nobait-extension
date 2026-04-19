@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "NoBait v2 - Link Redirect Resolver",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Hold-click any link to resolve its final destination URL after redirects.",
   "permissions": ["activeTab", "tabs"],
   "background": {

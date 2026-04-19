@@ -65,7 +65,14 @@
   75%  { content: "..."; }
 }
 
-#nobait-tooltip-copy {
+#nobait-tooltip-buttons {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 0;
+}
+
+#nobait-tooltip-copy,
+#nobait-tooltip-copy-debug {
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -81,12 +88,14 @@
   line-height: 1;
 }
 
-#nobait-tooltip-copy:hover {
+#nobait-tooltip-copy:hover,
+#nobait-tooltip-copy-debug:hover {
   background: #3a3a5c;
   border-color: #6a6a8c;
 }
 
-#nobait-tooltip-copy.nobait-copied {
+#nobait-tooltip-copy.nobait-copied,
+#nobait-tooltip-copy-debug.nobait-copied {
   background: #1a3a1a;
   border-color: #2a6a2a;
   color: #66cc66;
