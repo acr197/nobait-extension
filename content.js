@@ -19,6 +19,9 @@
   let activeAnchor = null;
   let requestCounter = 0;
   let debugLog = [];
+  // Set to true the moment a popup is shown so the next click is swallowed.
+  // Prevents the mouseup-triggered click from navigating away after a hold.
+  let suppressNextClick = false;
 
   // ── Debug helpers ──────────────────────────────────────────────────
   function log(level, ...args) {
@@ -105,7 +108,8 @@
       `<div id="nobait-tooltip-loading">Following redirects for<br><strong>${escapeHtml(originalUrl)}</strong></div>`;
   }
 
-  function setTooltipResult(resolvedUrl, debugInfo) {
+  // anchorEl is the <a> that was long-held, used by the Copy Debug handler.
+  function setTooltipResult(resolvedUrl, debugInfo, anchorEl) {
     if (!tooltipEl) return;
 
     const same = debugInfo.originalUrl === resolvedUrl;
@@ -117,7 +121,10 @@
     tooltipEl.innerHTML =
       `<div id="nobait-tooltip-label">${label}</div>` +
       `<div id="nobait-tooltip-url">${escapeHtml(resolvedUrl)}</div>` +
-      `<button id="nobait-tooltip-copy" type="button">Copy URL</button>` +
+      `<div id="nobait-tooltip-buttons">` +
+        `<button id="nobait-tooltip-copy" type="button">Copy URL</button>` +
+        `<button id="nobait-tooltip-copy-debug" type="button">Copy Debug</button>` +
+      `</div>` +
       `<div id="nobait-tooltip-debug">${escapeHtml(formatDebugInfo(debugInfo))}</div>`;
 
     const copyBtn = tooltipEl.querySelector("#nobait-tooltip-copy");
@@ -128,7 +135,19 @@
     copyBtn.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      copyToClipboard(resolvedUrl, copyBtn);
+      copyToClipboard(resolvedUrl, copyBtn, "Copy URL");
+    });
+
+    const debugBtn = tooltipEl.querySelector("#nobait-tooltip-copy-debug");
+    debugBtn.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    debugBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const debugText = buildFullDebugText(debugInfo, anchorEl);
+      copyToClipboard(debugText, debugBtn, "Copy Debug");
     });
 
     // Re-check position now that content changed size
@@ -151,6 +170,9 @@
       log("INFO", "Tooltip removed");
     }
     activeAnchor = null;
+    // Safety reset — if tooltip is dismissed before a click arrives, don't
+    // suppress a future unrelated click.
+    suppressNextClick = false;
   }
 
   // ── Utility ────────────────────────────────────────────────────────
@@ -182,16 +204,74 @@
     return lines.join("\n");
   }
 
-  async function copyToClipboard(text, btnEl) {
+  // Builds the full debug dump for the Copy Debug button.
+  // Includes anchor text, publisher heuristic, all debug log entries, and error info.
+  function buildFullDebugText(info, anchorEl) {
+    // Best-effort: get visible article title from the anchor's text content
+    let articleTitle = "unknown";
+    if (anchorEl) {
+      const text = anchorEl.textContent.trim();
+      if (text) articleTitle = text;
+    }
+
+    // Best-effort: find publisher name from common data attributes or sibling text near the anchor
+    let publisher = "unknown";
+    if (anchorEl) {
+      const candidates = [
+        anchorEl.closest("[data-source]"),
+        anchorEl.closest("[data-publisher]"),
+        anchorEl.closest("[data-site-name]"),
+        anchorEl.querySelector(".source, .publisher, [class*='source'], [class*='publisher']"),
+        anchorEl.parentElement
+          ? anchorEl.parentElement.querySelector(".source, .publisher, [class*='source'], [class*='publisher']")
+          : null,
+      ].filter(Boolean);
+      for (const el of candidates) {
+        const val =
+          el.getAttribute("data-source") ||
+          el.getAttribute("data-publisher") ||
+          el.getAttribute("data-site-name") ||
+          el.textContent.trim();
+        if (val) {
+          publisher = val.slice(0, 120); // cap length
+          break;
+        }
+      }
+    }
+
+    const lines = [
+      `requestId         : ${info.requestId || "unknown"}`,
+      `articleTitle      : ${articleTitle}`,
+      `publisher         : ${publisher}`,
+      `originalUrl       : ${info.originalUrl || "unknown"}`,
+      `resolvedUrl       : ${info.resolvedUrl || "unknown"}`,
+      `resolverPath      : ${info.method || "unknown"}`,
+      `timestamp         : ${new Date().toISOString()}`,
+      `---`,
+      `--- In-popup debug log ---`,
+      debugLog.join("\n"),
+      `---`,
+      `error             : ${info.error || "none"}`,
+      `errorName         : ${info.errorName || "none"}`,
+      `errorStack        : ${info.errorStack || "none"}`,
+      `status            : ${info.status !== undefined ? info.status : "unknown"}`,
+      `redirected        : ${info.redirected !== undefined ? info.redirected : "unknown"}`,
+      `success           : ${info.success !== undefined ? info.success : "unknown"}`,
+      `pageUrl           : ${window.location.href}`,
+    ];
+    return lines.join("\n");
+  }
+
+  async function copyToClipboard(text, btnEl, resetLabel = "Copy URL") {
     try {
       await navigator.clipboard.writeText(text);
-      log("INFO", `Copied to clipboard: ${text}`);
+      log("INFO", `Copied to clipboard (${resetLabel}), length=${text.length}`);
       if (btnEl) {
         btnEl.textContent = "Copied!";
         btnEl.classList.add("nobait-copied");
         setTimeout(() => {
           if (btnEl) {
-            btnEl.textContent = "Copy URL";
+            btnEl.textContent = resetLabel;
             btnEl.classList.remove("nobait-copied");
           }
         }, 1500);
@@ -273,7 +353,6 @@
     cancelHold();
     // Do NOT remove tooltip on mouseup from the anchor —
     // only dismiss if the user mouses away from the tooltip or presses Escape.
-    // However, if no tooltip is showing, nothing to do.
   }
 
   function onKeyDown(e) {
@@ -284,10 +363,25 @@
     }
   }
 
+  // Capture-phase click handler that swallows the click fired on mouseup
+  // after a long-hold popup appears. Clears the flag immediately so only
+  // the one post-hold click is affected; short clicks pass through normally.
+  function onClickCapture(e) {
+    if (!suppressNextClick) return;
+    suppressNextClick = false;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    log("INFO", "Suppressed post-popup click on anchor (long-hold popup was active)");
+  }
+
   // ── Resolve and display ────────────────────────────────────────────
 
   function resolveAndShow(url, x, y) {
     const reqId = `req-${++requestCounter}-${Date.now()}`;
+    // Capture anchor reference now — activeAnchor may be cleared by the time
+    // the async response arrives.
+    const capturedAnchor = activeAnchor;
+
     log("INFO", `Sending resolve request | requestId=${reqId} | url=${url}`);
 
     const tip = createTooltip(x, y);
@@ -295,6 +389,12 @@
       log("ERROR", "Failed to create tooltip element");
       return;
     }
+
+    // Popup is now visible — arm the click suppressor so the mouseup-triggered
+    // click on the underlying anchor doesn't navigate the page away.
+    suppressNextClick = true;
+    log("INFO", "suppressNextClick armed — next page click will be swallowed");
+
     setTooltipLoading(url);
 
     chrome.runtime.sendMessage(
@@ -339,15 +439,19 @@
         log("INFO", `Response received | requestId=${reqId} | success=${response.success}`);
 
         if (response.success) {
-          setTooltipResult(response.resolvedUrl, {
-            requestId: reqId,
-            originalUrl: url,
-            resolvedUrl: response.resolvedUrl,
-            status: response.status,
-            redirected: response.redirected,
-            method: response.method,
-            success: true,
-          });
+          setTooltipResult(
+            response.resolvedUrl,
+            {
+              requestId: reqId,
+              originalUrl: url,
+              resolvedUrl: response.resolvedUrl,
+              status: response.status,
+              redirected: response.redirected,
+              method: response.method,
+              success: true,
+            },
+            capturedAnchor
+          );
         } else {
           log("ERROR", `Resolution failed | requestId=${reqId} | error=${response.error}`);
           setTooltipError(response.error || "Unknown error", {
@@ -368,6 +472,8 @@
   document.addEventListener("mousemove", onMouseMove, true);
   document.addEventListener("mouseup", onMouseUp, true);
   document.addEventListener("keydown", onKeyDown, true);
+  // Capture-phase click suppressor — must run before anchor's own click handler
+  document.addEventListener("click", onClickCapture, true);
 
   log("INFO", `NoBait v2 content script loaded on ${window.location.href}`);
 })();
