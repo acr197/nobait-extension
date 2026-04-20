@@ -196,6 +196,15 @@ async function resolveViaNoTab(originalUrl, requestId) {
   }
 }
 
+// ── Clickbait answer config ──────────────────────────────────────────
+// The Worker is shared with the original NoBait extension. It holds the
+// OPENAI_API_KEY secret and fronts api.openai.com/v1/responses (gpt-5).
+const NOBAIT_WORKER_URL = "https://nobait-proxy.acr197.workers.dev/summarize";
+const ARTICLE_FETCH_TIMEOUT_MS = 8000;
+const AI_TIMEOUT_MS = 15000;
+const ARTICLE_MAX_CHARS = 4000;
+const ANSWER_MAX_CHARS = 100;
+
 // ── Strategy 2: Tab-based navigation (follows JS redirects) ─────────
 // Opens the URL in a hidden background tab, lets the browser execute
 // JavaScript, and captures the final URL after all redirects complete.
@@ -497,20 +506,207 @@ async function resolveUrl(originalUrl, requestId) {
   };
 }
 
+// ── Clickbait answer pipeline ────────────────────────────────────────
+// After the URL is resolved we fetch the article, strip the HTML down
+// to readable text, and ask the NoBait Worker for the briefest possible
+// answer to the clickbait headline. Result is pushed to the content
+// script via chrome.tabs.sendMessage so the tooltip updates in place.
+
+// Fetches the resolved article URL and returns a plain-text excerpt.
+// Strips scripts/styles and collapses whitespace, preferring <article>
+// or <main> regions when present.
+async function fetchArticleText(url, requestId) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    ARTICLE_FETCH_TIMEOUT_MS
+  );
+
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "Accept": "text/html,application/xhtml+xml",
+      },
+    });
+    clearTimeout(timeoutId);
+
+    if (!resp.ok) {
+      throw new Error(`Article fetch HTTP ${resp.status}`);
+    }
+    const html = await resp.text();
+    const text = extractReadableText(html);
+    console.log(
+      `[NoBait BG] requestId=${requestId} | Article text extracted: ${text.length} chars`
+    );
+    return text;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    const aborted = err && err.name === "AbortError";
+    console.warn(
+      `[NoBait BG] requestId=${requestId} | Article fetch failed: ${
+        aborted ? "timeout" : err.message
+      }`
+    );
+    throw err;
+  }
+}
+
+// Pulls readable text out of raw HTML. Drops script/style/noscript/svg,
+// picks <article>/<main>/<body> in that order, strips remaining tags,
+// decodes common entities, and truncates to ARTICLE_MAX_CHARS.
+function extractReadableText(html) {
+  const cleaned = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, " ");
+
+  const articleMatch = cleaned.match(/<article[\s\S]*?<\/article>/i);
+  const mainMatch = cleaned.match(/<main[\s\S]*?<\/main>/i);
+  const bodyMatch = cleaned.match(/<body[\s\S]*?<\/body>/i);
+  const region = articleMatch
+    ? articleMatch[0]
+    : mainMatch
+    ? mainMatch[0]
+    : bodyMatch
+    ? bodyMatch[0]
+    : cleaned;
+
+  const text = region
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return text.slice(0, ARTICLE_MAX_CHARS);
+}
+
+// Builds a clickbait-stripping prompt and POSTs it to the shared NoBait
+// Worker. Returns a trimmed, ≤100-char answer string.
+async function askWorkerForAnswer(headline, articleText, requestId) {
+  const prompt =
+    `You are stripping away clickbait. Read the article excerpt and reveal, ` +
+    `in as few words as possible, the specific answer the headline is teasing.\n\n` +
+    `Guidance:\n` +
+    `- Prefer just names, places, or things — e.g. "Tomatoes, Sahara", "Keanu Reeves", "Mount Everest".\n` +
+    `- If the headline poses a question, answer it directly.\n` +
+    `- Never exceed ${ANSWER_MAX_CHARS} characters. Shorter is better.\n` +
+    `- No quotes, no prefixes like "Answer:", no trailing period unless the answer is a full sentence.\n\n` +
+    `Headline: ${headline || "(unknown)"}\n\n` +
+    `Article:\n${articleText}`;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+
+  try {
+    const resp = await fetch(NOBAIT_WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: prompt }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const detail =
+        (data && (data.detail || data.error)) || `HTTP ${resp.status}`;
+      throw new Error(`Worker error: ${detail}`);
+    }
+    const raw = String((data && data.summary) || "").trim();
+    if (!raw) throw new Error("Empty answer from worker");
+    const answer = trimAnswer(raw);
+    console.log(
+      `[NoBait BG] requestId=${requestId} | Worker answer (${answer.length}ch): ${answer}`
+    );
+    return answer;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    const aborted = err && err.name === "AbortError";
+    console.warn(
+      `[NoBait BG] requestId=${requestId} | Worker call failed: ${
+        aborted ? "timeout" : err.message
+      }`
+    );
+    throw err;
+  }
+}
+
+// Normalizes model output: strips wrapping quotes, collapses whitespace,
+// hard-caps length at ANSWER_MAX_CHARS with a trailing ellipsis if cut.
+function trimAnswer(text) {
+  let t = text.replace(/\s+/g, " ").trim();
+  t = t.replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, "").trim();
+  if (t.length > ANSWER_MAX_CHARS) {
+    t = t.slice(0, ANSWER_MAX_CHARS - 1).trimEnd() + "…";
+  }
+  return t;
+}
+
+// Runs after URL resolution: fetches the resolved article, asks the
+// Worker for a clickbait answer, and messages the result back to the
+// tab so the tooltip can swap its "Reading the article" placeholder.
+async function pushClickbaitAnswer(tabId, requestId, linkText, resolvedUrl) {
+  try {
+    const articleText = await fetchArticleText(resolvedUrl, requestId);
+    if (!articleText || articleText.length < 50) {
+      throw new Error("Article too short to summarize");
+    }
+    const answer = await askWorkerForAnswer(linkText, articleText, requestId);
+    chrome.tabs
+      .sendMessage(tabId, { type: "clickbait-answer", requestId, answer })
+      .catch(() => {});
+  } catch (err) {
+    console.warn(
+      `[NoBait BG] requestId=${requestId} | Clickbait pipeline failed: ${err.message}`
+    );
+    chrome.tabs
+      .sendMessage(tabId, {
+        type: "clickbait-answer",
+        requestId,
+        error: err.message,
+      })
+      .catch(() => {});
+  }
+}
+
 // ── Message listener ─────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type !== "resolve-url") return false;
 
   const originalUrl = message.url;
+  const linkText = typeof message.linkText === "string" ? message.linkText : "";
   const requestId = message.requestId || "unknown";
+  const tabId = sender && sender.tab && sender.tab.id;
 
   console.log(
     `[NoBait BG] requestId=${requestId} | Received resolve request for: ${originalUrl}`
   );
 
   resolveUrl(originalUrl, requestId)
-    .then((result) => sendResponse(result))
+    .then((result) => {
+      sendResponse(result);
+      // Kick off the clickbait answer pipeline asynchronously. Don't
+      // block the URL response on it — the URL is the fast path, the
+      // answer streams in seconds later.
+      if (result && result.success && typeof tabId === "number") {
+        pushClickbaitAnswer(
+          tabId,
+          requestId,
+          linkText,
+          result.resolvedUrl
+        );
+      }
+    })
     .catch((error) => {
       console.error(
         `[NoBait BG] requestId=${requestId} | Unexpected error:`,
@@ -530,5 +726,5 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 console.log(
-  "[NoBait BG] Service worker loaded — strategies: batchexecute, fetch-head/get, tab-navigation, html-parse"
+  "[NoBait BG] Service worker loaded — strategies: batchexecute, fetch-head/get, tab-navigation, html-parse + clickbait-answer"
 );

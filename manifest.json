@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "name": "NoBait v2 - Link Redirect Resolver",
-  "version": "0.2.0",
-  "description": "Hold-click any link to resolve its final destination URL after redirects.",
+  "version": "0.3.0",
+  "description": "Hold-click any link to resolve redirects and reveal the briefest possible answer to clickbait headlines.",
   "permissions": ["activeTab", "tabs"],
+  "host_permissions": ["https://nobait-proxy.acr197.workers.dev/*"],
   "background": {
     "service_worker": "background.js"
   },

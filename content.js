@@ -17,6 +17,7 @@
   let startY = 0;
   let tooltipEl = null;
   let activeAnchor = null;
+  let activeRequestId = null;
   let requestCounter = 0;
   let debugLog = [];
   // Set to true the moment a popup is shown so the next click is swallowed.
@@ -116,10 +117,13 @@
     const methodHint = debugInfo.method && debugInfo.method !== "none"
       ? ` (via ${debugInfo.method})`
       : "";
-    const label = same ? "Final URL (no redirect)" : `Resolved URL${methodHint}`;
+    const urlLabel = same ? "Final URL (no redirect)" : `Resolved URL${methodHint}`;
 
     tooltipEl.innerHTML =
-      `<div id="nobait-tooltip-label">${label}</div>` +
+      `<div id="nobait-tooltip-answer-label">The answer</div>` +
+      `<div id="nobait-tooltip-answer" class="nobait-answer-thinking">Reading the article</div>` +
+      `<div id="nobait-tooltip-separator"></div>` +
+      `<div id="nobait-tooltip-label">${urlLabel}</div>` +
       `<div id="nobait-tooltip-url">${escapeHtml(resolvedUrl)}</div>` +
       `<div id="nobait-tooltip-buttons">` +
         `<button id="nobait-tooltip-copy" type="button">Copy URL</button>` +
@@ -155,6 +159,27 @@
     positionTooltip(rect.left, rect.top - TOOLTIP_OFFSET_Y);
   }
 
+  // Swaps the "Reading the article" placeholder with the model's answer
+  // (or an error blurb) once the background pipeline completes.
+  function updateTooltipAnswer(answer, error) {
+    if (!tooltipEl) return;
+    const answerEl = tooltipEl.querySelector("#nobait-tooltip-answer");
+    if (!answerEl) return;
+    answerEl.classList.remove("nobait-answer-thinking");
+    if (error) {
+      answerEl.classList.add("nobait-answer-error");
+      answerEl.textContent = `Could not summarize (${error})`;
+    } else if (answer) {
+      answerEl.textContent = answer;
+    } else {
+      answerEl.classList.add("nobait-answer-error");
+      answerEl.textContent = "No answer returned";
+    }
+    // Reflow in case the new content changed the tooltip's height
+    const rect = tooltipEl.getBoundingClientRect();
+    positionTooltip(rect.left, rect.top - TOOLTIP_OFFSET_Y);
+  }
+
   function setTooltipError(errorMsg, debugInfo) {
     if (!tooltipEl) return;
     tooltipEl.innerHTML =
@@ -170,6 +195,7 @@
       log("INFO", "Tooltip removed");
     }
     activeAnchor = null;
+    activeRequestId = null;
     // Safety reset — if tooltip is dismissed before a click arrives, don't
     // suppress a future unrelated click.
     suppressNextClick = false;
@@ -332,7 +358,13 @@
     holdTimer = setTimeout(() => {
       holdTimer = null;
       log("INFO", `Hold threshold reached (${HOLD_DELAY_MS}ms) — resolving: ${href}`);
-      resolveAndShow(href, startX, startY);
+      // Capture the visible link text as our best guess at the clickbait
+      // headline. Fall back to the title attribute for icon-only links.
+      const linkText = (anchor.textContent || anchor.title || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 300);
+      resolveAndShow(href, startX, startY, linkText);
     }, HOLD_DELAY_MS);
   }
 
@@ -376,13 +408,14 @@
 
   // ── Resolve and display ────────────────────────────────────────────
 
-  function resolveAndShow(url, x, y) {
+  function resolveAndShow(url, x, y, linkText) {
     const reqId = `req-${++requestCounter}-${Date.now()}`;
+    activeRequestId = reqId;
     // Capture anchor reference now — activeAnchor may be cleared by the time
     // the async response arrives.
     const capturedAnchor = activeAnchor;
 
-    log("INFO", `Sending resolve request | requestId=${reqId} | url=${url}`);
+    log("INFO", `Sending resolve request | requestId=${reqId} | url=${url} | linkText="${linkText || ""}"`);
 
     const tip = createTooltip(x, y);
     if (!tip) {
@@ -398,7 +431,7 @@
     setTooltipLoading(url);
 
     chrome.runtime.sendMessage(
-      { type: "resolve-url", url: url, requestId: reqId },
+      { type: "resolve-url", url: url, linkText: linkText || "", requestId: reqId },
       (response) => {
         if (chrome.runtime.lastError) {
           const errMsg = chrome.runtime.lastError.message;
@@ -466,6 +499,29 @@
       }
     );
   }
+
+  // ── Clickbait answer receiver ──────────────────────────────────────
+  // Background pushes the AI answer as a separate message once the URL
+  // resolves and the article has been summarized. Ignore stale answers
+  // (user already dismissed the tooltip or started a new hold).
+  chrome.runtime.onMessage.addListener((message) => {
+    if (!message || message.type !== "clickbait-answer") return;
+    if (message.requestId !== activeRequestId) {
+      log("INFO", `Ignoring stale clickbait answer for ${message.requestId}`);
+      return;
+    }
+    if (!tooltipEl) {
+      log("INFO", `Clickbait answer arrived but tooltip already dismissed: ${message.requestId}`);
+      return;
+    }
+    log(
+      "INFO",
+      `Clickbait answer for ${message.requestId}: ${
+        message.answer ? message.answer : "error=" + message.error
+      }`
+    );
+    updateTooltipAnswer(message.answer, message.error);
+  });
 
   // ── Register listeners ─────────────────────────────────────────────
   document.addEventListener("mousedown", onMouseDown, true);

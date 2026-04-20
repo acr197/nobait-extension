@@ -25,12 +25,48 @@
   opacity: 1;
 }
 
+#nobait-tooltip-answer-label,
 #nobait-tooltip-label {
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: #8888aa;
   margin-bottom: 4px;
+}
+
+#nobait-tooltip-answer {
+  color: #f0f0f0;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.3;
+  margin-bottom: 10px;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+
+#nobait-tooltip-answer.nobait-answer-thinking {
+  color: #aaaacc;
+  font-weight: 400;
+  font-style: italic;
+  font-size: 13px;
+}
+
+#nobait-tooltip-answer.nobait-answer-thinking::after {
+  content: "";
+  animation: nobait-dots 1.2s steps(4, end) infinite;
+}
+
+#nobait-tooltip-answer.nobait-answer-error {
+  color: #ff9b6b;
+  font-weight: 400;
+  font-size: 12px;
+  font-style: italic;
+}
+
+#nobait-tooltip-separator {
+  height: 1px;
+  background: #2a2a4c;
+  margin: 6px 0 8px 0;
 }
 
 #nobait-tooltip-url {
