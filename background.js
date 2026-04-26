@@ -130,9 +130,12 @@ const ANSWER_MAX_CHARS = 220;
 // Bump when the prompt changes so debug dumps can be correlated with
 // answer quality. Old cached answers are evicted by URL+TTL, not version,
 // but the version is recorded in the meta payload pushed to the tooltip.
-const PROMPT_VERSION = "v4-2026-04-26";
-const BEST_GUESS_MAX_CHARS = 320;
+const PROMPT_VERSION = "v5-2026-04-26";
+const BEST_GUESS_MAX_CHARS = 440;
 const EXPANDED_MAX_CHARS = 500;
+// Punchline (style="punchline") returns bare-fragment answers — much
+// tighter cap than the standard 220-char prose summary.
+const PUNCHLINE_MAX_CHARS = 100;
 const ARCHIVE_AVAIL_TIMEOUT_MS = 5000;
 
 // Alt-source caps. Each attempt costs at most one URL resolve + one fetch +
@@ -143,27 +146,58 @@ const ALT_SOURCE_SEARCH_TIMEOUT_MS = 8000;
 const ALT_SOURCE_GN_QUICK_TIMEOUT_MS = 4000;
 
 // ── Settings (popup-controlled fallback toggles) ─────────────────────
-// Defaults match popup.js — the popup is the source of truth, but we
-// duplicate them here so first-run before the popup is opened still works.
+// Each fallback now has TWO booleans:
+//   enabled: show as a button in the long-click tooltip
+//   auto:    also run automatically as part of the fallback chain
+// `auto` requires `enabled` (popup enforces this).
+//
+// Defaults match popup.js. Backward compat: if the stored value is a bare
+// boolean (legacy "auto-run only"), it's lifted to { enabled: true, auto: <bool> }.
 const SETTINGS_KEY = "nobaitSettings";
 const DEFAULT_FALLBACKS = {
-  jsonLd: true,
-  metaDesc: true,
-  cookies: true,
-  amp: false,
-  twelveFt: false,
-  altSource: false,
-  archive: false,
+  jsonLd:    { enabled: true,  auto: true  },
+  metaDesc:  { enabled: true,  auto: true  },
+  cookies:   { enabled: true,  auto: true  },
+  amp:       { enabled: true,  auto: false },
+  twelveFt:  { enabled: false, auto: false },
+  altSource: { enabled: true,  auto: false },
+  archive:   { enabled: true,  auto: false },
 };
+
+function normalizeFallbackEntry(stored, def) {
+  if (stored === true) return { enabled: true, auto: true };
+  if (stored === false) return { enabled: def.enabled, auto: false };
+  if (stored && typeof stored === "object") {
+    return {
+      enabled: stored.enabled !== undefined ? !!stored.enabled : def.enabled,
+      auto: stored.auto !== undefined ? !!stored.auto : def.auto,
+    };
+  }
+  return { enabled: def.enabled, auto: def.auto };
+}
+
+const VALID_STYLES = new Set(["standard", "punchline"]);
+const DEFAULT_STYLE = "standard";
 
 async function getSettings() {
   try {
     const stored = await chrome.storage.local.get(SETTINGS_KEY);
-    const fb = (stored[SETTINGS_KEY] && stored[SETTINGS_KEY].fallbacks) || {};
-    return { fallbacks: { ...DEFAULT_FALLBACKS, ...fb } };
+    const raw = stored[SETTINGS_KEY] || {};
+    const fb = raw.fallbacks || {};
+    const merged = {
+      summaryStyle: VALID_STYLES.has(raw.summaryStyle) ? raw.summaryStyle : DEFAULT_STYLE,
+      fallbacks: {},
+    };
+    for (const [k, def] of Object.entries(DEFAULT_FALLBACKS)) {
+      merged.fallbacks[k] = normalizeFallbackEntry(fb[k], def);
+    }
+    return merged;
   } catch (err) {
     console.warn("[NoBait BG] settings load failed, using defaults:", err.message);
-    return { fallbacks: { ...DEFAULT_FALLBACKS } };
+    return {
+      summaryStyle: DEFAULT_STYLE,
+      fallbacks: JSON.parse(JSON.stringify(DEFAULT_FALLBACKS)),
+    };
   }
 }
 
@@ -175,6 +209,19 @@ function sendProgress(tabId, requestId, status) {
     .sendMessage(tabId, { type: "progress-update", requestId, status })
     .catch(() => {});
   console.log(`[NoBait BG] requestId=${requestId} | progress: ${status}`);
+}
+
+// Pushes a granular debug event to the in-popup debug log — DOES NOT
+// update the visible loading status. Used for per-attempt alt source
+// events, fallback chain decisions, and other diagnostics that should
+// be visible in Copy Debug but not flicker the status text.
+function sendDebugEvent(tabId, requestId, level, message) {
+  if (typeof tabId !== "number") return;
+  chrome.tabs
+    .sendMessage(tabId, { type: "debug-event", requestId, level: level || "INFO", message })
+    .catch(() => {});
+  const tag = level === "WARN" ? "warn" : level === "ERROR" ? "error" : "log";
+  console[tag](`[NoBait BG] requestId=${requestId} | ${message}`);
 }
 
 // ── Block detection config ───────────────────────────────────────────
@@ -294,17 +341,31 @@ function detectBlock(url, httpStatus, html, text) {
   }
 
   // ── Paywall: text markers ─────────────────────────────────────────
+  // Count how many markers appear in the extracted text, but cap the scan
+  // at 3 so we don't spend time on long articles that contain one membership
+  // appeal inside otherwise-real content (FanGraphs, The Athletic free tier,
+  // etc.). The body-length thresholds prevent false positives:
+  //   3+ markers         → always paywall (overwhelming signal)
+  //   2  markers, < 2000 → paywall (soft paywall with thin body)
+  //   1  marker,  < 1200 → paywall (strong single marker in thin body)
+  //   1+ markers, ≥ 1200 → NOT paywalled — real article present even if
+  //                         a subscription appeal is embedded in the page.
+  const textLen = (text || "").length;
   let markerHits = 0;
   let firstMarker = null;
   for (const marker of PAYWALL_TEXT_MARKERS) {
     if (lowText.includes(marker)) {
       markerHits += 1;
       if (!firstMarker) firstMarker = marker;
-      if (markerHits >= 2) break;
+      if (markerHits >= 3) break;
     }
   }
-  // Two markers, OR one marker in a short body → paywall.
-  if (markerHits >= 2 || (markerHits >= 1 && (text || "").length < 2500)) {
+  const isPaywallByMarker =
+    markerHits >= 3 ||
+    (markerHits >= 2 && textLen < 2000) ||
+    (markerHits >= 1 && textLen < 1200);
+
+  if (isPaywallByMarker) {
     return {
       kind: "paywall",
       publisher: hostname || "unknown",
@@ -313,6 +374,34 @@ function detectBlock(url, httpStatus, html, text) {
   }
 
   return null;
+}
+
+// Decodes HTML entities — both named (&amp;, &quot;, &nbsp;, etc.) and
+// numeric (decimal &#39; and hex &#x27;). Critical for headlines pulled
+// from <title> / og:title that ship apostrophes as &#x27; — without this
+// the search query "John&#x27;s article" gets sent verbatim and zero results.
+function decodeHtmlEntities(text) {
+  if (!text) return "";
+  return text
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+      try { return String.fromCodePoint(parseInt(hex, 16)); } catch { return _; }
+    })
+    .replace(/&#(\d+);/g, (_, dec) => {
+      try { return String.fromCodePoint(parseInt(dec, 10)); } catch { return _; }
+    })
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&mdash;/gi, "—")
+    .replace(/&ndash;/gi, "–")
+    .replace(/&hellip;/gi, "…")
+    .replace(/&lsquo;/gi, "‘")
+    .replace(/&rsquo;/gi, "’")
+    .replace(/&ldquo;/gi, "“")
+    .replace(/&rdquo;/gi, "”");
 }
 
 // Best-effort article title extraction from HTML metadata. Falls back
@@ -330,15 +419,7 @@ function extractArticleTitle(html) {
   for (const re of patterns) {
     const m = html.match(re);
     if (m && m[1]) {
-      let t = m[1]
-        .replace(/&nbsp;/g, " ")
-        .replace(/&amp;/g, "&")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/\s+/g, " ")
-        .trim();
+      let t = decodeHtmlEntities(m[1]).replace(/\s+/g, " ").trim();
       // Strip common " | Publisher" or " - Publisher" suffixes.
       t = t.replace(/\s*[|·•—–-]\s*[^|·•—–-]{2,40}$/, "").trim();
       if (t.length > 5) return t;
@@ -407,15 +488,7 @@ function extractMetaDescription(html) {
   for (const re of patterns) {
     const m = html.match(re);
     if (m && m[1]) {
-      const t = m[1]
-        .replace(/&nbsp;/g, " ")
-        .replace(/&amp;/g, "&")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/\s+/g, " ")
-        .trim();
+      const t = decodeHtmlEntities(m[1]).replace(/\s+/g, " ").trim();
       if (t.length > 60) return t;
     }
   }
@@ -814,13 +887,13 @@ function extractReadableText(html) {
   return { text: text.slice(0, ARTICLE_MAX_CHARS), regionUsed };
 }
 
-// Builds a clickbait-stripping prompt designed to produce concise but
-// substantive answers. Rules below address common failure modes:
+// Standard prompt — short summary with context, 1-2 sentences. Rules below
+// address common failure modes:
 // - Cryptic one-word answers ("Raspberry Pi") that don't explain themselves
 // - Lists collapsed to a single item or two
 // - Bare names returned for headlines that aren't asking "who"
 // - Declarative (non-clickbait) headlines getting non-answers
-function buildPrompt(headline, articleText) {
+function buildStandardPrompt(headline, articleText) {
   return (
     `You strip clickbait from headlines. Read the headline and article excerpt ` +
     `below, then write the briefest answer that actually satisfies what the ` +
@@ -851,10 +924,58 @@ function buildPrompt(headline, articleText) {
   );
 }
 
+// Punchline prompt — bare distilled answer in fragments, no sentences,
+// no fluff. Output examples are the user's own desired format.
+function buildPunchlinePrompt(headline, articleText) {
+  return (
+    `You strip clickbait to its bare PUNCHLINE. Read the headline and article ` +
+    `excerpt and answer in AS FEW WORDS AS POSSIBLE — the distilled payoff only.\n\n` +
+    `OUTPUT RULES (STRICT)\n` +
+    `- Fragments only. NO complete sentences. No subject + verb constructions.\n` +
+    `- No filler: skip "the", "a", "an", "this", "is", "are", "you", "your".\n` +
+    `- Hard limit: ${PUNCHLINE_MAX_CHARS} characters. Aim under 50.\n` +
+    `- No prefixes ("Answer:", "TL;DR:"), no quotes, no markdown.\n\n` +
+    `PATTERNS BY HEADLINE TYPE (USE THE EXACT FORMAT)\n\n` +
+    `[Single thing / answer] → just that noun phrase, no period, no article.\n` +
+    `  Headline: "Costco just rolled out a new snack but only for a limited time"\n` +
+    `  → Caramel Churro Sundae\n\n` +
+    `  Headline: "Who scored the winning goal?"\n` +
+    `  → Mbappé\n\n` +
+    `[Action / method / hack] → noun phrase naming the trick, period optional.\n` +
+    `  Headline: "I finally stopped fighting with spotty hotel Wi-Fi thanks to this Netflix USB hack"\n` +
+    `  → USB-C to ethernet adapter.\n\n` +
+    `[List of N things] → numbered inline "1. X 2. Y 3. Z" (cap at 5).\n` +
+    `  Headline: "I asked ChatGPT for unconventional productivity hacks — these are the 3 that actually worked"\n` +
+    `  → 1. Reverse to-do list 2. Chaos sprints 3. Task gamification\n\n` +
+    `  Headline: "5 budget tips that saved me $2,000"\n` +
+    `  → 1. Cancel subscriptions 2. Meal-prep 3. Used clothes 4. Brand swaps 5. Cash-back card\n\n` +
+    `[Question with multi-cause answer] → comma-separated key causes, no "because".\n` +
+    `  Headline: "Why are Treasury yields rising?"\n` +
+    `  → Strong jobs data, sticky inflation, fewer Fed cuts\n\n` +
+    `[Declarative news headline] → just the salient fact.\n` +
+    `  Headline: "Trump bought $51M in stocks, filing shows"\n` +
+    `  → Apple, Nvidia, Microsoft, Meta\n\n` +
+    `Headline: ${headline || "(unknown)"}\n\n` +
+    `Article excerpt:\n${articleText}`
+  );
+}
+
+// Dispatches to the right prompt builder based on summary style. `style`
+// is "standard" (default) or "punchline".
+function buildPrompt(headline, articleText, style) {
+  return style === "punchline"
+    ? buildPunchlinePrompt(headline, articleText)
+    : buildStandardPrompt(headline, articleText);
+}
+
 // POSTs the prompt to the shared NoBait Worker and returns
-// { answer, rawAnswer, workerStatus, aiCallMs }.
-async function askWorkerForAnswer(headline, articleText, requestId) {
-  const prompt = buildPrompt(headline, articleText);
+// { answer, rawAnswer, workerStatus, aiCallMs, promptChars, style }.
+// `style` is "standard" (default) or "punchline" — drives both the prompt
+// and the post-processing trim cap.
+async function askWorkerForAnswer(headline, articleText, requestId, style) {
+  const useStyle = style === "punchline" ? "punchline" : "standard";
+  const prompt = buildPrompt(headline, articleText, useStyle);
+  const cap = useStyle === "punchline" ? PUNCHLINE_MAX_CHARS : ANSWER_MAX_CHARS;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
   const startedAt = Date.now();
@@ -885,11 +1006,15 @@ async function askWorkerForAnswer(headline, articleText, requestId) {
       err.aiCallMs = aiCallMs;
       throw err;
     }
-    const answer = trimAnswer(raw);
+    // Punchline mode trims to a clean fragment boundary (last word break)
+    // rather than appending an ellipsis — fragments shouldn't have "…" appended.
+    const answer = useStyle === "punchline"
+      ? trimPunchline(raw, cap)
+      : trimAnswer(raw, cap);
     console.log(
-      `[NoBait BG] requestId=${requestId} | Worker answer in ${aiCallMs}ms (${answer.length}ch): ${answer}`
+      `[NoBait BG] requestId=${requestId} | Worker answer (${useStyle}) in ${aiCallMs}ms (${answer.length}ch): ${answer}`
     );
-    return { answer, rawAnswer: raw, workerStatus: resp.status, aiCallMs, promptChars: prompt.length };
+    return { answer, rawAnswer: raw, workerStatus: resp.status, aiCallMs, promptChars: prompt.length, style: useStyle };
   } catch (err) {
     clearTimeout(timeoutId);
     const aborted = err && err.name === "AbortError";
@@ -904,12 +1029,31 @@ async function askWorkerForAnswer(headline, articleText, requestId) {
 }
 
 // Normalizes model output: strips wrapping quotes, collapses whitespace,
-// hard-caps length at ANSWER_MAX_CHARS with a trailing ellipsis if cut.
-function trimAnswer(text) {
+// hard-caps length with a trailing ellipsis if cut.
+function trimAnswer(text, cap) {
+  const limit = cap || ANSWER_MAX_CHARS;
   let t = text.replace(/\s+/g, " ").trim();
   t = t.replace(/^["'`""'']+|["'`""'']+$/g, "").trim();
-  if (t.length > ANSWER_MAX_CHARS) {
-    t = t.slice(0, ANSWER_MAX_CHARS - 1).trimEnd() + "…";
+  if (t.length > limit) {
+    t = t.slice(0, limit - 1).trimEnd() + "…";
+  }
+  return t;
+}
+
+// Trim for Punchline style. Punchlines are fragments — no ellipsis,
+// no mid-word cut. If we have to trim, trim to the last word break.
+function trimPunchline(text, cap) {
+  const limit = cap || PUNCHLINE_MAX_CHARS;
+  let t = text.replace(/\s+/g, " ").trim();
+  t = t.replace(/^["'`""'']+|["'`""'']+$/g, "").trim();
+  // Strip common AI prefixes the punchline prompt forbids but the model
+  // sometimes still adds when the answer is very short.
+  t = t.replace(/^(answer|tl;dr|punchline|response)\s*[:\-—]\s*/i, "");
+  if (t.length > limit) {
+    const slice = t.slice(0, limit);
+    const lastSpace = slice.lastIndexOf(" ");
+    t = lastSpace > limit * 0.5 ? slice.slice(0, lastSpace) : slice;
+    t = t.replace(/[,;:.!?\-—–]+$/, "").trim();
   }
   return t;
 }
@@ -944,50 +1088,157 @@ function trimToCompleteSentence(text, maxChars) {
 //
 // Returns { answer, rawAnswer, method, articleText?, source: {name, publisher, url, snapshotDate}? }
 // or null if every enabled step failed.
+// Runs a single fallback method on demand (user clicked the corresponding
+// button in the tooltip). Returns { found, answer, source?, error? }.
+// Re-uses the answer cache for the article HTML/text so jsonLd/metaDesc
+// don't need a refetch.
+async function runManualFallback(method, ctx) {
+  const { headline, originalUrl, resolvedUrl, requestId, tabId } = ctx;
+  // Load style from settings so the manual button matches the user's choice.
+  const settings = await getSettings();
+  const style = settings.summaryStyle || DEFAULT_STYLE;
+
+  sendDebugEvent(tabId, requestId, "INFO",
+    `Manual fallback "${method}" requested | style=${style} | resolvedUrl=${resolvedUrl} | headline="${headline.slice(0, 60)}"`
+  );
+
+  const cached = answerCache.get(resolvedUrl);
+  let articleHtml = null;
+  let articleText = null;
+  if (cached) {
+    articleText = cached.articleText || null;
+    // We don't cache HTML — would be too big. For jsonLd/metaDesc on a
+    // cached entry, refetch (cheap).
+  }
+
+  const fetchFresh = async (withCookies) => {
+    sendDebugEvent(tabId, requestId, "INFO",
+      `Manual ${method}: fetching ${withCookies ? "with cookies" : "fresh"}…`
+    );
+    const a = await fetchArticleText(resolvedUrl, requestId, { withCookies });
+    return a;
+  };
+
+  if (method === "jsonLd" || method === "metaDesc") {
+    // These need HTML — refetch (cheap) then extract.
+    let article;
+    try { article = await fetchFresh(false); }
+    catch (err) {
+      return { found: false, error: `Couldn't refetch article: ${err.message}` };
+    }
+    articleHtml = article.html;
+    let body;
+    if (method === "jsonLd") {
+      body = extractJsonLdBody(articleHtml);
+      sendDebugEvent(tabId, requestId, "INFO", `JSON-LD extraction: ${body ? body.length + " chars found" : "no articleBody"}`);
+    } else {
+      body = extractMetaDescription(articleHtml);
+      sendDebugEvent(tabId, requestId, "INFO", `Meta description extraction: ${body ? body.length + " chars found" : "none"}`);
+    }
+    if (!body || body.length < 60) {
+      return { found: false, error: `${method === "jsonLd" ? "No JSON-LD article body" : "No meta description"} on this page.` };
+    }
+    const r = await askWorkerForAnswer(headline, body, requestId, style);
+    sendDebugEvent(tabId, requestId, "INFO", `Manual ${method} summary OK (${style}): ${r.answer.length} chars`);
+    return { found: true, answer: r.answer, rawAnswer: r.rawAnswer };
+  }
+
+  if (method === "cookies") {
+    let article;
+    try { article = await fetchFresh(true); }
+    catch (err) {
+      return { found: false, error: `Cookied refetch failed: ${err.message}` };
+    }
+    if (article.block) {
+      sendDebugEvent(tabId, requestId, "WARN", `Cookied refetch still blocked: ${article.block.kind}`);
+      return { found: false, error: `Still blocked even with cookies (${article.block.kind}). Are you logged in to ${(function () { try { return new URL(resolvedUrl).hostname; } catch { return "this site"; } })()}?` };
+    }
+    if (!article.text || article.text.length < 200) {
+      return { found: false, error: `Cookied refetch returned only ${article.text.length} chars.` };
+    }
+    const r = await askWorkerForAnswer(headline, article.text, requestId, style);
+    sendDebugEvent(tabId, requestId, "INFO", `Manual cookies summary OK (${style}): ${r.answer.length} chars`);
+    return { found: true, answer: r.answer, rawAnswer: r.rawAnswer };
+  }
+
+  if (method === "amp") {
+    const amp = await tryAmpVersion(originalUrl, requestId);
+    if (!amp || !amp.article.text || amp.article.text.length < 200) {
+      sendDebugEvent(tabId, requestId, "WARN", `AMP version: not found or too short`);
+      return { found: false, error: "No usable AMP version found at the common URL patterns." };
+    }
+    sendDebugEvent(tabId, requestId, "INFO", `AMP version found: ${amp.ampUrl} (${amp.article.text.length} chars)`);
+    const r = await askWorkerForAnswer(headline, amp.article.text, requestId, style);
+    return {
+      found: true, answer: r.answer, rawAnswer: r.rawAnswer,
+      source: { name: "AMP version", url: amp.ampUrl },
+    };
+  }
+
+  if (method === "twelveFt") {
+    const proxy = await tryViaTwelveFt(originalUrl, requestId);
+    if (!proxy || !proxy.article.text || proxy.article.text.length < 200) {
+      sendDebugEvent(tabId, requestId, "WARN", `12ft.io proxy: not usable`);
+      return { found: false, error: "12ft.io proxy didn't return usable content." };
+    }
+    sendDebugEvent(tabId, requestId, "INFO", `12ft.io OK: ${proxy.article.text.length} chars`);
+    const r = await askWorkerForAnswer(headline, proxy.article.text, requestId, style);
+    return {
+      found: true, answer: r.answer, rawAnswer: r.rawAnswer,
+      source: { name: "12ft.io", url: proxy.proxyUrl },
+    };
+  }
+
+  return { found: false, error: `Unknown manual fallback method: ${method}` };
+}
+
 async function runFallbackChain(article, originalUrl, headline, articleDate, requestId, tabId, settings) {
   const fb = settings.fallbacks;
+  const style = settings.summaryStyle || DEFAULT_STYLE;
+  // Helper: each fallback is { enabled, auto } now. Auto-fallback chain only
+  // runs steps where auto === true.
+  const isAuto = (key) => !!(fb[key] && fb[key].auto);
 
   // Free + instant — re-extract from the HTML we already fetched.
-  if (fb.jsonLd && article && article.html) {
+  if (isAuto("jsonLd") && article && article.html) {
     sendProgress(tabId, requestId, "Trying embedded article body…");
     const body = extractJsonLdBody(article.html);
     if (body && body.length >= 200) {
       try {
-        const r = await askWorkerForAnswer(headline, body, requestId);
+        const r = await askWorkerForAnswer(headline, body, requestId, style);
         return { answer: r.answer, rawAnswer: r.rawAnswer, method: "jsonLd", articleText: body };
       } catch (e) { /* fall through */ }
     }
   }
 
-  if (fb.metaDesc && article && article.html) {
+  if (isAuto("metaDesc") && article && article.html) {
     sendProgress(tabId, requestId, "Trying page summary metadata…");
     const desc = extractMetaDescription(article.html);
     if (desc && desc.length >= 100) {
       try {
-        const r = await askWorkerForAnswer(headline, desc, requestId);
+        const r = await askWorkerForAnswer(headline, desc, requestId, style);
         return { answer: r.answer, rawAnswer: r.rawAnswer, method: "metaDesc", articleText: desc };
       } catch (e) { /* fall through */ }
     }
   }
 
-  // Cookied refetch — works when user is logged into a subscriber site.
-  if (fb.cookies) {
+  if (isAuto("cookies")) {
     sendProgress(tabId, requestId, "Retrying with your browser cookies…");
     try {
       const cookied = await fetchArticleText(originalUrl, requestId, { withCookies: true });
       if (!cookied.block && cookied.text && cookied.text.length >= 200) {
-        const r = await askWorkerForAnswer(headline, cookied.text, requestId);
+        const r = await askWorkerForAnswer(headline, cookied.text, requestId, style);
         return { answer: r.answer, rawAnswer: r.rawAnswer, method: "cookies", articleText: cookied.text };
       }
     } catch (e) { /* fall through */ }
   }
 
-  if (fb.amp) {
+  if (isAuto("amp")) {
     sendProgress(tabId, requestId, "Trying AMP version…");
     try {
       const amp = await tryAmpVersion(originalUrl, requestId);
       if (amp && amp.article.text && amp.article.text.length >= 200) {
-        const r = await askWorkerForAnswer(headline, amp.article.text, requestId);
+        const r = await askWorkerForAnswer(headline, amp.article.text, requestId, style);
         return {
           answer: r.answer, rawAnswer: r.rawAnswer, method: "amp",
           articleText: amp.article.text,
@@ -997,12 +1248,12 @@ async function runFallbackChain(article, originalUrl, headline, articleDate, req
     } catch (e) { /* fall through */ }
   }
 
-  if (fb.twelveFt) {
+  if (isAuto("twelveFt")) {
     sendProgress(tabId, requestId, "Trying 12ft.io proxy…");
     try {
       const proxy = await tryViaTwelveFt(originalUrl, requestId);
       if (proxy && proxy.article.text && proxy.article.text.length >= 200) {
-        const r = await askWorkerForAnswer(headline, proxy.article.text, requestId);
+        const r = await askWorkerForAnswer(headline, proxy.article.text, requestId, style);
         return {
           answer: r.answer, rawAnswer: r.rawAnswer, method: "twelveFt",
           articleText: proxy.article.text,
@@ -1012,10 +1263,10 @@ async function runFallbackChain(article, originalUrl, headline, articleDate, req
     } catch (e) { /* fall through */ }
   }
 
-  if (fb.altSource) {
+  if (isAuto("altSource")) {
     sendProgress(tabId, requestId, "Searching alternative publishers…");
     try {
-      const alt = await findAlternativeSource(headline, originalUrl, articleDate, requestId);
+      const alt = await findAlternativeSource(headline, originalUrl, articleDate, requestId, tabId, style);
       if (alt && alt.found && alt.answer) {
         return {
           answer: alt.answer, rawAnswer: alt.rawAnswer, method: "altSource",
@@ -1030,10 +1281,10 @@ async function runFallbackChain(article, originalUrl, headline, articleDate, req
     } catch (e) { /* fall through */ }
   }
 
-  if (fb.archive) {
+  if (isAuto("archive")) {
     sendProgress(tabId, requestId, "Looking up Wayback Machine snapshot…");
     try {
-      const arch = await tryArchiveSummary(originalUrl, headline, requestId);
+      const arch = await tryArchiveSummary(originalUrl, headline, requestId, tabId, style);
       if (arch && arch.found && arch.answer) {
         return {
           answer: arch.answer, rawAnswer: arch.rawAnswer, method: "archive",
@@ -1154,10 +1405,13 @@ async function pushClickbaitAnswer(tabId, requestId, linkText, originalUrl, reso
   }
 
   // Try the primary summarize ONLY if no block AND text is sufficient.
+  // Style comes from popup settings (Standard vs Punchline).
+  const style = settings.summaryStyle || DEFAULT_STYLE;
+  baseMeta.summaryStyle = style;
   let primarySummary = null;
   if (!effectiveBlock && article.text && article.text.length >= 200) {
     try {
-      const r = await askWorkerForAnswer(linkText, article.text, requestId);
+      const r = await askWorkerForAnswer(linkText, article.text, requestId, style);
       primarySummary = r;
       baseMeta.aiCallMs = r.aiCallMs;
       baseMeta.workerStatus = r.workerStatus;
@@ -1270,8 +1524,9 @@ async function pushClickbaitAnswer(tabId, requestId, linkText, originalUrl, reso
 // through the same clickbait-answer pipeline. Returns:
 //   { found: true, source, archiveUrl, snapshotDate, answer, rawAnswer, meta }
 //   { found: false, archiveUrlGuess, reason }
-async function tryArchiveSummary(originalUrl, headline, requestId) {
-  console.log(`[NoBait BG] requestId=${requestId} | Archive lookup starting for: ${originalUrl}`);
+async function tryArchiveSummary(originalUrl, headline, requestId, tabId, style) {
+  const useStyle = style || DEFAULT_STYLE;
+  sendDebugEvent(tabId, requestId, "INFO", `Archive lookup starting (style=${useStyle}) for: ${originalUrl}`);
   const startedAt = Date.now();
 
   // Wayback availability API — JSON, very fast
@@ -1286,9 +1541,12 @@ async function tryArchiveSummary(originalUrl, headline, requestId) {
     clearTimeout(availTimeout);
     const availData = await availResp.json().catch(() => ({}));
     closest = availData && availData.archived_snapshots && availData.archived_snapshots.closest;
+    sendDebugEvent(tabId, requestId, "INFO",
+      `Wayback availability check: ${closest ? `snapshot found (${closest.timestamp})` : "no snapshot"}`
+    );
   } catch (err) {
     clearTimeout(availTimeout);
-    console.warn(`[NoBait BG] requestId=${requestId} | Wayback availability check failed: ${err.message}`);
+    sendDebugEvent(tabId, requestId, "WARN", `Wayback availability check failed: ${err.message}`);
   }
 
   if (!closest || !closest.url) {
@@ -1308,14 +1566,18 @@ async function tryArchiveSummary(originalUrl, headline, requestId) {
     ? `${closest.timestamp.slice(0, 4)}-${closest.timestamp.slice(4, 6)}-${closest.timestamp.slice(6, 8)}`
     : "unknown";
 
-  console.log(
-    `[NoBait BG] requestId=${requestId} | Wayback snapshot found: ${snapshotDate} | fetching ${rawSnapshotUrl}`
+  sendDebugEvent(tabId, requestId, "INFO",
+    `Wayback snapshot found from ${snapshotDate} | fetching ${rawSnapshotUrl.slice(0, 100)}`
   );
 
   let article;
   try {
     article = await fetchArticleText(rawSnapshotUrl, requestId);
+    sendDebugEvent(tabId, requestId, "INFO",
+      `Wayback snapshot fetched: ${article.text.length} chars (status ${article.httpStatus})`
+    );
   } catch (err) {
+    sendDebugEvent(tabId, requestId, "WARN", `Wayback snapshot fetch failed: ${err.message}`);
     return {
       found: true,
       source: "wayback",
@@ -1328,6 +1590,9 @@ async function tryArchiveSummary(originalUrl, headline, requestId) {
   }
 
   if (article.block || !article.text || article.text.length < 100) {
+    sendDebugEvent(tabId, requestId, "WARN",
+      `Wayback snapshot unusable: ${article.block ? `blocked (${article.block.kind})` : `text=${article.text.length} chars`}`
+    );
     return {
       found: true,
       source: "wayback",
@@ -1343,8 +1608,12 @@ async function tryArchiveSummary(originalUrl, headline, requestId) {
 
   let answerResult;
   try {
-    answerResult = await askWorkerForAnswer(headline, article.text, requestId);
+    answerResult = await askWorkerForAnswer(headline, article.text, requestId, useStyle);
+    sendDebugEvent(tabId, requestId, "INFO",
+      `Wayback summary OK (${useStyle}): ${answerResult.answer.length} chars in ${answerResult.aiCallMs}ms`
+    );
   } catch (err) {
+    sendDebugEvent(tabId, requestId, "WARN", `Wayback AI summary failed: ${err.message}`);
     return {
       found: true,
       source: "wayback",
@@ -1380,11 +1649,14 @@ async function tryArchiveSummary(originalUrl, headline, requestId) {
 // you, and answer the topic directly using your knowledge of similar
 // coverage from around the article's date.
 // Returns { answer, rawAnswer, aiCallMs, promptChars, workerStatus }.
-async function bestGuessSummary(headline, originalUrl, resolvedUrl, articleDate, requestId) {
+async function bestGuessSummary(headline, originalUrl, resolvedUrl, articleDate, requestId, tabId) {
   let publisher = "unknown";
   try {
     publisher = new URL(resolvedUrl || originalUrl).hostname.replace(/^www\./, "");
   } catch {}
+  sendDebugEvent(tabId, requestId, "INFO",
+    `Best-guess starting | publisher=${publisher} | date=${articleDate || "n/a"} | headline="${(headline || "").slice(0, 80)}"`
+  );
 
   const dateLine = articleDate
     ? `Article publish date: ${articleDate}`
@@ -1406,7 +1678,8 @@ async function bestGuessSummary(headline, originalUrl, resolvedUrl, articleDate,
     `   relevant context you do have.\n` +
     `- If you're drawing heavily on a specific publication's coverage of the topic, end with ` +
     `   "(via <publication>)". Otherwise no citation needed.\n` +
-    `- Hard limit: ${BEST_GUESS_MAX_CHARS} characters. Plain text. No "Best guess:" prefix.\n\n` +
+    `- Soft limit ~${BEST_GUESS_MAX_CHARS} characters. Always end on a COMPLETE SENTENCE — ` +
+    `your last character must be . ! or ?. Never truncate mid-word or mid-thought. Plain text.\n\n` +
     `EXAMPLES\n` +
     `Headline: "Price of access to Trump's memecoin VIP reception plunges"\n` +
     `→ "The TRUMP token's VIP-reception event saw entry-cost requirements drop sharply ` +
@@ -1441,13 +1714,9 @@ async function bestGuessSummary(headline, originalUrl, resolvedUrl, articleDate,
     }
     const raw = String((data && data.summary) || "").trim();
     if (!raw) throw new Error("Empty answer from worker");
-    let answer = raw.replace(/\s+/g, " ").trim();
-    answer = answer.replace(/^["'`""'']+|["'`""'']+$/g, "").trim();
-    if (answer.length > BEST_GUESS_MAX_CHARS) {
-      answer = answer.slice(0, BEST_GUESS_MAX_CHARS - 1).trimEnd() + "…";
-    }
-    console.log(
-      `[NoBait BG] requestId=${requestId} | Best-guess answer in ${aiCallMs}ms (${answer.length}ch): ${answer}`
+    const answer = trimToCompleteSentence(raw, BEST_GUESS_MAX_CHARS);
+    sendDebugEvent(tabId, requestId, "INFO",
+      `Best-guess answer in ${aiCallMs}ms (${answer.length}ch): "${answer.slice(0, 100)}"`
     );
     return {
       answer,
@@ -1459,8 +1728,8 @@ async function bestGuessSummary(headline, originalUrl, resolvedUrl, articleDate,
   } catch (err) {
     clearTimeout(timeoutId);
     const aborted = err && err.name === "AbortError";
-    console.warn(
-      `[NoBait BG] requestId=${requestId} | Best-guess call failed: ${aborted ? "timeout" : err.message}`
+    sendDebugEvent(tabId, requestId, "WARN",
+      `Best-guess call failed: ${aborted ? "timeout" : err.message}`
     );
     throw err;
   }
@@ -1497,11 +1766,14 @@ function buildExpansionPrompt(headline, articleText, originalAnswer) {
 
 // Posts the expansion prompt to the Worker. Returns
 //   { answer, rawAnswer, aiCallMs, promptChars, workerStatus }.
-async function askForMoreContext(headline, articleText, originalAnswer, requestId) {
+async function askForMoreContext(headline, articleText, originalAnswer, requestId, tabId) {
   const prompt = buildExpansionPrompt(headline, articleText, originalAnswer);
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
   const startedAt = Date.now();
+  sendDebugEvent(tabId, requestId, "INFO",
+    `Expansion AI call sent | promptChars=${prompt.length} | articleChars=${articleText.length}`
+  );
   try {
     const resp = await fetch(NOBAIT_WORKER_URL, {
       method: "POST",
@@ -1519,8 +1791,8 @@ async function askForMoreContext(headline, articleText, originalAnswer, requestI
     const raw = String((data && data.summary) || "").trim();
     if (!raw) throw new Error("Empty expansion from worker");
     const answer = trimToCompleteSentence(raw, EXPANDED_MAX_CHARS);
-    console.log(
-      `[NoBait BG] requestId=${requestId} | Expansion in ${aiCallMs}ms (${answer.length}ch): ${answer}`
+    sendDebugEvent(tabId, requestId, "INFO",
+      `Expansion answer in ${aiCallMs}ms (${answer.length}ch, raw=${raw.length}): "${answer.slice(0, 100)}"`
     );
     return {
       answer,
@@ -1532,8 +1804,8 @@ async function askForMoreContext(headline, articleText, originalAnswer, requestI
   } catch (err) {
     clearTimeout(timeoutId);
     const aborted = err && err.name === "AbortError";
-    console.warn(
-      `[NoBait BG] requestId=${requestId} | Expansion failed: ${aborted ? "timeout" : err.message}`
+    sendDebugEvent(tabId, requestId, "WARN",
+      `Expansion failed: ${aborted ? "timeout" : err.message}`
     );
     throw err;
   }
@@ -1541,15 +1813,17 @@ async function askForMoreContext(headline, articleText, originalAnswer, requestI
 
 // Looks up cached article text for the URL the user originally summarized,
 // or refetches if expired/missing, then asks the worker for an expansion.
-async function expandAnswer(resolvedUrl, headline, originalAnswer, requestId) {
+async function expandAnswer(resolvedUrl, headline, originalAnswer, requestId, tabId) {
   const cached = answerCache.get(resolvedUrl);
   let articleText = cached && cached.articleText;
   let usedHeadline = headline || (cached && cached.headline) || "";
 
+  sendDebugEvent(tabId, requestId, "INFO",
+    `Expansion starting | resolvedUrl=${resolvedUrl} | cached=${!!cached} | cachedTextLen=${(cached && cached.articleText && cached.articleText.length) || 0} | originalAnswerLen=${originalAnswer.length}`
+  );
+
   if (!articleText) {
-    console.log(
-      `[NoBait BG] requestId=${requestId} | More context: cache miss, refetching ${resolvedUrl}`
-    );
+    sendDebugEvent(tabId, requestId, "INFO", `Expansion: cache miss, refetching article`);
     const article = await fetchArticleText(resolvedUrl, requestId);
     if (article.block) {
       throw new Error(`Article newly blocked (${article.block.kind}) — can't expand`);
@@ -1560,7 +1834,7 @@ async function expandAnswer(resolvedUrl, headline, originalAnswer, requestId) {
     articleText = article.text;
   }
 
-  return await askForMoreContext(usedHeadline, articleText, originalAnswer, requestId);
+  return await askForMoreContext(usedHeadline, articleText, originalAnswer, requestId, tabId);
 }
 
 // Parses a Google News RSS XML payload into { title, link, pubDate, source,
@@ -1655,9 +1929,155 @@ function rootDomainOf(urlOrHost) {
 //   { found: true, source, publisher, articleUrl, articleTitle, articleDate,
 //     answer, rawAnswer, attempts: [{source, url, reason}, ...] }
 //   { found: false, attempts: [...], error? }
-async function findAlternativeSource(headline, originalUrl, articleDate, requestId) {
-  console.log(
-    `[NoBait BG] requestId=${requestId} | Alt source search for: "${(headline || "").slice(0, 100)}"`
+// Parses DuckDuckGo HTML search result links. DDG wraps result URLs in a
+// /l/?uddg=<encoded URL> redirect, so we decode that to get the real
+// destination. Returns [{url, title}, ...] in result order.
+function parseDdgHtmlResults(html) {
+  if (!html) return [];
+  const results = [];
+  const re = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null && results.length < 25) {
+    let url = m[1];
+    const title = m[2]
+      .replace(/<[^>]+>/g, "")
+      .replace(/&amp;/g, "&")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (url.includes("/l/?uddg=")) {
+      const um = url.match(/[?&]uddg=([^&]+)/);
+      if (um) {
+        try { url = decodeURIComponent(um[1]); } catch {}
+      }
+    }
+    if (url.startsWith("//")) url = "https:" + url;
+    if (!/^https?:\/\//.test(url)) continue;
+    results.push({ url, title });
+  }
+  return results;
+}
+
+// Searches DuckDuckGo's HTML interface for `headline` and walks results
+// looking for an article from a publisher different from `originalRoot`.
+// Each candidate is fetched + block-checked + summarized. Used as a
+// second-tier fallback when Google News RSS returns no usable candidates
+// (often the case for FT/NYT-original stories where Google News clusters
+// everything to the canonical publisher URL).
+async function tryDuckDuckGoHtmlAlt(headline, originalRoot, requestId, attempts, remainingAttempts, tabId, style) {
+  const useStyle = style || DEFAULT_STYLE;
+  sendDebugEvent(tabId, requestId, "INFO",
+    `DDG fallback starting | style=${useStyle} | query="${headline.slice(0, 80)}" | originalRoot=${originalRoot || "n/a"}`
+  );
+
+  // Build a query that biases toward news (DDG doesn't have a news vertical
+  // available via HTML, but adding "news" or "site:" hints helps).
+  const query = `${headline}`;
+  const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+
+  let html;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 6000);
+    const resp = await fetch(searchUrl, {
+      signal: ctrl.signal,
+      headers: { "Accept": "text/html" },
+    });
+    clearTimeout(timer);
+    if (!resp.ok) {
+      console.warn(`[NoBait BG] requestId=${requestId} | DDG search HTTP ${resp.status}`);
+      return null;
+    }
+    html = await resp.text();
+  } catch (err) {
+    console.warn(`[NoBait BG] requestId=${requestId} | DDG search failed: ${err.message}`);
+    return null;
+  }
+
+  const results = parseDdgHtmlResults(html);
+  sendDebugEvent(tabId, requestId, "INFO", `DDG returned ${results.length} raw results`);
+
+  // Filter to different publishers, dedupe by root domain.
+  const seen = new Set([originalRoot]);
+  const candidates = [];
+  for (const r of results) {
+    const root = rootDomainOf(r.url);
+    if (!root) continue;
+    if (seen.has(root)) continue;
+    // Skip aggregators that won't have substantive article content
+    if (
+      root === "google.com" ||
+      root === "youtube.com" ||
+      root === "wikipedia.org" ||
+      root === "reddit.com" ||
+      root === "facebook.com" ||
+      root === "twitter.com" ||
+      root === "x.com" ||
+      root === "linkedin.com" ||
+      root === "duckduckgo.com"
+    ) continue;
+    seen.add(root);
+    candidates.push(r);
+    if (candidates.length >= 10) break;
+  }
+
+  sendDebugEvent(tabId, requestId, "INFO",
+    `DDG: ${candidates.length} candidate(s) after dedupe and aggregator filter`
+  );
+
+  for (const candidate of candidates) {
+    if (attempts.length >= remainingAttempts) break;
+    const sourceName = candidate.title || rootDomainOf(candidate.url);
+    sendDebugEvent(tabId, requestId, "INFO",
+      `DDG try [${attempts.length + 1}/${remainingAttempts}]: ${rootDomainOf(candidate.url)} | ${candidate.url.slice(0, 100)}`
+    );
+    try {
+      const article = await fetchArticleText(candidate.url, requestId);
+      if (article.block) {
+        const reason = `${article.block.kind} via DDG: ${article.block.publisher || article.block.reason || article.block.detectedFrom || "blocked"}`;
+        attempts.push({ source: sourceName, url: candidate.url, reason });
+        sendDebugEvent(tabId, requestId, "INFO", `→ DDG candidate blocked: ${reason}`);
+        continue;
+      }
+      if (!article.text || article.text.length < 200) {
+        attempts.push({ source: sourceName, url: candidate.url, reason: `text too short via DDG (${article.text.length} chars)` });
+        sendDebugEvent(tabId, requestId, "INFO", `→ DDG candidate text too short: ${article.text.length} chars`);
+        continue;
+      }
+      sendDebugEvent(tabId, requestId, "INFO", `→ DDG fetched OK: ${article.text.length} chars, summarizing (${useStyle})…`);
+      const aiResult = await askWorkerForAnswer(headline, article.text, requestId, useStyle);
+      sendDebugEvent(tabId, requestId, "INFO",
+        `Alt source FOUND via DDG: ${sourceName} → ${candidate.url} | answer=${aiResult.answer.length} chars`
+      );
+      return {
+        found: true,
+        source: sourceName,
+        publisher: rootDomainOf(candidate.url),
+        articleUrl: candidate.url,
+        articleTitle: article.articleTitle || candidate.title,
+        articleDate: article.articleDate,
+        answer: aiResult.answer,
+        rawAnswer: aiResult.rawAnswer,
+        searchEngine: "duckduckgo",
+      };
+    } catch (err) {
+      attempts.push({ source: sourceName, url: candidate.url, reason: `via DDG: ${err.message}` });
+      sendDebugEvent(tabId, requestId, "WARN", `→ DDG candidate error: ${err.message}`);
+    }
+  }
+
+  return null;
+}
+
+async function findAlternativeSource(headline, originalUrl, articleDate, requestId, tabId, style) {
+  const useStyle = style || DEFAULT_STYLE;
+  sendDebugEvent(tabId, requestId,
+    "INFO",
+    `Alt source search starting | style=${useStyle} | query="${(headline || "").slice(0, 100)}" | originalUrl=${originalUrl} | date=${articleDate || "n/a"}`
   );
 
   if (!headline || headline.trim().length < 5) {
@@ -1678,39 +2098,69 @@ async function findAlternativeSource(headline, originalUrl, articleDate, request
     const timer = setTimeout(() => ctrl.abort(), ALT_SOURCE_SEARCH_TIMEOUT_MS);
     const resp = await fetch(searchUrl, { signal: ctrl.signal });
     clearTimeout(timer);
-    if (!resp.ok) throw new Error(`Google News search HTTP ${resp.status}`);
-    xml = await resp.text();
+    if (!resp.ok) {
+      sendDebugEvent(tabId, requestId, "WARN", `Google News search HTTP ${resp.status} — will fall through to DDG`);
+    } else {
+      xml = await resp.text();
+    }
   } catch (err) {
-    throw new Error(`Search failed: ${err.message}`);
+    sendDebugEvent(tabId, requestId, "WARN", `Google News search failed: ${err.message} — will fall through to DDG`);
   }
 
-  const items = parseRssItems(xml);
-  console.log(`[NoBait BG] requestId=${requestId} | Alt source: ${items.length} candidates from Google News RSS`);
-  if (items.length === 0) {
-    return { found: false, attempts: [], error: "No candidate articles in search results" };
-  }
+  const items = xml ? parseRssItems(xml) : [];
+  sendDebugEvent(tabId, requestId, "INFO",
+    `Google News RSS returned ${items.length} raw items`
+  );
 
-  // 2. Dedupe by source name and pre-filter by source URL
-  const seenSources = new Set();
+  // 2. Dedupe by source name AND pre-filter by root domain.
+  // Checking rootDomainOf(item.sourceUrl) before resolution saves every
+  // attempt slot on same-publisher affiliates. Google News often returns
+  // community blogs or sub-sites of the original publisher (FanGraphs
+  // has AZ Snake Pit, That Balls Outta Here, etc. all resolving to
+  // fangraphs.com). Reject those cheaply here instead of burning an
+  // attempt on a slow resolve + fetch that will fail anyway.
+  const seenSources = new Set([originalRoot]); // seed with original root
   const candidates = [];
   for (const item of items) {
     const sourceKey = (item.source || item.sourceUrl || item.link).toLowerCase();
     if (seenSources.has(sourceKey)) continue;
     seenSources.add(sourceKey);
+
+    // Domain pre-filter: if the RSS <source url=""> resolves to the same
+    // root domain as the original article, skip without counting as an attempt.
+    if (item.sourceUrl) {
+      const sourceRoot = rootDomainOf(item.sourceUrl);
+      if (sourceRoot && originalRoot && sourceRoot === originalRoot) {
+        sendDebugEvent(tabId, requestId, "INFO",
+          `Alt source pre-filter skip: "${item.source}" (sourceUrl=${item.sourceUrl}, root=${sourceRoot} matches original)`
+        );
+        continue;
+      }
+    }
+
     candidates.push(item);
-    if (candidates.length >= 12) break; // gather extras for fallbacks
+    if (candidates.length >= 15) break; // gather extras in case many fail
   }
 
-  // 3. Try each candidate up to the cap
+  sendDebugEvent(tabId, requestId, "INFO",
+    `Alt source: ${candidates.length} candidate(s) survive pre-filter (out of ${items.length} RSS results)`
+  );
+
+  // 3. Try each candidate up to the cap. Even if Google News yielded nothing
+  // useful here, we still continue to the DDG fallback below.
   const attempts = [];
   for (const candidate of candidates) {
     if (attempts.length >= ALT_SOURCE_MAX_ATTEMPTS) break;
     const sourceName = candidate.source || candidate.sourceUrl || "(unknown source)";
+    sendDebugEvent(tabId, requestId, "INFO",
+      `Alt source try [${attempts.length + 1}/${ALT_SOURCE_MAX_ATTEMPTS}]: ${sourceName} | sourceUrl=${candidate.sourceUrl || "n/a"} | gnLink=${candidate.link.slice(0, 80)}…`
+    );
 
     // Cheap skip: source URL says it's the same publisher.
     const sourceRoot = rootDomainOf(candidate.sourceUrl || candidate.link);
     if (originalRoot && sourceRoot && sourceRoot === originalRoot) {
       attempts.push({ source: sourceName, url: candidate.sourceUrl || candidate.link, reason: "same publisher as original" });
+      sendDebugEvent(tabId, requestId, "INFO", `→ skipped: same publisher (${sourceRoot})`);
       continue;
     }
 
@@ -1722,36 +2172,45 @@ async function findAlternativeSource(headline, originalUrl, articleDate, request
       const resolvedRoot = rootDomainOf(resolved);
       if (originalRoot && resolvedRoot && resolvedRoot === originalRoot) {
         attempts.push({ source: sourceName, url: resolved, reason: "same publisher as original (post-resolve)" });
+        sendDebugEvent(tabId, requestId, "INFO", `→ skipped post-resolve: redirected back to original publisher (${resolved.slice(0, 100)})`);
         continue;
       }
       if (resolved.includes("news.google.com")) {
         attempts.push({ source: sourceName, url: resolved, reason: "couldn't resolve Google News redirect" });
+        sendDebugEvent(tabId, requestId, "WARN", `→ skipped: Google News redirect didn't fire`);
         continue;
       }
+
+      sendDebugEvent(tabId, requestId, "INFO", `→ resolved to ${resolved}`);
 
       // Fetch + run block detection.
       const article = await fetchArticleText(resolved, requestId);
       if (article.block) {
         const reason = `${article.block.kind}: ${article.block.publisher || article.block.reason || article.block.detectedFrom || "blocked"}`;
         attempts.push({ source: sourceName, url: resolved, reason });
+        sendDebugEvent(tabId, requestId, "INFO", `→ blocked: ${reason}`);
         continue;
       }
       if (!article.text || article.text.length < 200) {
         attempts.push({ source: sourceName, url: resolved, reason: `text too short (${article.text.length} chars)` });
+        sendDebugEvent(tabId, requestId, "INFO", `→ text too short: ${article.text.length} chars`);
         continue;
       }
+
+      sendDebugEvent(tabId, requestId, "INFO", `→ fetched OK: ${article.text.length} chars, asking AI for summary (${useStyle})…`);
 
       // Summarize with the same prompt the main pipeline uses.
       let aiResult;
       try {
-        aiResult = await askWorkerForAnswer(headline, article.text, requestId);
+        aiResult = await askWorkerForAnswer(headline, article.text, requestId, useStyle);
       } catch (err) {
         attempts.push({ source: sourceName, url: resolved, reason: `summary failed: ${err.message}` });
+        sendDebugEvent(tabId, requestId, "WARN", `→ AI summary failed: ${err.message}`);
         continue;
       }
 
-      console.log(
-        `[NoBait BG] requestId=${requestId} | Alt source FOUND: ${sourceName} (${resolvedRoot}) → ${resolved}`
+      sendDebugEvent(tabId, requestId, "INFO",
+        `Alt source FOUND via Google News: ${sourceName} (${resolvedRoot}) → ${resolved} | answer=${aiResult.answer.length} chars`
       );
       return {
         found: true,
@@ -1769,8 +2228,29 @@ async function findAlternativeSource(headline, originalUrl, articleDate, request
     }
   }
 
+  // Google News exhausted. Try DuckDuckGo HTML as a second tier — DDG
+  // doesn't cluster syndicated stories the way Google News does, so for
+  // FT/NYT-original articles where Google News routes everything back to
+  // the original publisher, DDG often finds genuine third-party coverage.
+  const remainingAttempts = ALT_SOURCE_MAX_ATTEMPTS;
   console.log(
-    `[NoBait BG] requestId=${requestId} | Alt source: all ${attempts.length} attempts failed/blocked`
+    `[NoBait BG] requestId=${requestId} | Google News yielded no usable alt; trying DuckDuckGo HTML (${attempts.length} attempts so far)`
+  );
+  const ddgResult = await tryDuckDuckGoHtmlAlt(
+    headline,
+    originalRoot,
+    requestId,
+    attempts,
+    attempts.length + remainingAttempts,
+    tabId,
+    useStyle
+  );
+  if (ddgResult && ddgResult.found) {
+    return { ...ddgResult, attempts };
+  }
+
+  console.log(
+    `[NoBait BG] requestId=${requestId} | Alt source: all ${attempts.length} attempts failed/blocked (Google News + DuckDuckGo)`
   );
   return { found: false, attempts };
 }
@@ -1829,7 +2309,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const requestId = message.requestId || "unknown";
     const url = message.url;
     const headline = typeof message.headline === "string" ? message.headline : "";
-    tryArchiveSummary(url, headline, requestId)
+    getSettings().then((settings) => tryArchiveSummary(url, headline, requestId, tabId, settings.summaryStyle))
       .then((result) => {
         if (typeof tabId === "number") {
           chrome.tabs
@@ -1859,7 +2339,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       message.originalUrl || "",
       message.resolvedUrl || "",
       message.articleDate || null,
-      requestId
+      requestId,
+      tabId
     )
       .then((result) => {
         if (typeof tabId === "number") {
@@ -1887,14 +2368,63 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  if (message.type === "try-fallback") {
+    // Unified handler for manually invoking jsonLd / metaDesc / cookies /
+    // amp / twelveFt fallbacks (the ones that already exist but were only
+    // run automatically). Re-uses the cached article text/HTML when present
+    // so jsonLd and metaDesc are essentially instant.
+    const requestId = message.requestId || "unknown";
+    const method = message.method;
+    const headline = message.headline || "";
+    const resolvedUrl = message.resolvedUrl || "";
+    const originalUrl = message.originalUrl || resolvedUrl;
+    runManualFallback(method, { headline, originalUrl, resolvedUrl, requestId, tabId })
+      .then((result) => {
+        if (typeof tabId === "number") {
+          chrome.tabs
+            .sendMessage(tabId, {
+              type: "fallback-result",
+              requestId,
+              method,
+              ...result,
+            })
+            .catch(() => {});
+        }
+      })
+      .catch((err) => {
+        if (typeof tabId === "number") {
+          chrome.tabs
+            .sendMessage(tabId, {
+              type: "fallback-result",
+              requestId,
+              method,
+              found: false,
+              error: err.message,
+            })
+            .catch(() => {});
+        }
+      });
+    return false;
+  }
+
   if (message.type === "try-alt-source") {
     const requestId = message.requestId || "unknown";
-    findAlternativeSource(
-      message.headline || "",
+    // Use headline if present, else fall back to articleTitle (extracted
+    // from the fetched HTML). For Google News icon-only links the anchor
+    // textContent is empty, but og:title from the resolved page gives us
+    // a real query.
+    const queryHeadline =
+      (message.headline && message.headline.trim()) ||
+      (message.articleTitle && message.articleTitle.trim()) ||
+      "";
+    getSettings().then((settings) => findAlternativeSource(
+      queryHeadline,
       message.originalUrl || message.resolvedUrl || "",
       message.articleDate || null,
-      requestId
-    )
+      requestId,
+      tabId,
+      settings.summaryStyle
+    ))
       .then((result) => {
         if (typeof tabId === "number") {
           chrome.tabs
@@ -1924,7 +2454,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       message.resolvedUrl || "",
       message.headline || "",
       message.originalAnswer || "",
-      requestId
+      requestId,
+      tabId
     )
       .then((result) => {
         if (typeof tabId === "number") {

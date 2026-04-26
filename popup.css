@@ -13,7 +13,7 @@ html, body {
 }
 
 body {
-  width: 380px;
+  width: 440px;
   min-height: 200px;
 }
 
@@ -95,6 +95,82 @@ a:hover { color: #2C5858; }
   vertical-align: -2px;
 }
 
+/* ── Summary-style rows (radio group at top) ──────────────────── */
+
+.style-list {
+  list-style: none;
+  margin: 0 0 4px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.style-row {
+  position: relative;
+  border: 1px solid #E0E2E0;
+  border-radius: 6px;
+  background: #F4F5F4;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.style-row:hover {
+  border-color: #3D7575;
+  background: #EAF1F1;
+}
+
+.style-row.is-selected {
+  border-color: #3D7575;
+  background: #EAF1F1;
+}
+
+.style-main {
+  display: grid;
+  grid-template-columns: 18px 1fr 22px;
+  gap: 10px;
+  align-items: start;
+  padding: 9px 10px;
+}
+
+.radio-cell {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  margin-top: 2px;
+}
+
+.radio-cell input[type="radio"] {
+  margin: 0;
+  accent-color: #3D7575;
+  cursor: pointer;
+  width: 14px;
+  height: 14px;
+}
+
+.style-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.style-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #141414;
+  line-height: 1.2;
+}
+
+.style-row.is-selected .style-label {
+  color: #2C5858;
+}
+
+.style-desc {
+  font-size: 11.5px;
+  color: #5E5E5E;
+  line-height: 1.4;
+}
+
 /* ── Fallback rows ─────────────────────────────────────────────── */
 
 .fallback-list {
@@ -119,21 +195,51 @@ a:hover { color: #2C5858; }
   background: #EAF1F1;
 }
 
-.fallback-row label {
+/* Two-column layout: [Show toggle] [info text grows] [Auto toggle] [info button] */
+.fallback-main {
   display: grid;
-  grid-template-columns: 18px 1fr 22px;
+  grid-template-columns: 52px 1fr 52px 22px;
   gap: 10px;
   align-items: start;
   padding: 9px 10px;
+}
+
+.checkbox-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
   cursor: pointer;
+  user-select: none;
+  margin-top: 1px;
+}
+
+.checkbox-cell-label {
+  font-size: 10px;
+  color: #5E5E5E;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.fallback-row.is-enabled .auto-cell .checkbox-cell-label {
+  color: #3D7575;
+}
+
+.auto-cell input:disabled + .checkbox-cell-label {
+  opacity: 0.4;
 }
 
 .fallback-row input[type="checkbox"] {
-  margin: 2px 0 0;
+  margin: 0;
   accent-color: #3D7575;
   cursor: pointer;
   width: 14px;
   height: 14px;
+}
+
+.fallback-row input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
 }
 
 .fallback-info {

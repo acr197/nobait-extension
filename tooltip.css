@@ -3,7 +3,7 @@
 #nobait-tooltip {
   position: fixed;
   z-index: 2147483647;
-  max-width: 480px;
+  max-width: 620px;
   min-width: 200px;
   padding: 10px 14px;
   background: #1a1a2e;
@@ -123,7 +123,8 @@
 }
 
 #nobait-tooltip-toggle-debug {
-  margin-left: auto; /* push to right edge of the row */
+  /* sits inline with the other action buttons — no margin-left auto so
+     it doesn't wrap to its own line on narrower tooltips. */
   padding: 3px 9px;
   background: transparent;
   color: #6a6a8c;
@@ -146,12 +147,6 @@
   background: #1a1a2e;
   border-color: #5a5a7c;
   color: #ccccee;
-}
-
-/* Block-action row variant: button is part of the same flex row as the
-   alternatives buttons. Push to far right to match the requested order. */
-#nobait-tooltip-block-actions #nobait-tooltip-toggle-debug {
-  margin-left: auto;
 }
 
 /* ── Hidden extras (URL + Copy buttons + debug dump) ─────────── */
@@ -360,7 +355,7 @@
 }
 
 #nobait-tooltip-block-actions button {
-  padding: 5px 10px;
+  padding: 5px 8px;
   background: #2a2a4a;
   color: #ccccee;
   border: 1px solid #4a4a6c;
@@ -370,6 +365,7 @@
   line-height: 1;
   cursor: pointer;
   transition: background 0.1s ease, border-color 0.1s ease, color 0.1s ease;
+  white-space: nowrap;
 }
 
 #nobait-tooltip-block-actions button:hover:not(:disabled) {
@@ -388,6 +384,23 @@
   background: #1a3a3a;
   border-color: #3D7575;
   color: #aee0e0;
+}
+
+/* Auto-state button: enabled in settings AND set to auto-run as part
+   of the long-click chain. Not clickable — the green tint + lightning
+   bolt + hover title tell the user it's running automatically. */
+#nobait-tooltip-block-actions button.nobait-action-auto,
+#nobait-tooltip-block-actions button.nobait-action-auto:disabled {
+  background: #1d3a2e;
+  border-color: #3D7575;
+  color: #8fdab1;
+  cursor: help; /* indicates "info on hover", not clickable */
+  opacity: 1;   /* override the default :disabled opacity */
+}
+
+#nobait-tooltip-block-actions button.nobait-action-auto:hover {
+  background: #25503d;
+  border-color: #5fa88a;
 }
 
 #nobait-tooltip-block-result:empty {

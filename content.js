@@ -20,6 +20,9 @@
   let activeRequestId = null;
   let requestCounter = 0;
   let debugLog = [];
+  // Cached fallback settings — populated async on init and updated when the
+  // popup writes new values. Used by buildActionRowHtml() to render buttons.
+  let cachedSettings = null;
   // Set to true the moment a popup is shown so the next click is swallowed.
   // Prevents the mouseup-triggered click from navigating away after a hold.
   let suppressNextClick = false;
@@ -122,23 +125,15 @@
       : "";
     const urlLabel = same ? "Final URL (no redirect)" : `Resolved URL${methodHint}`;
 
-    // Answer-state action row carries the same fallback buttons as the
-    // block UI (minus Best guess, since we already have a real answer).
-    // They're available so the user can ask for an alternative perspective
-    // even when the primary summary worked.
+    // Answer-state action row: settings-driven fallback buttons + always-shown
+    // actions (More context, Google, DDG, Debug). Built dynamically from
+    // cached popup settings so users control which buttons appear.
     tooltipEl.innerHTML =
       `<div id="nobait-tooltip-answer-area">` +
         `<div id="nobait-tooltip-answer-label">The answer</div>` +
         `<div id="nobait-tooltip-answer" class="nobait-answer-thinking">Reading the article</div>` +
         `<div id="nobait-tooltip-source-note" class="nobait-extras-hidden"></div>` +
-        `<div id="nobait-tooltip-block-actions" class="nobait-actions-answer-state">` +
-          `<button id="nobait-tooltip-more-context" type="button" disabled title="Available after a successful AI summary — one click per long-press">More context</button>` +
-          `<button data-action="alt-source" type="button">Alt source</button>` +
-          `<button data-action="archive" type="button">Try archive</button>` +
-          `<button data-action="google" type="button">Google</button>` +
-          `<button data-action="ddg" type="button">DuckDuckGo</button>` +
-          `<button id="nobait-tooltip-toggle-debug" type="button" title="Show resolved URL + copy buttons + debug info">Debug info</button>` +
-        `</div>` +
+        buildActionRowHtml("answer") +
         `<div id="nobait-tooltip-block-result"></div>` +
       `</div>` +
       `<div id="nobait-tooltip-extras" class="nobait-extras-hidden">` +
@@ -426,14 +421,7 @@
       `<div id="nobait-tooltip-answer-label" class="nobait-block-label">${escapeHtml(headlineLabel)}</div>` +
       `<div id="nobait-tooltip-block-status">${escapeHtml(publisher)}</div>` +
       `<div id="nobait-tooltip-block-message">${escapeHtml(description)}</div>` +
-      `<div id="nobait-tooltip-block-actions">` +
-        `<button data-action="best-guess" type="button">Best guess</button>` +
-        `<button data-action="alt-source" type="button">Alt source</button>` +
-        `<button data-action="archive" type="button">Try archive</button>` +
-        `<button data-action="google" type="button">Google</button>` +
-        `<button data-action="ddg" type="button">DuckDuckGo</button>` +
-        `<button id="nobait-tooltip-toggle-debug" type="button" title="Show resolved URL + copy buttons + debug info">Debug info</button>` +
-      `</div>` +
+      buildActionRowHtml("block") +
       `<div id="nobait-tooltip-block-result"></div>`;
 
     wireBlockActionButtons(blockMessage);
@@ -441,6 +429,69 @@
 
     const rect = tooltipEl.getBoundingClientRect();
     positionTooltip(rect.left, rect.top - TOOLTIP_OFFSET_Y);
+  }
+
+  // Settings-driven button definitions. `key` matches the settings flag.
+  // `auto` and `enabled` are read from cachedSettings at render time.
+  // Buttons appear in this order in the action row.
+  const FALLBACK_BUTTON_DEFS = [
+    { key: "jsonLd",    action: "jsonLd",    label: "Embed body" },
+    { key: "metaDesc",  action: "metaDesc",  label: "Page summary" },
+    { key: "cookies",   action: "cookies",   label: "Use cookies" },
+    { key: "amp",       action: "amp",       label: "AMP" },
+    { key: "twelveFt",  action: "twelveFt",  label: "12ft.io" },
+    { key: "altSource", action: "alt-source", label: "Alt source" },
+    { key: "archive",   action: "archive",   label: "Try archive" },
+  ];
+
+  // Builds the action-row HTML based on cached settings. `state` is
+  // "answer" (post-summary, leads with More context) or "block" (paywall etc.,
+  // leads with Best guess). Settings-driven buttons are shown if enabled;
+  // ones with auto=true render disabled with a green-tint and hover tooltip.
+  // Always-on tail: Google, DuckDuckGo, Debug info.
+  function buildActionRowHtml(state) {
+    const settings = cachedSettings || { fallbacks: {} };
+    const fb = settings.fallbacks || {};
+
+    let html = `<div id="nobait-tooltip-block-actions"`;
+    if (state === "answer") html += ` class="nobait-actions-answer-state"`;
+    html += `>`;
+
+    if (state === "answer") {
+      html +=
+        `<button id="nobait-tooltip-more-context" type="button" disabled ` +
+        `title="Available after a successful AI summary — one click per long-press">More context</button>`;
+    } else if (state === "block") {
+      html +=
+        `<button data-action="best-guess" type="button" ` +
+        `title="Ask the model for topic context based on training data (no source content)">Best guess</button>`;
+    }
+
+    for (const def of FALLBACK_BUTTON_DEFS) {
+      const entry = fb[def.key];
+      if (!entry || !entry.enabled) continue;
+      const isAuto = !!entry.auto;
+      if (isAuto) {
+        html +=
+          `<button data-action="${def.action}" type="button" disabled ` +
+          `class="nobait-action-auto" ` +
+          `title="Runs automatically as part of the long-click chain (settings)">` +
+          `${escapeHtml(def.label)} ⚡</button>`;
+      } else {
+        html +=
+          `<button data-action="${def.action}" type="button" ` +
+          `title="Click to manually run this fallback">${escapeHtml(def.label)}</button>`;
+      }
+    }
+
+    html +=
+      `<button data-action="google" type="button" title="Open a Google search for this headline">Google</button>` +
+      `<button data-action="ddg" type="button" title="Open a DuckDuckGo search for this headline">DuckDuckGo</button>` +
+      `<button id="nobait-tooltip-toggle-debug" type="button" ` +
+      `title="Show resolved URL + copy buttons + debug info">Debug info</button>`;
+
+    html += `</div>`;
+    return html;
   }
 
   // Hooks up click handlers for the action buttons inside the block UI.
@@ -460,16 +511,27 @@
         e.preventDefault();
         e.stopPropagation();
         const action = btn.dataset.action;
-        // Headline preference: caller-provided > og:title from fetched HTML > URL.
-        // Critical because Google News links are icon-only — anchor.textContent
-        // is empty, so without the title fallback we'd search Google for a URL.
+        // Read activeMeta DYNAMICALLY at click time, not wire time. In the
+        // answer-state path, setTooltipResult wires these buttons before
+        // clickbait-answer arrives — so articleTitle isn't on activeMeta
+        // yet when the buttons are wired. By the time the user clicks,
+        // articleTitle has been merged in. Capture-time read would miss it.
+        const liveMeta = (activeMeta && activeMeta.requestId === blockMessage.requestId) ? activeMeta : {};
         const headline =
           (blockMessage.headline && blockMessage.headline.trim()) ||
+          (liveMeta.headline && liveMeta.headline.trim()) ||
           (blockMessage.articleTitle && blockMessage.articleTitle.trim()) ||
+          (liveMeta.articleTitle && liveMeta.articleTitle.trim()) ||
           "";
-        const originalUrl = blockMessage.originalUrl || blockMessage.resolvedUrl;
-        const resolvedUrl = blockMessage.resolvedUrl;
-        const articleDate = blockMessage.articleDate || null;
+        const originalUrl = blockMessage.originalUrl || liveMeta.originalUrl || blockMessage.resolvedUrl;
+        const resolvedUrl = blockMessage.resolvedUrl || liveMeta.resolvedUrl;
+        const articleDate = blockMessage.articleDate || liveMeta.articleDate || null;
+        const articleTitle = blockMessage.articleTitle || liveMeta.articleTitle || null;
+        log(
+          "INFO",
+          `Block action "${action}" fired | headline="${headline.slice(0, 80)}" (${headline.length} chars) | ` +
+            `articleDate=${articleDate || "n/a"} | articleTitle="${(articleTitle || "n/a").slice(0, 80)}"`
+        );
 
         if (action === "google" || action === "ddg") {
           const engine = action === "ddg" ? "duckduckgo" : "google";
@@ -518,11 +580,38 @@
             type: "try-alt-source",
             requestId: blockMessage.requestId,
             headline,
+            articleTitle,
             originalUrl,
             resolvedUrl,
             articleDate,
           });
-          log("INFO", `Block action: try-alt-source for "${headline.slice(0, 80)}"`);
+          log("INFO", `Block action: try-alt-source | query="${headline.slice(0, 80)}" | originalUrl=${originalUrl} | date=${articleDate || "n/a"}`);
+          return;
+        }
+
+        // Manual fallback actions (settings-driven buttons): jsonLd, metaDesc,
+        // cookies, amp, twelveFt. All routed through the unified try-fallback
+        // handler in background.js.
+        const MANUAL_FALLBACK_ACTIONS = new Set(["jsonLd", "metaDesc", "cookies", "amp", "twelveFt"]);
+        if (MANUAL_FALLBACK_ACTIONS.has(action)) {
+          const labelMap = {
+            jsonLd:   "embedded body",
+            metaDesc: "page summary",
+            cookies:  "cookied refetch",
+            amp:      "AMP version",
+            twelveFt: "12ft.io proxy",
+          };
+          setBlockResult(`Trying ${labelMap[action]}…`, "loading");
+          disableBlockButton(btn, "Trying…");
+          chrome.runtime.sendMessage({
+            type: "try-fallback",
+            method: action,
+            requestId: blockMessage.requestId,
+            headline,
+            originalUrl,
+            resolvedUrl,
+          });
+          log("INFO", `Manual fallback: ${action} | resolvedUrl=${resolvedUrl}`);
           return;
         }
       });
@@ -570,7 +659,7 @@
     const region = tooltipEl.querySelector("#nobait-tooltip-block-result");
     if (!region) return;
     region.className = `nobait-block-result-${kind || "info"}`;
-    if (kind === "archive" || kind === "best-guess" || kind === "raw-html") {
+    if (kind === "archive" || kind === "best-guess" || kind === "alt-source" || kind === "fallback" || kind === "raw-html") {
       region.innerHTML = htmlOrText; // pre-built HTML — caller is responsible for escaping
     } else {
       region.textContent = htmlOrText;
@@ -771,16 +860,41 @@
     const meta = activeMeta && activeMeta.requestId === info.requestId ? activeMeta : {};
     const fmt = (v) => (v === undefined || v === null ? "n/a" : String(v));
 
+    // Compose a "best known" view of the article identity from all available
+    // sources (anchor scrape, og:title from fetch, AI meta, etc.).
+    const bestHeadline =
+      (meta.headline && meta.headline.trim()) ||
+      (meta.detectedHeadline && meta.detectedHeadline.trim()) ||
+      (meta.articleTitle && meta.articleTitle.trim()) ||
+      articleTitle ||
+      "(none captured)";
+    const bestPublisher = (function () {
+      try {
+        const u = new URL(info.resolvedUrl || info.originalUrl || "");
+        return u.hostname.replace(/^www\./, "");
+      } catch { return publisher; }
+    })();
+    const bestDate = meta.articleDate || "(unknown)";
+
     const lines = [
       `=== NoBait v2 debug dump ===`,
+      ``,
+      `╔══ Article identity ══════════════════════════════════════════╗`,
+      ` headline          : ${bestHeadline}`,
+      ` publisher         : ${bestPublisher}`,
+      ` date              : ${bestDate}`,
+      ` finalUrl          : ${info.resolvedUrl || "(unresolved)"}`,
+      ` originalUrl       : ${info.originalUrl || "(unknown)"}`,
+      `╚══════════════════════════════════════════════════════════════╝`,
+      ``,
       `extension         : NoBait v2 ${extensionVersion}`,
       `requestId         : ${info.requestId || "unknown"}`,
       `timestamp         : ${new Date().toISOString()}`,
       `pageUrl           : ${window.location.href}`,
       ``,
-      `--- Anchor ---`,
-      `articleTitle      : ${articleTitle}`,
-      `publisher         : ${publisher}`,
+      `--- Anchor scrape ---`,
+      `anchorText        : ${articleTitle}`,
+      `anchorPublisher   : ${publisher}`,
       `detectedHeadline  : ${fmt(meta.detectedHeadline)} (${fmt(meta.headlineLength)} chars)`,
       ``,
       `--- URL resolution ---`,
@@ -1161,7 +1275,9 @@
       t !== "best-guess-result" &&
       t !== "alt-source-result" &&
       t !== "more-context-result" &&
-      t !== "progress-update"
+      t !== "fallback-result" &&
+      t !== "progress-update" &&
+      t !== "debug-event"
     ) return;
 
     if (message.requestId !== activeRequestId) {
@@ -1179,8 +1295,15 @@
       const answerEl = tooltipEl.querySelector("#nobait-tooltip-answer");
       if (answerEl && answerEl.classList.contains("nobait-answer-thinking")) {
         answerEl.textContent = message.status || "Working";
-        log("INFO", `Progress: ${message.status}`);
       }
+      log("INFO", `Progress: ${message.status}`);
+      return;
+    }
+
+    if (t === "debug-event") {
+      // Background-side granular event, just appended to in-popup debug log
+      // for visibility in Copy Debug. Doesn't change anything visible.
+      log(message.level || "INFO", `[BG] ${message.message}`);
       return;
     }
 
@@ -1308,6 +1431,42 @@
       return;
     }
 
+    if (t === "fallback-result") {
+      // Manual fallback (jsonLd/metaDesc/cookies/amp/twelveFt) result.
+      log(
+        "INFO",
+        `Manual fallback "${message.method}" result | found=${message.found} | ` +
+          `answerLen=${(message.answer || "").length} | error="${message.error || ""}"`
+      );
+      reEnableBlockButton(message.method);
+      const labelMap = {
+        jsonLd:   "embedded article body",
+        metaDesc: "page metadata",
+        cookies:  "cookied refetch",
+        amp:      "AMP version",
+        twelveFt: "12ft.io proxy",
+      };
+      const sourceLabel = labelMap[message.method] || message.method;
+      if (message.found && message.answer) {
+        let html =
+          `<div class="nobait-block-result-label">Summary from ${escapeHtml(sourceLabel)}</div>` +
+          `<div class="nobait-block-result-answer">${escapeHtml(message.answer)}</div>`;
+        if (message.source && message.source.url) {
+          html += `<div class="nobait-block-result-source">` +
+            `<a href="${escapeHtml(message.source.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(message.source.name || "Open source")}</a>` +
+            `</div>`;
+        }
+        setBlockResult(html, "fallback");
+      } else {
+        setBlockResult(
+          `<div class="nobait-block-result-label nobait-block-result-warn">${escapeHtml(sourceLabel)} unavailable</div>` +
+          `<div class="nobait-block-result-detail">${escapeHtml(message.error || "No content returned.")}</div>`,
+          "fallback"
+        );
+      }
+      return;
+    }
+
     if (t === "more-context-result") {
       log(
         "INFO",
@@ -1326,6 +1485,27 @@
   document.addEventListener("keydown", onKeyDown, true);
   // Capture-phase click suppressor — must run before anchor's own click handler
   document.addEventListener("click", onClickCapture, true);
+
+  // ── Settings cache + sync ──────────────────────────────────────────
+  // Settings drive which fallback buttons appear in the tooltip and which
+  // are styled as auto-running. Cache them on init; refresh when the
+  // popup writes new values via chrome.storage.
+  (async () => {
+    try {
+      const stored = await chrome.storage.local.get("nobaitSettings");
+      cachedSettings = stored.nobaitSettings || null;
+    } catch (e) {
+      log("WARN", `Settings load failed: ${e.message}`);
+    }
+  })();
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === "local" && changes.nobaitSettings) {
+        cachedSettings = changes.nobaitSettings.newValue;
+        log("INFO", "Settings updated from popup");
+      }
+    });
+  } catch (e) { /* storage not available */ }
 
   log("INFO", `NoBait v2 content script loaded on ${window.location.href}`);
 })();
