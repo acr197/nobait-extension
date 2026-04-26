@@ -63,6 +63,183 @@
   font-style: italic;
 }
 
+#nobait-tooltip-answer.nobait-answer-expanding {
+  opacity: 0.6;
+}
+
+#nobait-tooltip-answer.nobait-answer-expanded {
+  /* Slightly tighter line-height for longer text */
+  line-height: 1.35;
+}
+
+#nobait-tooltip-more-context {
+  display: inline-block;
+  padding: 3px 9px;
+  margin: 0 0 8px 0;
+  background: transparent;
+  color: #8888aa;
+  border: 1px solid #3a3a5c;
+  border-radius: 4px;
+  font-size: 10.5px;
+  font-family: inherit;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: background 0.1s ease, border-color 0.1s ease, color 0.1s ease, opacity 0.1s ease;
+}
+
+#nobait-tooltip-more-context:hover:not(:disabled) {
+  background: #2a2a4a;
+  border-color: #5a5a7c;
+  color: #ccccee;
+}
+
+#nobait-tooltip-more-context:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+#nobait-tooltip-more-context.nobait-action-pending {
+  cursor: wait;
+  opacity: 0.7;
+  color: #aaaacc;
+}
+
+#nobait-tooltip-more-context.nobait-action-pending::after {
+  content: "";
+  animation: nobait-dots 1.2s steps(4, end) infinite;
+}
+
+/* ── Action row (More context + Debug info, in answer state) ───── */
+
+#nobait-tooltip-action-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 0 0;
+}
+
+#nobait-tooltip-action-row #nobait-tooltip-more-context {
+  margin-bottom: 0;
+}
+
+#nobait-tooltip-toggle-debug {
+  margin-left: auto; /* push to right edge of the row */
+  padding: 3px 9px;
+  background: transparent;
+  color: #6a6a8c;
+  border: 1px solid #2a2a4c;
+  border-radius: 4px;
+  font-size: 10.5px;
+  font-family: inherit;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: background 0.1s ease, border-color 0.1s ease, color 0.1s ease;
+}
+
+#nobait-tooltip-toggle-debug:hover {
+  background: #1a1a2e;
+  border-color: #4a4a6c;
+  color: #aaaacc;
+}
+
+#nobait-tooltip-toggle-debug.nobait-debug-open {
+  background: #1a1a2e;
+  border-color: #5a5a7c;
+  color: #ccccee;
+}
+
+/* Block-action row variant: button is part of the same flex row as the
+   alternatives buttons. Push to far right to match the requested order. */
+#nobait-tooltip-block-actions #nobait-tooltip-toggle-debug {
+  margin-left: auto;
+}
+
+/* ── Hidden extras (URL + Copy buttons + debug dump) ─────────── */
+
+.nobait-extras-hidden {
+  display: none !important;
+}
+
+/* ── Source attribution note (between answer + action row) ───── */
+
+#nobait-tooltip-source-note {
+  margin: 0 0 8px 0;
+  padding: 6px 8px;
+  background: #15152a;
+  border: 1px solid #2a2a4c;
+  border-left: 3px solid #3D7575;
+  border-radius: 4px;
+  font-size: 11.5px;
+  color: #aac3c3;
+  line-height: 1.4;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+
+#nobait-tooltip-source-note em {
+  font-style: italic;
+}
+
+#nobait-tooltip-source-note strong {
+  color: #d8e8e8;
+  font-weight: 600;
+}
+
+#nobait-tooltip-source-note a {
+  color: #7ecfff;
+  text-decoration: underline;
+}
+
+#nobait-tooltip-source-note a:hover {
+  color: #aee0ff;
+}
+
+/* ── Answer-state action row (extends block-actions row) ──────── */
+
+#nobait-tooltip-block-actions.nobait-actions-answer-state {
+  margin-top: 4px;
+}
+
+/* In answer state, More context button matches action button styling (sits in
+   the same flex row instead of its own dedicated bottom margin). */
+.nobait-actions-answer-state #nobait-tooltip-more-context {
+  margin-bottom: 0;
+}
+
+/* ── Alt-source attempts list ─────────────────────────────────── */
+
+.nobait-alt-attempts {
+  margin: 4px 0 0 0;
+  padding: 0 0 0 18px;
+  font-size: 11px;
+  color: #c0c0d0;
+  line-height: 1.45;
+}
+
+.nobait-alt-attempts li {
+  margin-bottom: 2px;
+}
+
+.nobait-alt-attempts strong {
+  color: #d8d8e8;
+  font-weight: 600;
+}
+
+.nobait-alt-tried {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #8888aa;
+}
+
+.nobait-alt-tried summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.nobait-alt-tried summary:hover {
+  color: #aaaacc;
+}
+
 #nobait-tooltip-separator {
   height: 1px;
   background: #2a2a4c;
@@ -149,4 +326,134 @@
   user-select: all;
   max-height: 120px;
   overflow-y: auto;
+}
+
+/* ── Block (paywall / bot-block) UI ──────────────────────────────── */
+
+#nobait-tooltip-answer-label.nobait-block-label {
+  color: #ffb37a;
+}
+
+#nobait-tooltip-block-status {
+  color: #ffd9b3;
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+
+#nobait-tooltip-block-message {
+  color: #c9c9d8;
+  font-size: 12px;
+  line-height: 1.4;
+  margin-bottom: 8px;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+
+#nobait-tooltip-block-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+#nobait-tooltip-block-actions button {
+  padding: 5px 10px;
+  background: #2a2a4a;
+  color: #ccccee;
+  border: 1px solid #4a4a6c;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: inherit;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.1s ease, border-color 0.1s ease, color 0.1s ease;
+}
+
+#nobait-tooltip-block-actions button:hover:not(:disabled) {
+  background: #3a3a5c;
+  border-color: #6a6a8c;
+  color: #ffffff;
+}
+
+#nobait-tooltip-block-actions button:disabled,
+#nobait-tooltip-block-actions button.nobait-action-pending {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+#nobait-tooltip-block-actions button.nobait-action-flash {
+  background: #1a3a3a;
+  border-color: #3D7575;
+  color: #aee0e0;
+}
+
+#nobait-tooltip-block-result:empty {
+  display: none;
+}
+
+#nobait-tooltip-block-result {
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: #15152a;
+  border: 1px solid #2a2a4c;
+  border-radius: 4px;
+  font-size: 12px;
+  color: #d0d0e0;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+
+#nobait-tooltip-block-result.nobait-block-result-loading {
+  color: #aaaacc;
+  font-style: italic;
+}
+
+#nobait-tooltip-block-result.nobait-block-result-loading::after {
+  content: "";
+  animation: nobait-dots 1.2s steps(4, end) infinite;
+}
+
+.nobait-block-result-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #8888aa;
+  margin-bottom: 4px;
+}
+
+.nobait-block-result-label.nobait-block-result-warn {
+  color: #d0a060;
+}
+
+.nobait-block-result-answer {
+  color: #f0f0f0;
+  font-size: 13px;
+  line-height: 1.4;
+  margin-bottom: 6px;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+
+.nobait-block-result-detail {
+  color: #c0c0d0;
+  font-size: 11px;
+  line-height: 1.35;
+  margin-bottom: 6px;
+}
+
+.nobait-block-result-source {
+  font-size: 11px;
+  color: #8888aa;
+}
+
+.nobait-block-result-source a {
+  color: #7ecfff;
+  text-decoration: underline;
+}
+
+.nobait-block-result-source a:hover {
+  color: #aee0ff;
 }

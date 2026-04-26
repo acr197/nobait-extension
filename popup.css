@@ -1,0 +1,272 @@
+/* popup.css — AppCaddy-branded settings popup for NoBait v2 */
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #F4F5F4;
+  color: #141414;
+  font-family: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+body {
+  width: 380px;
+  min-height: 200px;
+}
+
+a {
+  color: #3D7575;
+  text-decoration: none;
+}
+
+a:hover { color: #2C5858; }
+
+/* ── Header ────────────────────────────────────────────────────── */
+
+.popup-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid #E0E2E0;
+  background: #F4F5F4;
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.brand strong {
+  font-family: "Syne", "DM Sans", -apple-system, sans-serif;
+  font-weight: 700;
+  font-size: 17px;
+  letter-spacing: -0.01em;
+}
+
+.version {
+  font-size: 11px;
+  color: #5E5E5E;
+  font-variant-numeric: tabular-nums;
+}
+
+.appcaddy-tag {
+  font-size: 11px;
+  color: #5E5E5E;
+}
+
+/* ── Section ───────────────────────────────────────────────────── */
+
+.popup-section {
+  padding: 14px 16px 4px;
+}
+
+.popup-section h2 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #141414;
+}
+
+.section-help {
+  margin: 0 0 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #5E5E5E;
+}
+
+.info-glyph-inline {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border: 1px solid #5E5E5E;
+  border-radius: 50%;
+  font-size: 9px;
+  font-weight: 600;
+  font-style: italic;
+  vertical-align: -2px;
+}
+
+/* ── Fallback rows ─────────────────────────────────────────────── */
+
+.fallback-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.fallback-row {
+  position: relative;
+  border: 1px solid #E0E2E0;
+  border-radius: 6px;
+  background: #F4F5F4;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.fallback-row:hover {
+  border-color: #3D7575;
+  background: #EAF1F1;
+}
+
+.fallback-row label {
+  display: grid;
+  grid-template-columns: 18px 1fr 22px;
+  gap: 10px;
+  align-items: start;
+  padding: 9px 10px;
+  cursor: pointer;
+}
+
+.fallback-row input[type="checkbox"] {
+  margin: 2px 0 0;
+  accent-color: #3D7575;
+  cursor: pointer;
+  width: 14px;
+  height: 14px;
+}
+
+.fallback-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.fallback-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #141414;
+  line-height: 1.2;
+}
+
+.fallback-desc {
+  font-size: 11.5px;
+  color: #5E5E5E;
+  line-height: 1.4;
+}
+
+.fallback-desc em {
+  font-style: italic;
+  color: #3D7575;
+}
+
+.info-btn {
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  padding: 0;
+  border: 1px solid #5E5E5E;
+  border-radius: 50%;
+  background: transparent;
+  color: #5E5E5E;
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 600;
+  font-family: inherit;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.1s ease, color 0.1s ease, border-color 0.1s ease;
+  flex-shrink: 0;
+}
+
+.info-btn:hover {
+  background: #3D7575;
+  color: #F4F5F4;
+  border-color: #3D7575;
+}
+
+/* ── Footer ────────────────────────────────────────────────────── */
+
+.popup-footer {
+  padding: 10px 16px 14px;
+  font-size: 11px;
+  color: #5E5E5E;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-top: 1px solid #E0E2E0;
+  margin-top: 10px;
+}
+
+.popup-footer a {
+  font-size: 11px;
+}
+
+/* ── Info modal ────────────────────────────────────────────────── */
+
+.info-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.info-modal.hidden {
+  display: none;
+}
+
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(20, 20, 20, 0.45);
+}
+
+.modal-card {
+  position: relative;
+  z-index: 1;
+  width: 320px;
+  max-height: 80vh;
+  padding: 16px 18px 18px;
+  background: #F4F5F4;
+  border: 1px solid #E0E2E0;
+  border-radius: 6px;
+  overflow-y: auto;
+}
+
+.modal-close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: 18px;
+  line-height: 1;
+  color: #5E5E5E;
+  cursor: pointer;
+}
+
+.modal-close:hover { color: #141414; }
+
+.modal-card h3 {
+  margin: 0 0 8px;
+  padding-right: 24px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.modal-card p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #141414;
+  white-space: pre-wrap;
+}

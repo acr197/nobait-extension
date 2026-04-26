@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+  <title>NoBait v2</title>
+</head>
+<body>
+  <header class="popup-header">
+    <div class="brand">
+      <strong>NoBait</strong>
+      <span class="version" id="version-label"></span>
+    </div>
+    <div class="appcaddy-tag">
+      <a href="https://appcaddy.app" target="_blank" rel="noopener noreferrer">AppCaddy</a>
+    </div>
+  </header>
+
+  <section class="popup-section">
+    <h2>Fallback strategies</h2>
+    <p class="section-help">
+      When the first fetch can't read the article, NoBait runs the enabled strategies in order until one returns a real summary. Tap the <span class="info-glyph-inline">i</span> on any row for technical detail.
+    </p>
+
+    <ul id="fallback-list" class="fallback-list">
+      <!-- populated by popup.js -->
+    </ul>
+  </section>
+
+  <footer class="popup-footer">
+    <span>Settings save automatically.</span>
+    <a href="#" id="reset-defaults">Reset to defaults</a>
+  </footer>
+
+  <div id="info-modal" class="info-modal hidden" role="dialog" aria-hidden="true">
+    <div class="modal-backdrop" id="modal-backdrop"></div>
+    <div class="modal-card">
+      <button class="modal-close" id="modal-close" type="button" aria-label="Close">&times;</button>
+      <h3 id="modal-title"></h3>
+      <p id="modal-body"></p>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
