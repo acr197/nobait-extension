@@ -1,4 +1,4 @@
-// background.js — Service worker for NoBait v2
+// background.js — Service worker for NoBait
 // Resolves redirect chains via: (1) no-tab fetch (RSS redirect for Google News,
 // HEAD/GET for all others), (2) tab navigation fallback for JS-only redirects.
 

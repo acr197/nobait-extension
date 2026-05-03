@@ -1,4 +1,4 @@
-// content.js — NoBait v2 content script
+// content.js — NoBait content script
 // Listens for mousedown-hold on anchors, requests redirect resolution,
 // and renders a tooltip with the resolved URL.
 
@@ -812,7 +812,7 @@
 
   function formatDebugInfo(info) {
     const lines = [
-      `--- NoBait v2 Debug ---`,
+      `--- NoBait Debug ---`,
       `requestId   : ${info.requestId || "N/A"}`,
       `originalUrl : ${info.originalUrl || "N/A"}`,
       `resolvedUrl : ${info.resolvedUrl || "N/A"}`,
@@ -887,7 +887,7 @@
     const bestDate = meta.articleDate || "(unknown)";
 
     const lines = [
-      `=== NoBait v2 debug dump ===`,
+      `=== NoBait debug dump ===`,
       ``,
       `╔══ Article identity ══════════════════════════════════════════╗`,
       ` headline          : ${bestHeadline}`,
@@ -897,7 +897,7 @@
       ` originalUrl       : ${info.originalUrl || "(unknown)"}`,
       `╚══════════════════════════════════════════════════════════════╝`,
       ``,
-      `extension         : NoBait v2 ${extensionVersion}`,
+      `extension         : NoBait ${extensionVersion}`,
       `requestId         : ${info.requestId || "unknown"}`,
       `timestamp         : ${new Date().toISOString()}`,
       `pageUrl           : ${window.location.href}`,
@@ -1517,5 +1517,5 @@
     });
   } catch (e) { /* storage not available */ }
 
-  log("INFO", `NoBait v2 content script loaded on ${window.location.href}`);
+  log("INFO", `NoBait content script loaded on ${window.location.href}`);
 })();

@@ -1,4 +1,4 @@
-NoBait v2 resolves link redirects and answers clickbait headlines on mousedown, without leaving the page.
+NoBait resolves link redirects and answers clickbait headlines on mousedown, without leaving the page.
 
 ## What It Does
 

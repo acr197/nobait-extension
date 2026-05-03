@@ -1,4 +1,4 @@
-// popup.js — Settings UI for NoBait v2.
+// popup.js — Settings UI for NoBait.
 // Each fallback option has TWO controls:
 //   - "Show button"  → if checked, the option appears as a button in the long-click tooltip
 //   - "Auto"         → if checked, the option also runs automatically as part of the
