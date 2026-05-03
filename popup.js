@@ -12,40 +12,40 @@ const FALLBACKS = [
     key: "jsonLd",
     label: "Embedded body",
     description:
-      "Many articles ship their full text in invisible page metadata for SEO crawlers — this reads it directly. Free, instant.",
+      "Many articles ship their full text in invisible page metadata for SEO crawlers. This reads it directly. Instant.",
     advanced:
       "Looks for <script type='application/ld+json'> blocks containing NewsArticle / Article schema with an articleBody field. Common on NYT, WaPo, BBC, Reuters, AP, and most modern CMS-published sites. Often returns the entire article body even on paywalled pages because the metadata is shipped to crawlers regardless of the user's subscription state.",
     defaultEnabled: true,
-    defaultAuto: true,
+    defaultAuto: false,
   },
   {
     key: "metaDesc",
     label: "Page summary",
     description:
-      "Falls back to the article's social-media preview text (2-3 sentences). Free; less detail than a full summary.",
+      "Falls back to the article's social-media preview text (2-3 sentences), with less detail than a full summary.",
     advanced:
       "Reads <meta name='description'>, <meta property='og:description'>, and <meta name='twitter:description'>. These are 2-3 sentence summaries the publisher writes for Google / Facebook / Twitter previews. Usually present even on paywalled articles. Quality varies — some publishers write substantive descriptions, others just paste the headline.",
     defaultEnabled: true,
-    defaultAuto: true,
+    defaultAuto: false,
   },
   {
     key: "cookies",
-    label: "Use my cookies",
+    label: "Browser cookies",
     description:
-      "Sends your existing browser session, so subscriber sites you're already logged into return the full article. Free.",
+      "Sends your existing browser session, so subscriber sites you're already logged into return the full article.",
     advanced:
       "Adds credentials: 'include' to the fetch request. If you're logged into NYT, FT, Bloomberg, etc. in this browser, the publisher sees your session cookie and serves subscriber-tier HTML — the same content you'd see by clicking the link normally. Has no effect on sites you aren't logged into. Some publishers' anti-bot still blocks based on missing browser fingerprint, so this isn't a guaranteed bypass.",
-    defaultEnabled: true,
-    defaultAuto: true,
+    defaultEnabled: false,
+    defaultAuto: false,
   },
   {
     key: "amp",
     label: "AMP version",
     description:
-      "Tries the article's mobile/AMP URL — often free of paywalls and ads. Adds a few seconds; doesn't always exist.",
+      "Tries the article's mobile/AMP URL, often without paywalls or ads. Adds a few seconds; doesn't always exist.",
     advanced:
-      "Many publishers serve a stripped-down 'AMP' (Accelerated Mobile Pages) version at /amp/ or ?amp=1. AMP pages usually have the full article body and no paywall because they're served to Google's mobile snippets. Hit rate ~30–50% depending on publisher. Tried via URL pattern transforms (/amp/<slug>, /<slug>/amp, ?amp=1).",
-    defaultEnabled: true,
+      "Many publishers serve a stripped-down 'AMP' (Accelerated Mobile Pages) version at /amp/ or ?amp=1. AMP pages usually have the full article body and no paywall because they're served to Google's mobile snippets. Hit rate ~30-50% depending on publisher. Tried via URL pattern transforms (/amp/<slug>, /<slug>/amp, ?amp=1).",
+    defaultEnabled: false,
     defaultAuto: false,
   },
   {
@@ -64,7 +64,7 @@ const FALLBACKS = [
     description:
       "Searches for similar coverage from other publishers and summarizes one of those instead. Slow (5-15 sec); reliable when working.",
     advanced:
-      "Hits Google News RSS search with the headline, walks up to 5 candidates from different publishers, skips any that are paywalled or blocked, and summarizes the first clean one. Falls through to DuckDuckGo HTML search if Google News yields nothing. Always cites which publisher it ended up using.",
+      "Hits a news RSS search with the headline, walks up to 5 candidates from different publishers, skips any that are paywalled or blocked, and summarizes the first clean one. Falls through to a secondary HTML search if the first search yields nothing. Always cites which publisher it ended up using.",
     defaultEnabled: true,
     defaultAuto: false,
   },
@@ -74,9 +74,39 @@ const FALLBACKS = [
     description:
       "Looks up an archive.org snapshot and summarizes that. Slow; many recent articles aren't archived yet.",
     advanced:
-      "Queries archive.org's Wayback availability API for the closest snapshot, then fetches the raw saved page (id_ modifier strips the Wayback toolbar wrapper) and summarizes it. Reliable for older articles, often misses recent ones (Wayback's index lags by hours/days). Not a true paywall bypass — only works for content Wayback captured publicly.",
-    defaultEnabled: true,
+      "Queries archive.org's Wayback availability API for the closest snapshot, then fetches the raw saved page (id_ modifier strips the Wayback toolbar wrapper) and summarizes it. Reliable for older articles, often misses recent ones (Wayback's index lags by hours/days). Not a true paywall bypass; only works for content Wayback captured publicly.",
+    defaultEnabled: false,
     defaultAuto: false,
+  },
+  {
+    key: "google",
+    label: "Google",
+    description: "Shows a Google button in the tooltip. Click it to search the headline on Google.",
+    advanced:
+      "Opens a new tab with a Google web search for the link's headline text. Useful when all fetch-based fallbacks fail and you want to find coverage manually.",
+    defaultEnabled: false,
+    defaultAuto: false,
+    noAutoCheckbox: true,
+  },
+  {
+    key: "ddg",
+    label: "DuckDuckGo",
+    description: "Shows a DuckDuckGo button in the tooltip. Click it to search the headline on DuckDuckGo.",
+    advanced:
+      "Opens a new tab with a DuckDuckGo web search for the link's headline text. Same as the Google option but routes through DuckDuckGo.",
+    defaultEnabled: false,
+    defaultAuto: false,
+    noAutoCheckbox: true,
+  },
+  {
+    key: "debugInfo",
+    label: "Debug info",
+    description: "Shows a Debug info button in the tooltip. Reveals the resolved URL and pipeline details.",
+    advanced:
+      "Adds a Debug info button to the tooltip. Clicking it expands a panel showing the resolved URL, copy buttons, and a full pipeline dump: fetch timings, body length, HTTP status, AI call duration, fallback method, block reason, and more.",
+    defaultEnabled: false,
+    defaultAuto: false,
+    noAutoCheckbox: true,
   },
 ];
 
@@ -90,7 +120,7 @@ const STYLES = [
     key: "standard",
     label: "Standard",
     description:
-      "Short summary with context — 1-2 sentences. Good when you want the why and the how.",
+      "Short summary with context: 1-2 sentences. Good when you want the why and the how.",
     advanced:
       "Hard cap 220 chars. Asks the model for a substantive but brief summary that satisfies the headline's promise — answers the question, lists the items (up to 5), or gives the specific who/what/why. Default. Recommended for most users.",
   },
@@ -98,7 +128,7 @@ const STYLES = [
     key: "punchline",
     label: "Punchline",
     description:
-      "Just the distilled answer — fragments, names, lists. Skips all fluff.",
+      "Just the distilled answer: fragments, names, lists. Skips all fluff.",
     advanced:
       "Hard cap 100 chars (typically <50). Forbids complete sentences, articles (the/a), and copulas (is/are). For a single answer returns just the noun phrase (e.g. 'Caramel Churro Sundae'). For lists returns numbered items inline ('1. X 2. Y 3. Z'). For questions returns a bare answer. Useful when you want the headline's payoff in one glance.",
   },
@@ -207,6 +237,13 @@ function renderFallbacks(settings) {
     const li = document.createElement("li");
     li.className = "fallback-row" + (entry.enabled ? " is-enabled" : "");
 
+    const autoCell = fb.noAutoCheckbox
+      ? `<div class="checkbox-cell auto-cell auto-cell-placeholder"></div>`
+      : `<label class="checkbox-cell auto-cell" title="Run this option automatically every long-click. Forces Show on.">` +
+          `<input type="checkbox" class="cb-auto" data-key="${fb.key}" ${entry.auto ? "checked" : ""} ${entry.enabled ? "" : "disabled"}>` +
+          `<span class="checkbox-cell-label">Auto</span>` +
+        `</label>`;
+
     li.innerHTML =
       `<div class="fallback-main">` +
         `<label class="checkbox-cell" title="Show this option as a button in the long-click tooltip">` +
@@ -217,10 +254,7 @@ function renderFallbacks(settings) {
           `<div class="fallback-label">${escapeHtml(fb.label)}</div>` +
           `<div class="fallback-desc">${escapeHtml(fb.description)}</div>` +
         `</div>` +
-        `<label class="checkbox-cell auto-cell" title="Run this option automatically every long-click. Forces Show on.">` +
-          `<input type="checkbox" class="cb-auto" data-key="${fb.key}" ${entry.auto ? "checked" : ""} ${entry.enabled ? "" : "disabled"}>` +
-          `<span class="checkbox-cell-label">Auto</span>` +
-        `</label>` +
+        autoCell +
         `<button class="info-btn" data-key="${fb.key}" type="button" title="More info">i</button>` +
       `</div>`;
 
@@ -229,29 +263,33 @@ function renderFallbacks(settings) {
 
     cbEnabled.addEventListener("change", () => {
       settings.fallbacks[fb.key].enabled = cbEnabled.checked;
-      // Auto can't be on if Show is off — clear it and disable the checkbox.
-      if (!cbEnabled.checked) {
-        settings.fallbacks[fb.key].auto = false;
-        cbAuto.checked = false;
-        cbAuto.disabled = true;
-      } else {
-        cbAuto.disabled = false;
+      if (cbAuto) {
+        // Auto can't be on if Show is off — clear it and disable the checkbox.
+        if (!cbEnabled.checked) {
+          settings.fallbacks[fb.key].auto = false;
+          cbAuto.checked = false;
+          cbAuto.disabled = true;
+        } else {
+          cbAuto.disabled = false;
+        }
       }
       li.classList.toggle("is-enabled", cbEnabled.checked);
       saveSettings(settings);
     });
 
-    cbAuto.addEventListener("change", () => {
-      // Auto requires Enabled — turn Show on if user enables Auto.
-      if (cbAuto.checked && !cbEnabled.checked) {
-        cbEnabled.checked = true;
-        settings.fallbacks[fb.key].enabled = true;
-        cbAuto.disabled = false;
-        li.classList.add("is-enabled");
-      }
-      settings.fallbacks[fb.key].auto = cbAuto.checked;
-      saveSettings(settings);
-    });
+    if (cbAuto) {
+      cbAuto.addEventListener("change", () => {
+        // Auto requires Enabled — turn Show on if user enables Auto.
+        if (cbAuto.checked && !cbEnabled.checked) {
+          cbEnabled.checked = true;
+          settings.fallbacks[fb.key].enabled = true;
+          cbAuto.disabled = false;
+          li.classList.add("is-enabled");
+        }
+        settings.fallbacks[fb.key].auto = cbAuto.checked;
+        saveSettings(settings);
+      });
+    }
 
     const infoBtn = li.querySelector(".info-btn");
     infoBtn.addEventListener("click", (e) => {

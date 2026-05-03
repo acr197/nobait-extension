@@ -155,13 +155,16 @@ const ALT_SOURCE_GN_QUICK_TIMEOUT_MS = 4000;
 // boolean (legacy "auto-run only"), it's lifted to { enabled: true, auto: <bool> }.
 const SETTINGS_KEY = "nobaitSettings";
 const DEFAULT_FALLBACKS = {
-  jsonLd:    { enabled: true,  auto: true  },
-  metaDesc:  { enabled: true,  auto: true  },
-  cookies:   { enabled: true,  auto: true  },
-  amp:       { enabled: true,  auto: false },
+  jsonLd:    { enabled: true,  auto: false },
+  metaDesc:  { enabled: true,  auto: false },
+  cookies:   { enabled: false, auto: false },
+  amp:       { enabled: false, auto: false },
   twelveFt:  { enabled: false, auto: false },
   altSource: { enabled: true,  auto: false },
-  archive:   { enabled: true,  auto: false },
+  archive:   { enabled: false, auto: false },
+  google:    { enabled: false, auto: false },
+  ddg:       { enabled: false, auto: false },
+  debugInfo: { enabled: false, auto: false },
 };
 
 function normalizeFallbackEntry(stored, def) {
@@ -1404,12 +1407,14 @@ async function pushClickbaitAnswer(tabId, requestId, linkText, originalUrl, reso
       effectiveBlock.reason || effectiveBlock.publisher || effectiveBlock.detectedFrom || "unknown";
   }
 
-  // Try the primary summarize ONLY if no block AND text is sufficient.
+  // Try the primary summarize ONLY if no block AND body is non-empty.
+  // Short bodies are passed as-is — the model will produce what it can.
   // Style comes from popup settings (Standard vs Punchline).
   const style = settings.summaryStyle || DEFAULT_STYLE;
   baseMeta.summaryStyle = style;
   let primarySummary = null;
-  if (!effectiveBlock && article.text && article.text.length >= 200) {
+  if (!effectiveBlock && article.text && article.text.length > 0) {
+    sendDebugEvent(tabId, requestId, "INFO", `Attempting summarize: body is ${article.text.length} chars`);
     try {
       const r = await askWorkerForAnswer(linkText, article.text, requestId, style);
       primarySummary = r;
@@ -2479,6 +2484,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   return false;
+});
+
+chrome.runtime.onInstalled.addListener(async ({ reason }) => {
+  if (reason !== "install") return;
+  try {
+    const stored = await chrome.storage.local.get(SETTINGS_KEY);
+    if (!stored[SETTINGS_KEY]) {
+      await chrome.storage.local.set({
+        [SETTINGS_KEY]: {
+          summaryStyle: DEFAULT_STYLE,
+          fallbacks: JSON.parse(JSON.stringify(DEFAULT_FALLBACKS)),
+        },
+      });
+      console.log("[NoBait BG] First install: initialized settings with defaults.");
+    }
+  } catch (err) {
+    console.warn("[NoBait BG] onInstalled settings init failed:", err.message);
+  }
 });
 
 console.log(

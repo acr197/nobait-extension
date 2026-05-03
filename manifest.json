@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "NoBait v2 - Link Redirect Resolver",
-  "version": "0.11.0",
+  "version": "0.11.3",
   "description": "Hold-click any link to resolve redirects and reveal the briefest possible answer to clickbait headlines.",
   "permissions": ["activeTab", "tabs", "storage"],
   "host_permissions": ["https://nobait-proxy.acr197.workers.dev/*", "<all_urls>"],

@@ -214,6 +214,10 @@
     } else if (answer) {
       answerEl.textContent = answer;
       enableMore = true;
+      if (source && source.method === "altSource") {
+        const labelEl = tooltipEl.querySelector("#nobait-tooltip-answer-label");
+        if (labelEl) labelEl.textContent = "Summary from alternative source";
+      }
     } else {
       answerEl.classList.add("nobait-answer-error");
       answerEl.textContent = "No answer returned";
@@ -251,7 +255,7 @@
       const link = source.url
         ? ` · <a href="${escapeHtml(source.url)}" target="_blank" rel="noopener noreferrer">Open article</a>`
         : "";
-      html = `<strong>From ${pub}</strong> (original publisher was blocked)${link}`;
+      html = `${pub}${link}`;
     } else if (method === "archive") {
       const date = source.snapshotDate ? ` (${escapeHtml(source.snapshotDate)})` : "";
       const link = source.url
@@ -484,11 +488,17 @@
       }
     }
 
-    html +=
-      `<button data-action="google" type="button" title="Open a Google search for this headline">Google</button>` +
-      `<button data-action="ddg" type="button" title="Open a DuckDuckGo search for this headline">DuckDuckGo</button>` +
-      `<button id="nobait-tooltip-toggle-debug" type="button" ` +
-      `title="Show resolved URL + copy buttons + debug info">Debug info</button>`;
+    if (fb.google && fb.google.enabled) {
+      html += `<button data-action="google" type="button" title="Open a Google search for this headline">Google</button>`;
+    }
+    if (fb.ddg && fb.ddg.enabled) {
+      html += `<button data-action="ddg" type="button" title="Open a DuckDuckGo search for this headline">DuckDuckGo</button>`;
+    }
+    if (fb.debugInfo && fb.debugInfo.enabled) {
+      html +=
+        `<button id="nobait-tooltip-toggle-debug" type="button" ` +
+        `title="Show resolved URL + copy buttons + debug info">Debug info</button>`;
+    }
 
     html += `</div>`;
     return html;
