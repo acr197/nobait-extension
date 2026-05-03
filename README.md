@@ -4,17 +4,6 @@ NoBait resolves link redirects and answers clickbait headlines on mousedown, wit
 
 Hold any link for 500ms. The extension intercepts the mousedown event, resolves the full redirect chain, fetches the destination article, and shows the headline's plain-English answer in a floating tooltip. Redirect resolution uses fetch (HEAD then GET) with a Google News RSS shortcut for CBM URLs — no AI or proxy at that step. When the primary fetch is blocked or paywalled, a configurable fallback chain retries via embedded article metadata, browser cookies, AMP URLs, alternative publisher coverage, or a Wayback Machine snapshot.
 
-## Screenshots
-
-Long-press tooltip with the AI answer and fallback action buttons.
-
-![Long-press tooltip showing AI summary](popup-preview.png)
-
-
-Settings panel with summary style and fallback strategy toggles.
-
-![Extension settings panel](options-panel.png)
-
 ## Stack
 
 - Chrome and Firefox, Manifest V3
@@ -30,6 +19,14 @@ Settings panel with summary style and fallback strategy toggles.
 - Fallback chain runs in order: JSON-LD body, meta description, browser cookies, AMP version, 12ft.io proxy, alternative source search, Wayback Machine snapshot
 - Fallback visibility and auto-run behavior are individually configurable in the settings panel
 
+## Screenshots
+
+![Long-press tooltip showing AI summary](popup-preview.png)
+Long-press tooltip with the AI answer and fallback action buttons.
+
+![Extension settings panel](options-panel.png)
+Settings panel with summary style and fallback strategy toggles.
+
 ## Setup
 
 1. Clone the repo
@@ -41,3 +38,5 @@ Settings panel with summary style and fallback strategy toggles.
 ## Relevance
 
 Demonstrates redirect chain resolution, content extraction heuristics, and a tiered fallback pipeline inside a Manifest V3 service worker with no persistent background process.
+
+Published by AppCaddy. Author, Andrew Ryan.
